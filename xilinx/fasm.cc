@@ -1000,6 +1000,7 @@ struct FasmBackend
             std::string edge = str_or_default(ci->params, ctx->id("DDR_CLK_EDGE"), "OPPOSITE_EDGE");
             if (edge == "SAME_EDGE")          write_bit("IFF.DDR_CLK_EDGE.SAME_EDGE");
             else if (edge == "OPPOSITE_EDGE") write_bit("IFF.DDR_CLK_EDGE.OPPOSITE_EDGE");
+            else if (edge == "SAME_EDGE_PIPELINED") write_bit("IFF.PIPELINED");
             else log_error("unsupported clock edge parameter for cell '%s' at %s: %s. Supported are: SAME_EDGE and OPPOSITE_EDGE",
                             ci->name.c_str(ctx), site.c_str(), edge.c_str());
 
