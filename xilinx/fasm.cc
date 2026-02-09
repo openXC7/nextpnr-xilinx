@@ -1062,7 +1062,10 @@ struct FasmBackend
             write_bit("ODDR.DDR_CLK_EDGE.SAME_EDGE");
             write_bit("ODDR.SRUSED");
             write_bit("ODDR_TDDR.IN_USE");
-            write_bit("OQUSED", get_net_or_empty(ci, ctx->id("OQ")) != nullptr);
+            // For slave OSERDESE2, OQUSED must be set even though OQ is not connected
+            std::string serdes_mode = str_or_default(ci->params, ctx->id("SERDES_MODE"), "MASTER");
+            bool is_slave = (serdes_mode == "SLAVE");
+            write_bit("OQUSED", is_slave || (get_net_or_empty(ci, ctx->id("OQ")) != nullptr));
             write_bit("ZINV_CLK", !bool_or_default(ci->params, ctx->id("IS_CLK_INVERTED"), false));
             for (std::string t : {"T1", "T2", "T3", "T4"})
                 write_bit("ZINV_" + t, (get_net_or_empty(ci, ctx->id(t)) != nullptr || t == "T1") &&
@@ -1102,6 +1105,8 @@ struct FasmBackend
 #endif
             write_bit("SRTYPE.SYNC");
             write_bit("TSRTYPE.SYNC");
+            if (is_slave) write_bit("SERDES_MODE.SLAVE");
+
             pop();
         } else if (ci->type == ctx->id("ISERDESE2_ISERDESE2")) {
             std::string data_rate = str_or_default(ci->params, ctx->id("DATA_RATE"));

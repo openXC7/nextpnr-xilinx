@@ -855,8 +855,8 @@ void XC7Packer::pack_iologic()
                         auto slave_bel_name = parts.front() + "Y" + std::to_string(y_coord_slave) + "/OSERDESE2";
 
                         CellInfo *slave_cell;
-                        if (shiftin1 != nullptr) slave_cell = shiftin1->users.front().cell;
-                        else slave_cell = shiftin2->users.front().cell;
+                        if (shiftin1 != nullptr) slave_cell = shiftin1->driver.cell;
+                        else slave_cell = shiftin2->driver.cell;
                         slave_cell->attrs[id_BEL] = slave_bel_name;
                         used_oserdes_bels.insert(ctx->getBelByName(ctx->id(slave_bel_name)));
                     }
