@@ -59,6 +59,21 @@ void XC7Packer::prepare_clocking()
             tie_port(ci, "S0", true, true);
             tie_port(ci, "S1", false, true);
             tie_port(ci, "IGNORE0", true, true);
+        } else if (ci->type == ctx->id("BUFGMUX") || ci->type == ctx->id("BUFGMUX_CTRL")) {
+            // I same, S->S1 direct, S->S0 inverted, CE to VCC, IGNORE to GND
+            ci->type = ctx->id("BUFGCTRL");
+            rename_port(ctx, ci, ctx->id("S"), ctx->id("S1"));
+            NetInfo *s_net = ci->ports.at(ctx->id("S1")).net;
+            if (s_net != nullptr) {
+                ci->ports[ctx->id("S0")].name = ctx->id("S0");
+                ci->ports[ctx->id("S0")].type = PORT_IN;
+                connect_port(ctx, s_net, ci, ctx->id("S0"));
+                ci->params[ctx->id("IS_S0_INVERTED")] = Property(1);
+            }
+            tie_port(ci, "CE0", true, true);
+            tie_port(ci, "CE1", true, true);
+            tie_port(ci, "IGNORE0", false, false);
+            tie_port(ci, "IGNORE1", false, false);
         } else if (ci->type == id_BUFH || ci->type == id_BUFHCE) {
             ci->type = id_BUFHCE_BUFHCE;
             tie_port(ci, "CE", true, true);
