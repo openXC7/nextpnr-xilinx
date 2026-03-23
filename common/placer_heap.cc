@@ -43,6 +43,8 @@
 #include <fstream>
 #include <numeric>
 #include <queue>
+#include <random>
+#include <limits>
 #include <tuple>
 #include <unordered_map>
 #include "log.h"
@@ -528,7 +530,7 @@ class HeAPPlacer
             available_bels[ctx->getBelType(bel)].push_back(bel);
         }
         for (auto &t : available_bels) {
-            std::random_shuffle(t.second.begin(), t.second.end(), [&](size_t n) { return ctx->rng(int(n)); });
+            std::shuffle(t.second.begin(), t.second.end(), std::default_random_engine(ctx->rng(std::numeric_limits<int>::max())));
         }
         for (auto cell : sorted(ctx->cells)) {
             CellInfo *ci = cell.second;
