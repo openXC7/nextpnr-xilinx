@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.5)
+cmake_minimum_required(VERSION 3.10)
 project(nextpnr CXX C)
 
 option(BUILD_GUI "Build GUI" OFF)
@@ -177,7 +177,7 @@ if (BUILD_PYTHON)
     endwhile ()
 
     if (NOT Boost_PYTHON_FOUND)
-        foreach (PyVer 3 36 37 38 39 310 311 312)
+        foreach (PyVer 3 36 37 38 39 310 311 312 313 314)
             find_package(Boost QUIET COMPONENTS python${PyVer} ${boost_libs})
             if ("${Boost_LIBRARIES}" MATCHES ".*(python|PYTHON).*" )
                 set(Boost_PYTHON_FOUND TRUE)
