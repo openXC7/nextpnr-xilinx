@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.5)
+cmake_minimum_required(VERSION 3.10)
 project(nextpnr CXX C)
 
 option(BUILD_GUI "Build GUI" OFF)
