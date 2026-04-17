@@ -367,16 +367,26 @@ void XC7Packer::pack_io()
         if (buf_cell->type == ctx->id("IBUFDS_GTE2")) {
             constrain_ibufds_gt_site(buf_cell, pad_cell->attrs[id_BEL].as_string());
             auto net = buf_cell->ports[ctx->id("O")].net;
-            if (net != nullptr && net->users.size() == 1) {
-                auto user_cell = net->users[0].cell;
-                auto is_gtp = user_cell->type == id_GTPE2_COMMON;
-                auto is_gtx = user_cell->type == id_GTXE2_COMMON;
-                if (!(is_gtp || is_gtx))
-                    log_error("IBUFDS_GTE2 instance %s output port must be connected to a GTPE2_COMMON or GTXE2_COMMON instance, but is instead connected to an instance %s of type %s\n",
-                        buf_cell->name.c_str(ctx), user_cell->name.c_str(ctx), user_cell->type.c_str(ctx));
-                constrain_gt(pad_cell, user_cell);
+            if (net == nullptr)
+                log_error("IBUFDS_GTE2 instance %s output port is not connected\n", buf_cell->name.c_str(ctx));
+            // Scan users of IBUFDS_GTE2.O
+            CellInfo *gt_common = nullptr;
+            bool has_gtxe2_channel_direct = false;
+            for (auto &usr : net->users) {
+                if (usr.cell->type == id_GTPE2_COMMON || usr.cell->type == id_GTXE2_COMMON)
+                    gt_common = usr.cell;
+                else if (usr.cell->type == id_GTXE2_CHANNEL)
+                    has_gtxe2_channel_direct = true;
+            }
+            if (gt_common) {
+                constrain_gt(pad_cell, gt_common);
                 continue;
-            } else log_error("IBUFDS_GTE2 instance %s output port is not connected, or connected to multiple cells\n", buf_cell->name.c_str(ctx));
+            }
+            // GTX CPLL mode: GTXE2_CHANNEL already directly connected (second pad pass).
+            if (has_gtxe2_channel_direct)
+                continue;
+            log_error("IBUFDS_GTE2 instance %s output port must be connected to a GTPE2_COMMON, GTXE2_COMMON, or GTXE2_CHANNEL instance\n",
+                buf_cell->name.c_str(ctx));
         }
 
         // This OBUF is integrated into the GTP/GTX channel pad and does not need placing
