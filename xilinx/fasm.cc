@@ -2075,6 +2075,7 @@ struct FasmBackend
 
     void write_ibufds_gte2(CellInfo * ci)
     {
+        push(get_tile_name(ci->bel.tile));
         Loc siteLoc = ctx->getSiteLocInTile(ci->bel);
         push("IBUFDS_GTE2_Y" + std::to_string(siteLoc.y));
         write_bit("IN_USE");
@@ -2086,7 +2087,7 @@ struct FasmBackend
         if (!clkrcv_trst) log_warning("%s/%s: According to ug482, CLKRCV_TRST should always be on\n",
                                        ci->hierpath.c_str(ctx), ci->name.c_str(ctx));
         write_bit("CLKRCV_TRST", clkrcv_trst);
-        pop();
+        pop(2);
     }
 
     void write_gtp_pll(CellInfo *ci)
@@ -2747,7 +2748,7 @@ struct FasmBackend
     void write_pcie_2_1(CellInfo *ci)
     {
         push(get_tile_name(ci->bel.tile));
-        push("PCIE_2_1");
+        push("PCIE");
 
         auto write_str_bool = [&](std::string attribute, std::string deflt = "FALSE") {
             auto val = str_or_default(ci->params, ctx->id(attribute), deflt);
@@ -3665,14 +3666,17 @@ void write_gtx_channel(CellInfo *ci)
         write_inv("TXUSRCLK2");
         write_inv("RXUSRCLK2");
         write_inv("TXUSRCLK2");
+        write_inv("CPLLLOCKDETCLK");
+        write_bit("GTREFCLK0_USED", bool_or_default(ci->params, ctx->id("_GTREFCLK0_USED"), false));
+        write_bit("GTREFCLK1_USED", bool_or_default(ci->params, ctx->id("_GTREFCLK1_USED"), false));
 
         auto outrefclk_sel_inv = int_or_default(ci->params, ctx->id("OUTREFCLK_SEL_INV"), 0b10);
         write_int_vector("OUTREFCLK_SEL_INV[1:0]", outrefclk_sel_inv, 2);
 
         write_str_bool("PCS_PCIE_EN", "PCS_PCIE_EN");
 
-        auto rsvd_attr = int_or_default(ci->params, ctx->id("RSVD_ATTR"), 0);
-        write_int_vector("RSVD_ATTR[47:0]", rsvd_attr, 48);
+        auto rsvd_attr = int_or_default(ci->params, ctx->id("PCS_RSVD_ATTR"), 0);
+        write_int_vector("PCS_RSVD_ATTR[47:0]", rsvd_attr, 48);
 
         auto pd_trans_time_from_p2 = int_or_default(ci->params, ctx->id("PD_TRANS_TIME_FROM_P2"), 0);
         write_int_vector("PD_TRANS_TIME_FROM_P2[11:0]", pd_trans_time_from_p2, 12);
@@ -3717,6 +3721,8 @@ void write_gtx_channel(CellInfo *ci)
                 log_error("Invalid RX_DATA_WIDTH parameter '%d' for GTXE2_CHANNEL instance %s\n", rx_data_width, ci->name.c_str(ctx));
         }
         write_int_vector("RX_DATA_WIDTH[2:0]", rx_data_width, 3);
+        auto rx_int_datawidth = bool_or_default(ci->params, ctx->id("RX_INT_DATAWIDTH"), false);
+        write_bit("RX_INT_DATAWIDTH[0]", rx_int_datawidth);
         auto rx_ddi_sel = int_or_default(ci->params, ctx->id("RX_DDI_SEL"), 0);
         write_int_vector("RX_DDI_SEL[5:0]", rx_ddi_sel, 6);
         auto rx_debug_cfg = int_or_default(ci->params, ctx->id("RX_DEBUG_CFG"), 0);
@@ -3740,10 +3746,14 @@ void write_gtx_channel(CellInfo *ci)
         write_int_vector("RX_DFE_KL_CFG2[31:0]", rx_dfe_kl_cfg2, 32);
         auto rx_dfe_lpm_cfg = int_or_default(ci->params, ctx->id("RX_DFE_LPM_CFG"), 0b100101010100);
         write_int_vector("RX_DFE_LPM_CFG[11:0]", rx_dfe_lpm_cfg, 12);
+        auto rx_dfe_lpm_hold_during_eidle = bool_or_default(ci->params, ctx->id("RX_DFE_LPM_HOLD_DURING_EIDLE"), false);
+        write_bit("RX_DFE_LPM_HOLD_DURING_EIDLE[0]", rx_dfe_lpm_hold_during_eidle);
         auto rx_dfe_ut_cfg = int_or_default(ci->params, ctx->id("RX_DFE_UT_CFG"), 0x11E00);
         write_int_vector("RX_DFE_UT_CFG[16:0]", rx_dfe_ut_cfg, 17);
         auto rx_dfe_vp_cfg = int_or_default(ci->params, ctx->id("RX_DFE_VP_CFG"), 0x03F03);
         write_int_vector("RX_DFE_VP_CFG[16:0]", rx_dfe_vp_cfg, 17);
+        auto rx_dfe_xyd_cfg = int_or_default(ci->params, ctx->id("RX_DFE_XYD_CFG"), 0);
+        write_int_vector("RX_DFE_XYD_CFG[12:0]", rx_dfe_xyd_cfg, 13);
 
         write_str_bool("RX_DISPERR_SEQ_MATCH", "RX_DISPERR_SEQ_MATCH");
         auto rx_os_cfg = int_or_default(ci->params, ctx->id("RX_OS_CFG"), 0);
@@ -3907,6 +3917,8 @@ void write_gtx_channel(CellInfo *ci)
                 log_error("Invalid TX_DATA_WIDTH parameter '%d' for GTXE2_CHANNEL instance %s\n", tx_data_width, ci->name.c_str(ctx));
         }
         write_int_vector("TX_DATA_WIDTH[2:0]", tx_data_width, 3);
+        auto tx_int_datawidth = bool_or_default(ci->params, ctx->id("TX_INT_DATAWIDTH"), false);
+        write_bit("TX_INT_DATAWIDTH[0]", tx_int_datawidth);
 
         auto tx_drive_mode = str_or_default(ci->params, ctx->id("TX_DRIVE_MODE"), "DIRECT");
         if (tx_drive_mode != "DIRECT" && tx_drive_mode != "PIPE" && tx_drive_mode != "PIPEGEN3")
@@ -3985,10 +3997,13 @@ void write_gtx_channel(CellInfo *ci)
         auto txpmareset_time = int_or_default(ci->params, ctx->id("TXPMARESET_TIME"), 0);
         write_int_vector("TXPMARESET_TIME[4:0]", txpmareset_time, 5);
 
+        auto tx_qpi_status_en = bool_or_default(ci->params, ctx->id("TX_QPI_STATUS_EN"), false);
+        write_bit("TX_QPI_STATUS_EN[0]", tx_qpi_status_en);
+
         auto ucodeer_clr = bool_or_default(ci->params, ctx->id("UCODEER_CLR"), false);
         write_bit("UCODEER_CLR[0]", ucodeer_clr);
 
-        pop(); // GTPE2_CHANNEL
+        pop(); // GTXE2_CHANNEL
         pop(); // tile name
     }
 

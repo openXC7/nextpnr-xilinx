@@ -241,39 +241,46 @@ void XC7Packer::pack_gt()
             fold_inverter(ci, "TXUSRCLK");
             fold_inverter(ci, "TXUSRCLK2");
 
-            for (auto &port : ci->ports) {
-                auto port_name = port.first.str(ctx);
-                auto net = get_net_or_empty(ci, port.first);
+            {
+                // Collect bracket-named ports before the loop to avoid iterator
+                // invalidation when rename_port erases+inserts into ci->ports.
+                std::vector<std::pair<IdString,IdString>> to_rename;
+                for (auto &port : ci->ports) {
+                    auto port_name = port.first.str(ctx);
+                    auto net = get_net_or_empty(ci, port.first);
 
-                // If one of the clock ports is tied, then Vivado just disconnects them
-                if (net != nullptr && (boost::starts_with(port_name, "PLL") && boost::ends_with(port_name, "CLK"))
-                                && !boost::contains(port_name, "CLKMONITOR")) {
-                    if (net->name == ctx->id("$PACKER_GND_NET") || net->name == ctx->id("$PACKER_VCC_NET")) {
+                    // If one of the clock ports is tied, then Vivado just disconnects them
+                    if (net != nullptr && (boost::starts_with(port_name, "PLL") && boost::ends_with(port_name, "CLK"))
+                                    && !boost::contains(port_name, "CLKMONITOR")) {
+                        if (net->name == ctx->id("$PACKER_GND_NET") || net->name == ctx->id("$PACKER_VCC_NET")) {
+                            disconnect_port(ctx, ci, port.first);
+                            continue;
+                        }
+                        auto driver = net->driver.cell;
+                        if (driver->type != id_GTPE2_COMMON)
+                            log_error("The clock port '%s' of the GTPE2_CHANNEL instance %s can only be driven "
+                                        "by the clock ouputs of a GTPE2_COMMON instance, but not %s\n",
+                                        port_name.c_str(), ci->name.c_str(ctx), driver->type.c_str(ctx));
+                        auto drv_port = net->driver.port.str(ctx);
+                        auto port_prefix = port_name.substr(0, 4);
+                        auto port_suffix = port_name.substr(4);
+                        if (!boost::starts_with(drv_port, port_prefix) || !boost::ends_with(drv_port, port_suffix))
+                            log_error("The port %s of a GTPE2_CHANNEL instance can only be connected to the port %sOUT%s "
+                                        "of a GTPE2_COMMON instance, but not to %s.\n", port_name.c_str(), port_prefix.c_str(), port_suffix.c_str(),
+                                        drv_port.c_str());
+                        // These ports are hardwired. Disconnect
                         disconnect_port(ctx, ci, port.first);
-                        continue;
                     }
-                    auto driver = net->driver.cell;
-                    if (driver->type != id_GTPE2_COMMON)
-                        log_error("The clock port '%s' of the GTPE2_CHANNEL instance %s can only be driven "
-                                    "by the clock ouputs of a GTPE2_COMMON instance, but not %s\n",
-                                    port_name.c_str(), ci->name.c_str(ctx), driver->type.c_str(ctx));
-                    auto drv_port = net->driver.port.str(ctx);
-                    auto port_prefix = port_name.substr(0, 4);
-                    auto port_suffix = port_name.substr(4);
-                    if (!boost::starts_with(drv_port, port_prefix) || !boost::ends_with(drv_port, port_suffix))
-                        log_error("The port %s of a GTPE2_CHANNEL instance can only be connected to the port %sOUT%s "
-                                    "of a GTPE2_COMMON instance, but not to %s.\n", port_name.c_str(), port_prefix.c_str(), port_suffix.c_str(),
-                                    drv_port.c_str());
-                    // These ports are hardwired. Disconnect
-                    disconnect_port(ctx, ci, port.first);
-                }
 
-                if (boost::contains(port_name, "[") && boost::contains(port_name, "]")) {
-                    auto new_port_name = std::string(port_name);
-                    boost::replace_all(new_port_name, "[", "");
-                    boost::replace_all(new_port_name, "]", "");
-                    rename_port(ctx, ci, ctx->id(port_name), ctx->id(new_port_name));
+                    if (boost::contains(port_name, "[") && boost::contains(port_name, "]")) {
+                        auto new_port_name = std::string(port_name);
+                        boost::replace_all(new_port_name, "[", "");
+                        boost::replace_all(new_port_name, "]", "");
+                        to_rename.emplace_back(ctx->id(port_name), ctx->id(new_port_name));
+                    }
                 }
+                for (auto &pr : to_rename)
+                    rename_port(ctx, ci, pr.first, pr.second);
             }
         } else if (ci->type == id_GTXE2_CHANNEL) {
             fold_inverter(ci, "CLKRSVD0");
@@ -297,43 +304,59 @@ void XC7Packer::pack_gt()
             fold_inverter(ci, "TXUSRCLK");
             fold_inverter(ci, "TXUSRCLK2");
 
-            for (auto &port : ci->ports) {
-                auto port_name = port.first.str(ctx);
-                auto net = get_net_or_empty(ci, port.first);
+            {
+                std::vector<std::pair<IdString,IdString>> to_rename;
+                for (auto &port : ci->ports) {
+                    auto port_name = port.first.str(ctx);
+                    auto net = get_net_or_empty(ci, port.first);
 
-                // If one of the clock ports is tied, then Vivado just disconnects them
-                if (net != nullptr && ((boost::starts_with(port_name, "PLL") && boost::ends_with(port_name, "CLK")) ||
-                                       boost::contains(port_name, "REFCLK")) &&
-                                       !boost::contains(port_name, "CLKMONITOR") &&
-                                       !boost::contains(port_name, "CLKLOST")) {
-                    if (net->name == ctx->id("$PACKER_GND_NET") || net->name == ctx->id("$PACKER_VCC_NET")) {
+                    // If one of the clock ports is tied, then Vivado just disconnects them
+                    if (net != nullptr && ((boost::starts_with(port_name, "PLL") && boost::ends_with(port_name, "CLK")) ||
+                                           boost::contains(port_name, "REFCLK") ||
+                                           boost::starts_with(port_name, "QPLL")) &&
+                                           !boost::contains(port_name, "CLKMONITOR") &&
+                                           !boost::contains(port_name, "CLKLOST")) {
+                        if (net->name == ctx->id("$PACKER_GND_NET") || net->name == ctx->id("$PACKER_VCC_NET")) {
+                            disconnect_port(ctx, ci, port.first);
+                            continue;
+                        }
+                        auto driver = net->driver.cell;
+                        // GTX CPLL mode is possible: GTXE2_CHANNEL.GTREFCLK* driven directly by IBUFDS_GTE2
+                        // (no GTXE2_COMMON required in the design)
+                        if (driver->type != id_GTXE2_COMMON && driver->type !=id_IBUFDS_GTE2)
+                            log_error("The clock port '%s' of the GTXE2_CHANNEL instance %s can only be driven "
+                                        "by the clock ouputs of a GTXE2_COMMON or IBUFDS_GTE2 instance, but not %s\n",
+                                        port_name.c_str(), ci->name.c_str(ctx), driver->type.c_str(ctx));
+                        auto drv_port = net->driver.port.str(ctx);
+                        auto port_prefix = port_name.substr(0, 4);
+                        auto port_suffix = port_name.substr(4);
+                        if (drv_port != "O" && (!boost::starts_with(drv_port, port_prefix) || !boost::ends_with(drv_port, port_suffix)))
+                            log_warning("The port %s of a GTXE2_CHANNEL instance can only be connected to the port %sOUT%s "
+                                        "of a GTXE2_COMMON instance, or IBUFDS_GTE2, but not to %s.\n",
+                                        port_name.c_str(), port_prefix.c_str(), port_suffix.c_str(), drv_port.c_str());
+                        // GTX CPLL mode: GTREFCLk0/1 treatment similar to GTXE2_COMMON
+                        bool used = net->name != ctx->id("$PACKER_VCC_NET") &&
+                                    net->name != ctx->id("$PACKER_GND_NET");
+                        if (used && port_name == "GTREFCLK0")
+                            ci->setParam(ctx->id("_GTREFCLK0_USED"), Property(1, 1));
+                        if (used && port_name == "GTREFCLK1")
+                            ci->setParam(ctx->id("_GTREFCLK1_USED"), Property(1, 1));
+                        // These ports are hardwired. Disconnect
                         disconnect_port(ctx, ci, port.first);
-                        continue;
                     }
-                    auto driver = net->driver.cell;
-                    if (driver->type != id_GTXE2_COMMON)
-                        log_error("The clock port '%s' of the GTXE2_CHANNEL instance %s can only be driven "
-                                    "by the clock ouputs of a GTXE2_COMMON instance, but not %s\n",
-                                    port_name.c_str(), ci->name.c_str(ctx), driver->type.c_str(ctx));
-                    auto drv_port = net->driver.port.str(ctx);
-                    auto port_prefix = port_name.substr(0, 4);
-                    auto port_suffix = port_name.substr(4);
-                    if (!boost::starts_with(drv_port, port_prefix) || !boost::ends_with(drv_port, port_suffix))
-                        log_error("The port %s of a GTXE2_CHANNEL instance can only be connected to the port %sOUT%s "
-                                    "of a GTXE2_COMMON instance, but not to %s.\n", port_name.c_str(), port_prefix.c_str(), port_suffix.c_str(),
-                                    drv_port.c_str());
-                    // These ports are hardwired. Disconnect
-                    disconnect_port(ctx, ci, port.first);
-                }
 
-                if (boost::contains(port_name, "[") && boost::contains(port_name, "]")) {
-                    auto new_port_name = std::string(port_name);
-                    boost::replace_all(new_port_name, "[", "");
-                    boost::replace_all(new_port_name, "]", "");
-                    rename_port(ctx, ci, ctx->id(port_name), ctx->id(new_port_name));
+                    if (boost::contains(port_name, "[") && boost::contains(port_name, "]")) {
+                        auto new_port_name = std::string(port_name);
+                        boost::replace_all(new_port_name, "[", "");
+                        boost::replace_all(new_port_name, "]", "");
+                        to_rename.emplace_back(ctx->id(port_name), ctx->id(new_port_name));
+                    }
                 }
+                for (auto &pr : to_rename)
+                    rename_port(ctx, ci, pr.first, pr.second);
             }
-        }    }
+        }    
+    }
 }
 
 NEXTPNR_NAMESPACE_END
