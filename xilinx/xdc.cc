@@ -34,12 +34,16 @@ void Arch::parseXdc(std::istream &in)
         return std::all_of(str.begin(), str.end(), [](char c) { return std::isspace(c); });
     };
     auto strip_quotes = [](const std::string &str) {
-        if (str.at(0) == '"') {
-            NPNR_ASSERT(str.back() == '"');
-            return str.substr(1, str.size() - 2);
-        } else if (str.at(0) == '{') {
-            NPNR_ASSERT(str.back() == '}');
-            return str.substr(1, str.size() - 2);
+        if (str.empty())
+            return str;
+        if (str.front() == '"') {
+            if (str.back() == '"' && str.size() >= 2)
+                return str.substr(1, str.size() - 2);
+            return str;
+        } else if (str.front() == '{') {
+            if (str.back() == '}' && str.size() >= 2)
+                return str.substr(1, str.size() - 2);
+            return str;
         } else {
             return str;
         }
@@ -76,19 +80,26 @@ void Arch::parseXdc(std::istream &in)
         return split_args;
     };
 
+    auto trim_all = [](std::string s) {
+        s.erase(std::remove_if(s.begin(), s.end(), [](unsigned char c) {
+            return c == ' ' || c == '\t';
+        }), s.end());
+        return s;
+    };
     auto get_cells = [&](std::string str) {
         std::vector<CellInfo *> tgt_cells;
         if (str.empty() || str.front() != '[')
             log_error("failed to parse target (on line %d)\n", lineno);
         str = str.substr(1, str.size() - 2);
         auto split = split_to_args(str, false);
+        auto split_name = trim_all(str.substr(split.at(0).length()));
         if (split.size() < 1)
             log_error("failed to parse target (on line %d)\n", lineno);
         if (split.front() != "get_ports")
-            log_error("targets other than 'get_ports' are not supported (on line %d)\n", lineno);
+            log_warning("set_property: target %s not supported (on line %d)\n", split.front().c_str(), lineno);
         if (split.size() < 2)
             log_error("failed to parse target (on line %d)\n", lineno);
-        IdString cellname = id(strip_quotes(split.at(1)));
+        IdString cellname = id(strip_quotes(split_name));
         if (cells.count(cellname))
             tgt_cells.push_back(cells.at(cellname).get());
         return tgt_cells;
@@ -100,13 +111,14 @@ void Arch::parseXdc(std::istream &in)
             log_error("failed to parse target (on line %d)\n", lineno);
         str = str.substr(1, str.size() - 2);
         auto split = split_to_args(str, false);
+        auto split_name = trim_all(str.substr(split.at(0).length()));
         if (split.size() < 1)
             log_error("failed to parse target (on line %d)\n", lineno);
         if (split.front() != "get_ports" && split.front() != "get_nets")
             log_error("targets other than 'get_ports' or 'get_nets' are not supported (on line %d)\n", lineno);
         if (split.size() < 2)
             log_error("failed to parse target (on line %d)\n", lineno);
-        IdString netname = id(split.at(1));
+        IdString netname = id(strip_quotes(split_name));
         NetInfo *maybe_net = getNetByAlias(netname);
         if (maybe_net != nullptr)
             tgt_nets.push_back(maybe_net);
@@ -119,6 +131,10 @@ void Arch::parseXdc(std::istream &in)
         size_t cstart = line.find('#');
         if (cstart != std::string::npos)
             line = line.substr(0, cstart);
+        while (!line.empty() && std::isspace(line.back()))
+            line.pop_back();
+        if (!line.empty() && line.back() == ';')
+            line.pop_back();
         if (isempty(line))
             continue;
 
@@ -142,7 +158,7 @@ void Arch::parseXdc(std::istream &in)
                 arg_pairs.emplace_back(std::move(arguments.at(1)), std::move(arguments.at(2)));
             if (arguments.at(1) == "INTERNAL_VREF")
                 continue;
-            if (arguments.at(3).size() > 2 && arguments.at(3) == "[current_design]") {
+            if (arguments.at(3).size() > 2 && (arguments.at(3) == "[current_design]" || arguments.at(3) == "[current_project]")) {
                 log_warning("[current_design] isn't supported, ignoring (on line %d)\n", lineno);
                 continue;
             }
