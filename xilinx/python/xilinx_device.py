@@ -452,7 +452,9 @@ def import_device(name, prjxray_root, metadata_root):
 		return ij["intents"][str(ij["tiles"][tiletype][wirename])]
 
 	d = Device(name)
-	match = re.search(r"^(xc7[sakz]\d+t?)\w+-\d", name)
+	# Virtex-7 fabrics are e.g. xc7vx485t / xc7vh580t / xc7v585t (the optional
+	# x/h denotes the GTX/GTH sub-family), unlike the xc7[sakz]NNNt form.
+	match = re.search(r"^(xc7(?:[sakz]\d+t?|v[xh]?\d+t))\w+-\d", name)
 	if not match:
 		raise RuntimeError("{} is not known device name".format(name))
 	fabricname = match.groups()[0]

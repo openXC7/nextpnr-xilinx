@@ -31,6 +31,9 @@ def main():
 	if "xc7s" in args.device:
 		metadata_root = metadata_root.replace("artix7", "spartan7")
 		xraydb_root = xraydb_root.replace("artix7", "spartan7")
+	if "xc7v" in args.device:
+		metadata_root = metadata_root.replace("artix7", "virtex7")
+		xraydb_root = xraydb_root.replace("artix7", "virtex7")
 	d = import_device(args.device, xraydb_root, metadata_root)
 	# Import tile types
 	seen_tiletypes = set()
