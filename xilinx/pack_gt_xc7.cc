@@ -51,6 +51,10 @@ void XC7Packer::constrain_ibufds_gt_site(CellInfo *buf_cell, const std::string &
 
     int32_t min_buf_y = 0x7FFFFFFF;
     int32_t max_buf_y = 0;
+    int32_t buf_x     = -1;   // GTX columns can sit at X0 or X1 on larger
+                              // parts (e.g. xc7vx485t Bank 113 has the
+                              // SGMII REFCLK pair on IBUFDS_GTE2_X1Y0/Y1).
+                              // Read it from the tile rather than assuming X0.
     int32_t min_pad_y = 0x7FFFFFFF;
     int32_t max_pad_y = 0;
     int32_t pad_y = -1;
@@ -68,6 +72,7 @@ void XC7Packer::constrain_ibufds_gt_site(CellInfo *buf_cell, const std::string &
             auto sy = site->site_y;
             if (sy < min_buf_y) min_buf_y = sy;
             if (max_buf_y < sy) max_buf_y = sy;
+            if (buf_x < 0) buf_x = site->site_x;
         }
     }
 
@@ -77,13 +82,15 @@ void XC7Packer::constrain_ibufds_gt_site(CellInfo *buf_cell, const std::string &
 
     NPNR_ASSERT(min_pad_y < max_pad_y);
     NPNR_ASSERT(min_buf_y < max_buf_y);
+    NPNR_ASSERT_MSG(buf_x >= 0, "No IBUFDS_GTE2 site found in the GT* tile");
 
     auto rel_buf_y = (pad_y - min_pad_y) >> 1;
     auto buf_y = min_buf_y + rel_buf_y;
 
     int32_t num_pads = max_pad_y - min_pad_y + 1;
     NPNR_ASSERT_MSG(num_pads == 4, "A GTP_COMMON/GTX_COMMON tile only should have four input pads");
-    auto buf_bel = std::string("IBUFDS_GTE2_X0Y" + std::to_string(buf_y)) + "/IBUFDS_GTE2";
+    auto buf_bel = std::string("IBUFDS_GTE2_X") + std::to_string(buf_x)
+                   + "Y" + std::to_string(buf_y) + "/IBUFDS_GTE2";
 
     if (buf_cell->attrs.find(id_BEL) != buf_cell->attrs.end()) {
         auto existing_buf_bel = buf_cell->attrs[id_BEL].as_string();
