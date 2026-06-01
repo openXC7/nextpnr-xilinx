@@ -106,7 +106,7 @@ void XC7Packer::decompose_iob(CellInfo *xil_iob, bool is_hr, const std::string &
 
         CellInfo *inbuf = insert_ibuf(int_name(xil_iob->name, "IBUF", is_se_iobuf), ibuf_type, pad_net, top_out);
         std::string tile = get_tilename_by_sitename(ctx, site);
-        if (boost::starts_with(tile, "RIOB18_"))
+        if ((boost::starts_with(tile, "RIOB18_") || boost::starts_with(tile, "LIOB18_")))
             inbuf->attrs[ctx->id("BEL")] = site + "/IOB18/INBUF_DCIEN";
         else
             inbuf->attrs[ctx->id("BEL")] = site + "/IOB33/INBUF_EN";
@@ -130,7 +130,7 @@ void XC7Packer::decompose_iob(CellInfo *xil_iob, bool is_hr, const std::string &
                 is_se_iobuf ? (has_dci ? ctx->id("OBUFT_DCIEN") : ctx->id("OBUFT")) : xil_iob->type,
                 get_net_or_empty(xil_iob, ctx->id("I")), pad_net, get_net_or_empty(xil_iob, ctx->id("T")));
         std::string tile = get_tilename_by_sitename(ctx, site);
-        if (boost::starts_with(tile, "RIOB18_"))
+        if ((boost::starts_with(tile, "RIOB18_") || boost::starts_with(tile, "LIOB18_")))
             obuf->attrs[ctx->id("BEL")] = site + "/IOB18/OUTBUF_DCIEN";
         else
             obuf->attrs[ctx->id("BEL")] = site + "/IOB33/OUTBUF";
@@ -156,7 +156,7 @@ void XC7Packer::decompose_iob(CellInfo *xil_iob, bool is_hr, const std::string &
         NPNR_ASSERT(pad_n_net != nullptr);
         std::string site_n = pad_site(pad_n_net);
         std::string tile_p = get_tilename_by_sitename(ctx, site_p);
-        bool is_riob18 = boost::starts_with(tile_p, "RIOB18_");
+        bool is_riob18 = (boost::starts_with(tile_p, "RIOB18_") || boost::starts_with(tile_p, "LIOB18_"));
 
         if (!is_diff_iobuf && !is_diff_out_iobuf) {
             disconnect_port(ctx, xil_iob, ctx->id("I"));
@@ -192,7 +192,7 @@ void XC7Packer::decompose_iob(CellInfo *xil_iob, bool is_hr, const std::string &
         NPNR_ASSERT(pad_n_net != nullptr);
         std::string site_n = pad_site(pad_n_net);
         std::string tile_p = get_tilename_by_sitename(ctx, site_p);
-        bool is_riob18 = boost::starts_with(tile_p, "RIOB18_");
+        bool is_riob18 = (boost::starts_with(tile_p, "RIOB18_") || boost::starts_with(tile_p, "LIOB18_"));
 
         disconnect_port(ctx, xil_iob, (is_diff_iobuf || is_diff_out_iobuf) ? ctx->id("IO") : ctx->id("O"));
         disconnect_port(ctx, xil_iob, (is_diff_iobuf || is_diff_out_iobuf) ? ctx->id("IOB") : ctx->id("OB"));
@@ -314,7 +314,7 @@ void XC7Packer::pack_io()
                 auto pad_bel = std::string(site + "/PAD");
                 pad->attrs[id_BEL] = pad_bel;
             } else {
-                if (boost::starts_with(tile, "RIOB18_"))
+                if ((boost::starts_with(tile, "RIOB18_") || boost::starts_with(tile, "LIOB18_")))
                     pad->attrs[id_BEL] = std::string(site + "/IOB18/PAD");
                 else
                     pad->attrs[id_BEL] = std::string(site + "/IOB33/PAD");
@@ -369,14 +369,25 @@ void XC7Packer::pack_io()
             auto net = buf_cell->ports[ctx->id("O")].net;
             if (net == nullptr)
                 log_error("IBUFDS_GTE2 instance %s output port is not connected\n", buf_cell->name.c_str(ctx));
-            // Scan users of IBUFDS_GTE2.O
+            // Scan users of IBUFDS_GTE2.O.  Accepted silicon-legal patterns:
+            //   - GTXE2_COMMON / GTPE2_COMMON (QPLL clustering)
+            //   - GTXE2_CHANNEL direct (CPLL mode)
+            //   - BUFG / BUFH / BUFHCE / BUFR (MGT REFCLK routed straight
+            //     into a fabric clock buffer — used by the VC707 telegraph
+            //     SGMIICLK path: IBUFDS_GTE2 -> BUFG -> 125 MHz fabric clock)
             CellInfo *gt_common = nullptr;
             bool has_gtxe2_channel_direct = false;
+            bool has_bufg_direct = false;
             for (auto &usr : net->users) {
                 if (usr.cell->type == id_GTPE2_COMMON || usr.cell->type == id_GTXE2_COMMON)
                     gt_common = usr.cell;
                 else if (usr.cell->type == id_GTXE2_CHANNEL)
                     has_gtxe2_channel_direct = true;
+                else if (usr.cell->type == ctx->id("BUFG")
+                      || usr.cell->type == ctx->id("BUFH")
+                      || usr.cell->type == ctx->id("BUFHCE")
+                      || usr.cell->type == ctx->id("BUFR"))
+                    has_bufg_direct = true;
             }
             if (gt_common) {
                 constrain_gt(pad_cell, gt_common);
@@ -385,7 +396,11 @@ void XC7Packer::pack_io()
             // GTX CPLL mode: GTXE2_CHANNEL already directly connected (second pad pass).
             if (has_gtxe2_channel_direct)
                 continue;
-            log_error("IBUFDS_GTE2 instance %s output port must be connected to a GTPE2_COMMON, GTXE2_COMMON, or GTXE2_CHANNEL instance\n",
+            // Direct fabric clock buffer — no GT* clustering needed.
+            if (has_bufg_direct)
+                continue;
+            log_error("IBUFDS_GTE2 instance %s output port must be connected to "
+                      "a GTPE2_COMMON, GTXE2_COMMON, GTXE2_CHANNEL, or BUFG/BUFH/BUFR\n",
                 buf_cell->name.c_str(ctx));
         }
 
@@ -471,7 +486,10 @@ void XC7Packer::pack_io()
         else if (belname.substr(pos+1, 5) == "IOB33")
             rules = hriobuf_rules;
         else
-            log_error("Unexpected IOBUF BEL %s\n", belname.c_str());
+            // Cell has a BEL attribute that isn't an IOB — most likely a
+            // SLICE/CLB/etc. cell that was pinned via JSON.  Skip it; the
+            // SLICE-bound BEL is enforced later by the placer.
+            continue;
         if (rules.count(ci->type)) {
             xform_cell(rules, ci);
         }

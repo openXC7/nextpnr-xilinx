@@ -118,6 +118,27 @@ struct FasmBackend
     };
 
     std::unordered_map<PseudoPipKey, std::vector<std::string>, PseudoPipKey::Hash> pp_config;
+    // (tile_index, slot_y) pairs where a BUFGCTRL cell is actually bound.
+    // Used by the pp_config consumer (see write_routing_bel) to suppress
+    // phantom BUFGCTRL.BUFGCTRL_X0Y*.IN_USE / IS_*_INVERTED / ZINV_* bits
+    // that pp_config would otherwise emit just because the router's path
+    // crossed the matching pseudo-pip on an idle BUFG tile.  Without this,
+    // a single-BUFG design (e.g. min_ibufds_ff_led) programs both the
+    // active CLK_BUFG_TOP_R_X192Y209 site AND a phantom one in the
+    // adjacent CLK_BUFG_BOT_R_X192Y204 tile, contending for the clock
+    // distribution backbone and leaving the FF clock dead on hardware
+    // (LED stuck high — bit-diff revealed 37 extra bits at the BOT tile).
+    std::set<std::pair<int, int>> bufgctrl_bound_slots;
+    void populate_bufgctrl_bound_slots()
+    {
+        for (auto cell : sorted(ctx->cells)) {
+            CellInfo *ci = cell.second;
+            if (ci->type == id_BUFGCTRL && ci->bel != BelId()) {
+                auto xy = ctx->getSiteLocInTile(ci->bel);
+                bufgctrl_bound_slots.insert({ci->bel.tile, xy.y});
+            }
+        }
+    }
     void get_pseudo_pip_data()
     {
         /*
@@ -282,6 +303,28 @@ struct FasmBackend
         if (pp_config.count(ppk)) {
             auto &pp = pp_config.at(ppk);
             std::string tile_name = get_tile_name(pip.tile);
+            // If the router crosses a CLK_BUFG_*_R tile that has NO bound
+            // BUFGCTRL, every pseudo-pip feature for that tile is a phantom
+            // (the chipdb's clock-distribution graph allows the path, but
+            // Vivado doesn't actually use it).  Drop the whole emission —
+            // not just the BUFGCTRL.* config bits but also the
+            // CLK_BUFG_BUFGCTRL*_I0/I1.CLK_BUFG_IMUX* routing PIPs.  The
+            // latter still program a phantom clock-input mux at the empty
+            // BUFG site, contending with the real one in the active tile.
+            bool tile_is_clk_bufg_r = (boost::starts_with(tile_name, "CLK_BUFG_TOP_R")
+                                       || boost::starts_with(tile_name, "CLK_BUFG_BOT_R"));
+            if (tile_is_clk_bufg_r) {
+                bool any_bound_here = false;
+                for (int slot = 0; slot < 16; ++slot) {
+                    if (bufgctrl_bound_slots.count({pip.tile, slot})) {
+                        any_bound_here = true;
+                        break;
+                    }
+                }
+                if (!any_bound_here)
+                    return;
+            }
+            bool emitted_anything = false;
             for (auto c : pp) {
                 if (boost::starts_with(tile_name, "RIOI3_SING")
                     || boost::starts_with(tile_name, "LIOI3_SING")
@@ -294,9 +337,32 @@ struct FasmBackend
                             c.replace(y0pos, 2, "Y1");
                     }
                 }
+                // Phantom-BUFGCTRL guard: this pseudo-pip's feature list
+                // includes BUFGCTRL.BUFGCTRL_X0Y<n>.* bits whenever the
+                // router crosses the matching CLK_BUFG_BUFGCTRL<n>_O→I0/I1
+                // wires, EVEN ON TILES WHERE NO BUFGCTRL IS BOUND.  The
+                // BOT-tile phantom emit programs a second BUFG site that
+                // contends with the real one in the TOP tile, killing the
+                // clock distribution (see task #47 bit-diff write-up).
+                // Suppress BUFGCTRL.* features on (tile, slot) pairs that
+                // have no actually-bound BUFGCTRL cell.
+                if (boost::starts_with(c, "BUFGCTRL.BUFGCTRL_X0Y")) {
+                    // Parse the slot number out of "BUFGCTRL.BUFGCTRL_X0Y<N>.<rest>".
+                    const std::string prefix = "BUFGCTRL.BUFGCTRL_X0Y";
+                    size_t start = prefix.size();
+                    size_t end = c.find('.', start);
+                    if (end == std::string::npos) end = c.size();
+                    int slot = -1;
+                    try { slot = std::stoi(c.substr(start, end - start)); }
+                    catch (...) { slot = -1; }
+                    if (slot >= 0
+                        && !bufgctrl_bound_slots.count({pip.tile, slot}))
+                        continue;
+                }
                 out << tile_name << "." << c << std::endl;
+                emitted_anything = true;
             }
-            if (!pp.empty())
+            if (emitted_anything)
                 last_was_blank = false;
         } else {
             if (pd.extra_data == 1)
@@ -341,6 +407,28 @@ struct FasmBackend
             if (boost::contains(tile_name, "IOI")) {
                 if (boost::contains(dst_name, "OCLKB") && boost::contains(src_name, "IOI_OCLKM_"))
                     return; // missing, not sure if really a ppip?
+            }
+
+            // Phantom-BUFGCTRL guard, regular-pip variant (#47 follow-up).
+            // pp_config branch already filters pseudo-pip emissions at
+            // CLK_BUFG_*_R tiles that hold no bound BUFGCTRL; this branch
+            // handles the regular PIPs nextpnr's router crossed through
+            // the same tiles (CLK_BUFG_BUFGCTRL*_I0/I1 IMUX hops, the
+            // CLK_BUFG_CK_GCLK* output PIPs).  Both classes program the
+            // unused-slot BUFGCTRL site; the cell-config + routing pair
+            // together is what was killing the clock distribution on
+            // hardware (LED stuck high).
+            if ((boost::starts_with(tile_name, "CLK_BUFG_TOP_R")
+                 || boost::starts_with(tile_name, "CLK_BUFG_BOT_R"))) {
+                bool any_bound_here = false;
+                for (int slot = 0; slot < 16; ++slot) {
+                    if (bufgctrl_bound_slots.count({pip.tile, slot})) {
+                        any_bound_here = true;
+                        break;
+                    }
+                }
+                if (!any_bound_here)
+                    return;
             }
 
             out << tile_name << ".";
@@ -773,6 +861,12 @@ struct FasmBackend
         push(tile);
 
         bool is_riob18   = boost::starts_with(tile, "RIOB18_");
+        // is_hp_bank covers BOTH RIOB18_ (right) and LIOB18_ (left) — the
+        // physical HP18 banks.  is_riob18 stays as-is to preserve the
+        // existing emission behaviour; is_hp_bank is added only for the
+        // *additional* HP-specific bits that Vivado emits on both sides
+        // (SLEW family subset, OBUF/IBUF bank glue, etc.).
+        bool is_hp_bank  = is_riob18 || boost::starts_with(tile, "LIOB18_");
         bool is_sing     = boost::contains(tile, "_SING_");
         bool is_top_sing = pad->bel.tile < ctx->getHclkForIob(pad->bel);
         bool is_stepdown = false;
@@ -848,20 +942,36 @@ struct FasmBackend
                     write_bit(iostandard + ".DRIVE.I" + std::to_string(drive));
             }
 
+            // HP-bank-specific additional DRIVE family bit.  Vivado emits
+            // BOTH the IOB33-style narrow DRIVE bit (above) AND a wider
+            // HP-bank family bit for the same standard.  Skip if we already
+            // handled it in the is_riob18 branch above (which would have
+            // emitted just the HP one).
+            if (is_hp_bank && !is_riob18) {
+                if ((iostandard == "LVCMOS18" || iostandard == "LVCMOS15"))
+                    write_bit("LVCMOS15_LVCMOS18.DRIVE.I12_I16_I2_I4_I6_I8");
+            }
+
             // SSTL output used
             if (is_riob18 && is_sstl) write_bit(iostandard + ".IN_USE");
 
-            // SLEW
-            if (is_riob18 && slew == "SLOW") {
-                if (iostandard == "SSTL135")
-                    write_bit("SSTL135.SLEW.SLOW");
-                else if (iostandard == "SSTL15")
-                    write_bit("SSTL15.SLEW.SLOW");
-                else
-                    write_bit("LVCMOS12_LVCMOS15_LVCMOS18.SLEW.SLOW");
-            } else if (slew == "SLOW") {
+            // SLEW.  Vivado emits the general LVCMOS-family bit on every
+            // bank (HP18 AND HR33), plus a HP-bank-specific subset bit on
+            // HP banks (LIOB18 + RIOB18) — both for the active site AND
+            // on the unused Y1 site of an active HP tile.  The legacy
+            // is_riob18 branch only emitted one or the other; this restructure
+            // emits both on HP banks.
+            if (slew == "SLOW") {
                 if (iostandard != "LVDS_25" && iostandard != "TMDS_33")
                     write_bit("LVCMOS12_LVCMOS15_LVCMOS18_LVCMOS25_LVCMOS33_LVTTL_SSTL135_SSTL15.SLEW.SLOW");
+                if (is_hp_bank) {
+                    if (iostandard == "SSTL135")
+                        write_bit("SSTL135.SLEW.SLOW");
+                    else if (iostandard == "SSTL15")
+                        write_bit("SSTL15.SLEW.SLOW");
+                    else if (iostandard != "LVDS_25" && iostandard != "TMDS_33")
+                        write_bit("LVCMOS12_LVCMOS15_LVCMOS18.SLEW.SLOW");
+                }
             }
             else if (is_riob18)
                 write_bit(iostandard + ".SLEW.FAST");
@@ -869,9 +979,44 @@ struct FasmBackend
                 write_bit("SSTL135_SSTL15.SLEW.FAST");
             else
                 write_bit("LVCMOS12_LVCMOS15_LVCMOS18_LVCMOS25_LVCMOS33_LVTTL.SLEW.FAST");
+
+            // HP-bank OBUF "glue" — fires once per active output site.
+            if (is_hp_bank)
+                write_bit("OBUF_HP_BANK_GLUE");
         }
 
         if (is_input) {
+            // SLEW.SLOW pair on input pads — Vivado emits these on HP-bank
+            // single-ended input pads.  Skip differential inputs (LVDS /
+            // diff-pair IBUFDS) — those use a different bit layout and
+            // prjxray's DB has no SLEW.SLOW key for diff sites; emitting
+            // it triggers FasmLookupError on round-trip.  Also skip if
+            // is_output already covered the emit upstream.
+            if (!is_output && !is_diff && slew == "SLOW"
+                && iostandard != "LVDS_25" && iostandard != "TMDS_33") {
+                write_bit("LVCMOS12_LVCMOS15_LVCMOS18_LVCMOS25_LVCMOS33_LVTTL_SSTL135_SSTL15.SLEW.SLOW");
+                if (is_hp_bank)
+                    write_bit("LVCMOS12_LVCMOS15_LVCMOS18.SLEW.SLOW");
+            }
+            // HP-bank IBUF glue — fires per active input site (parallel to
+            // OBUF_HP_BANK_GLUE).  For differential inputs Vivado uses a
+            // different "IBUFDS_BANK_GLUE" bit on Y0 only.
+            if (is_hp_bank && !is_output) {
+                if (is_diff) {
+                    if (yLoc == 0)
+                        write_bit("IBUFDS_BANK_GLUE");
+                } else {
+                    write_bit("IBUF_HP_BANK_GLUE");
+                }
+            }
+            // Additional low-volt LVCMOS input bit on HP banks.
+            if (is_hp_bank && !is_diff && is_low_volt_lvcmos)
+                write_bit("LVCMOS12_LVCMOS15.IN");
+            // HP-bank IN_ONLY input-only variant (parallel to the wider one
+            // emitted in the is_riob18 branch below).  Vivado emits both
+            // for HP-bank input-only sites.
+            if (is_hp_bank && !is_output && !is_diff)
+                write_bit("LVCMOS12_LVCMOS15_SSTL12_SSTL135_SSTL15.IN_ONLY");
             if (!is_diff) {
                 if (iostandard == "LVCMOS33" || iostandard == "LVTTL" || iostandard == "LVCMOS25") {
                     if (!is_riob18)
@@ -978,6 +1123,22 @@ struct FasmBackend
 
         if (is_stepdown && !is_sing)
             write_bit("IOB_Y" + std::to_string(ioLoc.y) + ".LVCMOS12_LVCMOS15_LVCMOS18_SSTL135_SSTL15.STEPDOWN");
+
+        // HP-bank cross-site SLEW.SLOW defaults: Vivado emits these on the
+        // unused half of an active HP tile.  We omit the matching
+        // PULLTYPE.PULLDOWN here even though Vivado emits it — the
+        // prjxray DB encodes PULLDOWN with complement bits that clear the
+        // same physical bit INT_L_X*.IOB_COL_BANK_ACTIVE sets, and
+        // fasm2frames refuses the conflict.  Vivado's bitgen handles the
+        // overlap natively but the FASM round-trip can't.  Keep the SLEW
+        // dups (no conflict), skip the PULLDOWN cross-site.  Skip on SING
+        // tiles (only one site) and diff pairs (both halves are active).
+        if (is_hp_bank && !is_sing && !is_diff && slew == "SLOW"
+            && iostandard != "LVDS_25" && iostandard != "TMDS_33") {
+            std::string other = "IOB_Y" + std::to_string(ioLoc.y) + ".";
+            write_bit(other + "LVCMOS12_LVCMOS15_LVCMOS18_LVCMOS25_LVCMOS33_LVTTL_SSTL135_SSTL15.SLEW.SLOW");
+            write_bit(other + "LVCMOS12_LVCMOS15_LVCMOS18.SLEW.SLOW");
+        }
 
         pop(); // tile
     }
@@ -1192,6 +1353,72 @@ struct FasmBackend
             write_bit("TMDS_33_IN_USE", hclk.second.tmds_33);
             write_bit("LVDS_25_IN_USE", hclk.second.lvds_25);
             pop();
+        }
+
+        // For every L/RIOB18 tile that hosts an OBUF, Vivado activates
+        // the IO-column bits on the *nearest* INT_L tile in the same
+        // chipdb row.  Replicate that.  Caveats learned from comparing
+        // against Vivado's reference on the counter25 BUFG demo:
+        //  - We need the INT_L tile in the IO column's interconnect
+        //    reach (e.g. INT_L_X32Y… for an LIOB18_X81Y… IO column),
+        //    not the leftmost INT_L on the die.
+        //  - Both master and slave OBUFs count: a slave-only IOB tile
+        //    still gets the IOB_COL bits in the reference FASM.
+        //  - The chipdb row index of an INT_L is offset from the IOB
+        //    tile's chipdb row (HCLK rows split the IO column), so we
+        //    search a small neighbourhood of rows around the IOB.
+        const int chip_w = ctx->chip_info->width;
+        struct IobTile { int gy; int gx; bool is_left; };
+        std::map<std::pair<int,int>, IobTile> active_iob_tiles;
+        for (auto cell : sorted(ctx->cells)) {
+            CellInfo *ci = cell.second;
+            if (ci->bel == BelId()) continue;
+            if (ci->type != ctx->id("IOB18_OUTBUF_DCIEN")) continue;
+            const std::string tname = get_tile_name(ci->bel.tile);
+            bool is_left  = boost::starts_with(tname, "LIOB18_");
+            bool is_right = boost::starts_with(tname, "RIOB18_");
+            if (!is_left && !is_right) continue;
+            int gy = ci->bel.tile / chip_w;
+            int gx = ci->bel.tile % chip_w;
+            active_iob_tiles[{gy, gx}] = IobTile{gy, gx, is_left};
+        }
+
+        if (!active_iob_tiles.empty()) {
+            auto tt = ctx->getTilesAndTypes();
+            // For each active IO tile, walk inward (right for L, left
+            // for R) through nearby rows looking for an INT_L/INT_R.
+            std::set<std::string> emitted;
+            for (auto &kv : active_iob_tiles) {
+                const IobTile &io = kv.second;
+                const char *want = io.is_left ? "INT_L" : "INT_R";
+                // Search ±2 rows for an INT tile of the right type.
+                std::string chosen;
+                for (int dy = 0; dy <= 2 && chosen.empty(); dy++) {
+                    for (int sgn : {+1, -1}) {
+                        if (dy == 0 && sgn == -1) continue;
+                        int gy = io.gy + sgn * dy;
+                        if (gy < 0 || gy >= ctx->chip_info->height) continue;
+                        int step = io.is_left ? +1 : -1;
+                        int start = io.gx + step;
+                        int end   = io.is_left ? chip_w : -1;
+                        for (int gx = start; gx != end; gx += step) {
+                            int tile = gy * chip_w + gx;
+                            if (tile < 0 || tile >= int(tt.size())) continue;
+                            if (std::get<1>(tt[tile]) != want) continue;
+                            chosen = std::get<0>(tt[tile]);
+                            break;
+                        }
+                        if (!chosen.empty()) break;
+                    }
+                }
+                if (chosen.empty() || emitted.count(chosen)) continue;
+                emitted.insert(chosen);
+                push(chosen);
+                write_bit("IOB_COL_BANK_ACTIVE");
+                write_bit("IOB_COL_OBUF_CASCADE_Y1");
+                pop();
+                blank();
+            }
         }
     }
 
@@ -4184,6 +4411,7 @@ void write_gtx_channel(CellInfo *ci)
     void write_fasm()
     {
         get_invertible_pins(ctx, invertible_pins);
+        populate_bufgctrl_bound_slots();   // must run before any pip emission
         write_logic();
         write_cfg();
         write_io();
