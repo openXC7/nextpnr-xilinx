@@ -1282,11 +1282,18 @@ struct FasmBackend
         std::set<std::string> all_gclk;
         std::unordered_map<int, std::set<std::string>> hclk_by_row;
 
+        // Track which BUFGCTRL slots are bound in each CLK_BUFG_*_R tile so
+        // the second tile loop can emit default IMUX assignments for the
+        // unused ones (Vivado always writes them; nextpnr previously left
+        // them zero, costing ~32 FASM lines on a single-BUFG design).
+        std::unordered_map<int, std::set<int>> bufgctrl_used_y;
+
         for (auto cell : sorted(ctx->cells)) {
             CellInfo *ci = cell.second;
             if (ci->type == id_BUFGCTRL) {
                 push(get_tile_name(ci->bel.tile));
                 auto xy = ctx->getSiteLocInTile(ci->bel);
+                bufgctrl_used_y[ci->bel.tile].insert(xy.y);
                 push("BUFGCTRL.BUFGCTRL_X" + std::to_string(xy.x) + "Y" + std::to_string(xy.y));
                 write_bit("IN_USE");
                 write_bit("INIT_OUT", bool_or_default(ci->params, ctx->id("INIT_OUT")));
@@ -1375,6 +1382,28 @@ struct FasmBackend
             } else if (boost::starts_with(type, "HCLK_CMT")) {
                 for (auto &hclk : hclk_by_row[tile / ctx->chip_info->width]) {
                     write_bit("HCLK_CMT_CK_" + hclk + "_USED");
+                }
+            } else if (type == "CLK_BUFG_TOP_R" || type == "CLK_BUFG_BOT_R") {
+                // Vivado emits default I0/I1 input-mux assignments for every
+                // unused BUFGCTRL slot in this tile (each of the 16 slots
+                // routes its I_<n> input from CLK_BUFG_IMUX<28+(N%4)>_<N/4>
+                // when not actively driven by user logic).  Replicate that
+                // only if at least one BUFGCTRL in this tile IS bound —
+                // tiles with no BUFG activity stay zero, matching Vivado.
+                auto it = bufgctrl_used_y.find(tile);
+                if (it != bufgctrl_used_y.end()) {
+                    const auto &used = it->second;
+                    for (int n = 0; n < 16; ++n) {
+                        if (used.count(n))
+                            continue;
+                        std::string imux =
+                            "CLK_BUFG_IMUX" + std::to_string(28 + (n % 4))
+                            + "_" + std::to_string(n / 4);
+                        write_bit("CLK_BUFG_BUFGCTRL" + std::to_string(n)
+                                  + "_I0." + imux);
+                        write_bit("CLK_BUFG_BUFGCTRL" + std::to_string(n)
+                                  + "_I1." + imux);
+                    }
                 }
             }
             pop();
