@@ -112,6 +112,19 @@ void XC7Packer::prepare_clocking()
         } else if (ci->type == id_BUFH || ci->type == id_BUFHCE) {
             ci->type = id_BUFHCE_BUFHCE;
             tie_port(ci, "CE", true, true);
+        } else if (ci->type == id_BUFR) {
+            // BUFR site holds a single BEL of type BUFR_BUFR (per the
+            // virtex7 meta tree, ported from artix7).  Rename the cell
+            // type to match the BEL.  No port renames needed (BUFR pin
+            // names are identical: I/CE/CLR/O), but json2dcp drops any
+            // connection that lacks an X_ORIG_PORT_<name> attribute,
+            // so emit identity mappings for the four ports.
+            save_orig_type();
+            ci->type = id_BUFR_BUFR;
+            save_orig_port("I",   "I");
+            save_orig_port("CE",  "CE");
+            save_orig_port("CLR", "CLR");
+            save_orig_port("O",   "O");
         }
     }
 }
