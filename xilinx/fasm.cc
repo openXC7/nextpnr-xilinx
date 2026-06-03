@@ -790,8 +790,34 @@ struct FasmBackend
         push(get_half_name(half, is_mtile));
 
         write_routing_bel(get_site_wire(carry->bel, "PRECYINIT_OUT"));
-        if (get_net_or_empty(carry, ctx->id("CIN")) != nullptr)
-            write_bit("PRECYINIT.CIN");
+        // Select the CARRY4 carry-in source.  PRECYINIT.CIN takes the carry
+        // chain input (the slice below's CO), which only makes sense mid-chain
+        // and requires that wire to be physically driven.  At a chain ROOT the
+        // carry-in is a constant: nextpnr ties both CIN and CYINIT to
+        // $PACKER_GND_NET / $PACKER_VCC_NET.  Emitting PRECYINIT.CIN there made
+        // the carry-in depend on routing the GND/VCC pseudo-net into the slice
+        // (the "arc 38 of $PACKER_GND_NET" gap) — when that route fails the
+        // carry-in floats and the whole adder/incrementer is dead.  Vivado
+        // instead generates the constant locally via PRECYINIT.C0/.C1.  Do the
+        // same: only a real (non-constant) CIN net selects .CIN.
+        {
+            NetInfo *cin    = get_net_or_empty(carry, ctx->id("CIN"));
+            NetInfo *cyinit = get_net_or_empty(carry, ctx->id("CYINIT"));
+            IdString gnd = ctx->id("$PACKER_GND_NET");
+            IdString vcc = ctx->id("$PACKER_VCC_NET");
+            bool cin_is_chain = cin != nullptr && cin->name != gnd && cin->name != vcc;
+            if (cin_is_chain) {
+                write_bit("PRECYINIT.CIN");
+            } else {
+                // Constant carry-in: take the value from CYINIT (preferred) or a
+                // constant CIN.  VCC -> C1, anything else (GND/unconnected) -> C0.
+                NetInfo *konst = cyinit != nullptr ? cyinit : cin;
+                if (konst != nullptr && konst->name == vcc)
+                    write_bit("PRECYINIT.C1");
+                else
+                    write_bit("PRECYINIT.C0");
+            }
+        }
         push("CARRY4");
         for (char c : {'A', 'B', 'C', 'D'})
             write_routing_bel(get_site_wire(carry->bel, std::string("") + c + std::string("CY0_OUT")));
