@@ -357,9 +357,16 @@ void Arch::setup_pip_blacklist()
                 std::string dest_name = IdString(td.wire_data[pd.dst_index].name).str(this);
                 std::string src_name = IdString(td.wire_data[pd.src_index].name).str(this);
 
-                if (boost::contains(dest_name, "CK_BUFG_CASCO") &&
-                    boost::contains(src_name, "CK_BUFG_CASCIN"))
-                    blacklist_pips[td.type].insert(j);
+                // NOTE: the CK_BUFG_CASCIN->CK_BUFG_CASCO cascade pip is NOT
+                // blacklisted.  Vivado's dedicated clock-input path for an
+                // IBUFDS->BUFG net descends this cascade (CCIO -> CK_IN_R ->
+                // CASCO -> CASCIN -> ... -> CK_MUXED -> BUFGCTRL.I0).
+                // Blacklisting it left the BUFG input with only the fabric
+                // CLK_BUFG_IMUX pip, which does not deliver a working clock
+                // (dead BUFG, frozen design).  routeClock() binds this cascade
+                // STRENGTH_LOCKED before the general router runs, so re-enabling
+                // it cannot create a routing loop for ordinary nets.
+                (void)src_name;
             }
         } else if (boost::starts_with(type, "HCLK_IOI")) {
             for (int j = 0; j < td.num_pips; j++) {
@@ -765,6 +772,16 @@ void Arch::routeClock()
             clk_net_user_type == id_MMCME2_ADV_MMCME2_ADV;
         auto to_pll_mmcm_clkin1 = to_pll_or_mmcm && clk_net->users.front().port == id_CLKIN1;
 
+        // A single-user net feeding a BUFGCTRL clock input (I0) — e.g. the
+        // IBUFDS->BUFG input net — must reach the buffer through the dedicated
+        // CCIO->HCLK_CMT->CLK_HROW->CK_MUXED backbone.  Left to the general
+        // router it grabs the fabric pip CLK_BUFG_..._IMUX*_*->BUFGCTRL_I0,
+        // which does NOT deliver a working clock (the BUFG output is dead and
+        // the whole design freezes).  Route it here as a global so the
+        // dedicated path is bound LOCKED before the general router runs.
+        auto to_bufg_input = (no_users == 1 && clk_net_user_type == id_BUFGCTRL &&
+                              clk_net->users.front().port == id_I0);
+
         // check if we have a global clock net, skip otherwise
         bool is_global = false;
         if ((driver_type == id_BUFGCTRL    || driver_type == id_BUFCE_BUFG_PS ||
@@ -776,6 +793,8 @@ void Arch::routeClock()
                   clk_net_user_type == id_BUFGCE_DIV_BUFGCE_DIV))
             is_global = true;
         else if (to_pll_mmcm_clkin1)
+            is_global = true;
+        else if (to_bufg_input)
             is_global = true;
         if (!is_global)
             continue;
@@ -838,7 +857,7 @@ void Arch::routeClock()
             }
             if (dest == WireId()) {
                 log_info("            failed to find a route using dedicated resources.\n");
-                if (to_pll_mmcm_clkin1) {
+                if (to_pll_mmcm_clkin1 || to_bufg_input) {
                     // Due to some missing pips, currently special case more lenient solution
                     std::queue<WireId> empty;
                     std::swap(visit, empty);
@@ -1027,9 +1046,17 @@ bool Arch::route()
 {
     assign_budget(getCtx(), true);
     std::string router = str_or_default(settings, id("router"), defaultRouter);
+    // Route dedicated clocks BEFORE the Vcc flood.  The packer ties BUFGCTRL
+    // CE0/S0/S1/IGNORE to $PACKER_VCC_NET, and routeVcc()'s uphill BFS to reach
+    // those control pins greedily claims the adjacent clock-backbone wires
+    // (CLK_BUFG_REBUF, HCLK_INT_INTERFACE, CK_BUFG_CASC).  If Vcc runs first it
+    // locks the real clock out of its dedicated CCIO->CMT->HROW->CK_MUXED path,
+    // forcing the IBUFDS->BUFG input onto a fabric IMUX pip that does not
+    // deliver a working clock (dead design).  Clocks first; Vcc routes around
+    // the LOCKED clock wires afterwards.
+    routeClock();
     if (router != "router2")
         routeVcc();
-    routeClock();
     findSourceSinkLocations();
 
     bool result;
