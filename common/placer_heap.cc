@@ -529,8 +529,25 @@ class HeAPPlacer
                 continue;
             available_bels[ctx->getBelType(bel)].push_back(bel);
         }
-        for (auto &t : available_bels) {
-            std::shuffle(t.second.begin(), t.second.end(), std::default_random_engine(ctx->rng(std::numeric_limits<int>::max())));
+        // Shuffle each bel-type's pool deterministically and *identically on
+        // every platform*.  Two things here were implementation-defined and
+        // made Linux (libstdc++) and macOS (libc++) diverge into different
+        // initial placements — the butterfly that flips a routable placement
+        // into an unroutable one:
+        //   (a) std::default_random_engine is a different algorithm per STL;
+        //   (b) iterating available_bels (an unordered_map) fed the per-type
+        //       RNG seeds in a different, hash-dependent order.
+        // Fix both: iterate bel types in name-sorted order, and shuffle with
+        // std::mt19937 (a fixed, standardised PRNG).
+        std::vector<IdString> bel_type_order;
+        bel_type_order.reserve(available_bels.size());
+        for (auto &t : available_bels)
+            bel_type_order.push_back(t.first);
+        std::sort(bel_type_order.begin(), bel_type_order.end(),
+                  [&](IdString a, IdString b) { return a.str(ctx) < b.str(ctx); });
+        for (auto type : bel_type_order) {
+            auto &bels = available_bels[type];
+            std::shuffle(bels.begin(), bels.end(), std::mt19937(ctx->rng(std::numeric_limits<int>::max())));
         }
         for (auto cell : sorted(ctx->cells)) {
             CellInfo *ci = cell.second;
