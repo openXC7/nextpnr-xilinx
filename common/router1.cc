@@ -485,7 +485,7 @@ struct Router1
         // A* main loop
 
         int visitCnt = 0;
-        int maxVisitCnt = INT_MAX;
+        int maxVisitCnt = cfg.arcMaxVisitCnt;
         delay_t best_est = 0;
         delay_t best_score = -1;
 
@@ -802,6 +802,14 @@ Router1Cfg::Router1Cfg(Context *ctx)
     cleanupReroute = ctx->setting<bool>("router1/cleanupReroute", true);
     fullCleanupReroute = ctx->setting<bool>("router1/fullCleanupReroute", true);
     useEstimate = ctx->setting<bool>("router1/useEstimate", true);
+    arcMaxVisitCnt = ctx->setting<int>("router1/arcMaxVisitCnt", INT_MAX);
+    skipFailedArcs = ctx->setting<bool>("router1/skipFailedArcs", false);
+    // Env-var overrides (avoid command.cc plumbing): bound the per-arc A* search
+    // and skip arcs that exceed it, so a hanging arc is left for an external router.
+    if (const char *amv = getenv("NEXTPNR_ARC_MAX_VISIT"))
+        arcMaxVisitCnt = atoi(amv);
+    if (getenv("NEXTPNR_SKIP_FAILED_ARCS"))
+        skipFailedArcs = true;
 
     wireRipupPenalty = ctx->getRipupDelayPenalty();
     netRipupPenalty = 10 * ctx->getRipupDelayPenalty();
@@ -836,6 +844,7 @@ bool router1(Context *ctx, const Router1Cfg &cfg)
         log_info("   IterCnt |  w/ripup   wo/ripup |  w/r  wo/r |      arcs| batch(sec) total(sec)|\n");
 
         auto prev_time = rstart;
+        std::vector<arc_key> skipped_arcs;
         while (!router.arc_queue.empty()) {
             if (++iter_cnt % 1000 == 0) {
                 auto curr_time = std::chrono::high_resolution_clock::now();
@@ -859,6 +868,17 @@ bool router1(Context *ctx, const Router1Cfg &cfg)
             arc_key arc = router.arc_queue_pop();
 
             if (!router.route_arc(arc, true)) {
+                if (cfg.skipFailedArcs) {
+                    // Per-arc budget exceeded / no path within budget.  Leave this
+                    // arc unrouted and carry on; an external router (RapidWright)
+                    // finishes it.  A failed route_arc binds nothing, so state is
+                    // consistent.
+                    log_warning("Skipping arc %d of net %s (unroutable within budget; "
+                                "left for external router).\n",
+                                arc.user_idx, ctx->nameOf(arc.net_info));
+                    skipped_arcs.push_back(arc);
+                    continue;
+                }
                 log_warning("Failed to find a route for arc %d of net %s.\n", arc.user_idx, ctx->nameOf(arc.net_info));
 #ifndef NDEBUG
                 router.check();
@@ -874,6 +894,12 @@ bool router1(Context *ctx, const Router1Cfg &cfg)
                  router.arcs_without_ripup - last_arcs_without_ripup, int(router.arc_queue.size()),
                  std::chrono::duration<float>(rend - prev_time).count(),
                  std::chrono::duration<float>(rend - rstart).count());
+        if (!skipped_arcs.empty()) {
+            log_warning("router1: %d arc(s) left unrouted (budget exceeded) for an "
+                        "external router to finish:\n", int(skipped_arcs.size()));
+            for (auto &a : skipped_arcs)
+                log_warning("    net %s arc %d\n", ctx->nameOf(a.net_info), a.user_idx);
+        }
         log_info("Routing complete.\n");
         ctx->yield();
         log_info("Router1 time %.02fs\n", std::chrono::duration<float>(rend - rstart).count());
@@ -881,7 +907,10 @@ bool router1(Context *ctx, const Router1Cfg &cfg)
 #ifndef NDEBUG
         router.check();
         ctx->check();
-        log_assert(ctx->checkRoutedDesign());
+        // With skipFailedArcs the design is intentionally left partially routed,
+        // so the full-routing assertion would (correctly) fail — skip it.
+        if (!cfg.skipFailedArcs)
+            log_assert(ctx->checkRoutedDesign());
 #endif
 
         log_info("Checksum: 0x%08x\n", ctx->checksum());

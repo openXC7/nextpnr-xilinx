@@ -32,6 +32,12 @@ struct Router1Cfg
     bool cleanupReroute;
     bool fullCleanupReroute;
     bool useEstimate;
+    // Per-arc A* node budget.  An unroutable sink otherwise explores the whole
+    // chip (effective hang).  When exceeded the arc fails; with skipFailedArcs
+    // it is left unrouted (to be finished by an external router) instead of
+    // aborting the whole route.  Default INT_MAX = original unbounded behaviour.
+    int arcMaxVisitCnt;
+    bool skipFailedArcs;
     delay_t wireRipupPenalty;
     delay_t netRipupPenalty;
     delay_t reuseBonus;

@@ -424,12 +424,14 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
 
             // FF1 might use X, if it isn't driven directly
             CellInfo *ff1 = lts.cells[i << 4 | BEL_FF];
+            bool ff1_uses_x = false;
             if (ff1 != nullptr && ff1->ffInfo.d != nullptr && ff1->ffInfo.d->driver.cell != nullptr) {
                 auto &drv = ff1->ffInfo.d->driver;
                 if ((drv.cell == lut6 && drv.port != id_MC31) || drv.cell == lut5 || drv.cell == out_fmux) {
                     // Direct, OK
                 } else {
                     // Indirect, must use X input
+                    ff1_uses_x = true;
                     if (x_net == nullptr)
                         x_net = ff1->ffInfo.d;
                     else if (x_net != ff1->ffInfo.d) {
@@ -458,6 +460,17 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
                         return false;
                     }
                 }
+            }
+
+            // Legalisation fix (xc7): when the main FF (BEL_FF) takes its D from
+            // the X bypass (indirect) AND the column's secondary "5" FF (BEL_FF2)
+            // is also placed, nextpnr's router fails to bind the main FF's input
+            // MUX (xFFMUX) from X — it silently leaves the main FF's D floating
+            // (observed via physical sim: the bypass-fed AFF's D = X, corrupting
+            // an LFSR).  Forbid that co-pack so the placer separates the two FFs.
+            if (ff1_uses_x && ff2 != nullptr) {
+                DBG();
+                return false;
             }
 
             // collision with top address bits

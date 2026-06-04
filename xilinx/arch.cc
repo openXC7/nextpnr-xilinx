@@ -1055,6 +1055,15 @@ bool Arch::route()
     // deliver a working clock (dead design).  Clocks first; Vcc routes around
     // the LOCKED clock wires afterwards.
     routeClock();
+    // --route-clock-only: nextpnr routes just the dedicated clock backbone
+    // (IBUFDS->BUFG input on CCIO->CMT->HROW->CK_MUXED, and BUFG->global) and
+    // hands the placed-but-otherwise-unrouted design off to an external router
+    // (RapidWright's classic 7-series Router) that fills in all general nets.
+    if (settings.find(id("route-clock-only")) != settings.end()) {
+        getCtx()->settings[getCtx()->id("route")] = 1;
+        archInfoToAttributes();
+        return true;
+    }
     if (router != "router2")
         routeVcc();
     findSourceSinkLocations();
