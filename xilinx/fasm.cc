@@ -224,6 +224,56 @@ struct FasmBackend
                 }
         }
 
+        // === #102 LIOI mirror — left-side IOI tiles (LIOI, LIOI_SING,
+        // LIOI_TBYTESRC, LIOI_TBYTETERM) carry the same OLOGIC / ILOGIC
+        // pass-through PIP set as RIOI; without these entries nextpnr
+        // emits "Unprocessed route-thru" warnings and the OBUFs on the
+        // VC707 LED bank end up with stuck-high outputs because the
+        // OLOGIC OQ register sits at its default state.  prjxray's
+        // segbits_lioi.db has full OLOGIC coverage (word_bit addresses
+        // match RIOI 1:1) so re-using the same FASM feature names
+        // assembles correctly.
+        for (std::string s2 : {"", "_TBYTESRC", "_TBYTETERM", "_SING"})
+            for (std::string i :
+                 (s2 == "_SING") ? std::vector<std::string>{"0"     }
+                                 : std::vector<std::string>{"0", "1"}) {
+                pp_config[{ ctx->id("LIOI" + s2),
+                            ctx->id("LIOI_OLOGIC" + i + "_OQ"), ctx->id("IOI_OLOGIC" + i + "_D1") }] = {
+                                "OLOGIC_Y" + i + ".OMUX.D1",
+                                "OLOGIC_Y" + i + ".OQUSED",
+                                "OLOGIC_Y" + i + ".OSERDES.DATA_RATE_TQ.BUF"
+                            };
+                pp_config[{ ctx->id("LIOI" + s2),
+                            ctx->id("LIOI_OLOGIC" + i + "_OFB"), ctx->id("LIOI_OLOGIC" + i + "_OQ") }] = { };
+                pp_config[{ ctx->id("LIOI" + s2),
+                            ctx->id("LIOI_O" + i), ctx->id("LIOI_ODELAY" + i + "_DATAOUT") }] = { };
+                pp_config[{ ctx->id("LIOI" + s2),
+                            ctx->id("LIOI_OLOGIC" + i + "_OFB"), ctx->id("IOI_OLOGIC" + i + "_D1") }] = {
+                                "OLOGIC_Y" + i + ".OMUX.D1",
+                                "OLOGIC_Y" + i + ".OSERDES.DATA_RATE_TQ.BUF"
+                            };
+                pp_config[{ ctx->id("LIOI" + s2),
+                            ctx->id("IOI_ILOGIC" + i + "_O"), ctx->id("LIOI_ILOGIC" + i + "_D") }] = {
+                                "ILOGIC_Y" + i + ".ZINV_D"
+                            };
+                pp_config[{ ctx->id("LIOI" + s2),
+                            ctx->id("IOI_ILOGIC" + i + "_O"), ctx->id("LIOI_ILOGIC" + i + "_DDLY") }] = {
+                                "ILOGIC_Y" + i + ".IDELMUXE3.P0",
+                                "ILOGIC_Y" + i + ".ZINV_D"
+                            };
+                pp_config[{ ctx->id("LIOI" + s2),
+                            ctx->id("LIOI_OLOGIC" + i + "_TQ"), ctx->id("IOI_OLOGIC" + i + "_T1") }] = {
+                                "OLOGIC_Y" + i + ".ZINV_T1"
+                            };
+                if (i == "0") {
+                    pp_config[{ctx->id("LIOB18" + s2), ctx->id("IOB_O_IN1"),     ctx->id("IOB_O_OUT0")}]  = {};
+                    pp_config[{ctx->id("LIOB18" + s2), ctx->id("IOB_O_OUT0"),    ctx->id("IOB_O0")}]      = {};
+                    pp_config[{ctx->id("LIOB18" + s2), ctx->id("IOB_T_IN1"),     ctx->id("IOB_T_OUT0")}]  = {};
+                    pp_config[{ctx->id("LIOB18" + s2), ctx->id("IOB_T_OUT0"),    ctx->id("IOB_T0")}]      = {};
+                    pp_config[{ctx->id("LIOB18" + s2), ctx->id("IOB_DIFFI_IN0"), ctx->id("IOB_PADOUT1")}] = {};
+                }
+        }
+
         for (std::string s1 : {"TOP", "BOT"}) {
             for (std::string s2 : {"L", "R"}) {
                 for (int i = 0; i < 12; i++) {
