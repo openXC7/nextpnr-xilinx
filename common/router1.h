@@ -38,6 +38,12 @@ struct Router1Cfg
     // aborting the whole route.  Default INT_MAX = original unbounded behaviour.
     int arcMaxVisitCnt;
     bool skipFailedArcs;
+    // When set, route_const_arc() routes GND/VCC sinks using ONLY free wires (no
+    // ripup pass), so the constant net never tears up an already-placed signal to
+    // grab a shorter path -- it takes a longer free path instead.  Used by the
+    // hybrid flow (router2 signals first, then router1 const) to keep the signal
+    // routing/timing intact.  Env: NEXTPNR_GND_NO_RIPUP.
+    bool constNoRipup;
     delay_t wireRipupPenalty;
     delay_t netRipupPenalty;
     delay_t reuseBonus;

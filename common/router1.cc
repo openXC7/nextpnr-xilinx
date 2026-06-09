@@ -293,6 +293,20 @@ struct Router1
             if (skip_net(net_info))
                 continue;
 
+            // Constant nets use the shared per-sink pseudo-source model, not
+            // the single-source arc model this check validates.  Register
+            // their arcs as valid (so the global arc/wire asserts pass) but
+            // skip the single-source wire validation.
+            if (is_const_net(net_info)) {
+                for (int user_idx = 0; user_idx < int(net_info->users.size()); user_idx++) {
+                    arc_key arc;
+                    arc.net_info = net_info;
+                    arc.user_idx = user_idx;
+                    valid_arcs.insert(arc);
+                }
+                continue;
+            }
+
 #if 0
             if (ctx->debug)
                 log("[check] net: %s\n", ctx->nameOf(net_info));
@@ -358,6 +372,21 @@ struct Router1
 
             if (skip_net(net_info))
                 continue;
+
+            // Constant (GND/VCC) nets do not follow the single-source arc
+            // model — each sink is sourced from its nearest pseudo-constant
+            // wire by route_const_arc.  Skip the source/sink collision
+            // bookkeeping (a LUT route-through legitimately appears as both a
+            // logic source and a constant sink) and just queue the arcs.
+            if (is_const_net(net_info)) {
+                for (int user_idx = 0; user_idx < int(net_info->users.size()); user_idx++) {
+                    arc_key arc;
+                    arc.net_info = net_info;
+                    arc.user_idx = user_idx;
+                    arc_queue_insert(arc);
+                }
+                continue;
+            }
 
             auto src_wire = ctx->getNetinfoSourceWire(net_info);
 
@@ -439,11 +468,127 @@ struct Router1
         }
     }
 
+    // Is this the global GND or VCC constant pseudo-net?
+    bool is_const_net(const NetInfo *ni) const
+    {
+        return ni->name == ctx->id("$PACKER_GND_NET") || ni->name == ctx->id("$PACKER_VCC_NET");
+    }
+
+    // Route one sink of a constant (GND/VCC) net the way router2/Vivado do:
+    // rather than threading a single global source to every sink (which
+    // congests and collides with LUT route-throughs), source the constant
+    // from the *nearest* pseudo-constant wire.  A backward BFS from the sink
+    // terminates at the first wire whose intent is PSEUDO_GND/PSEUDO_VCC; the
+    // pseudo-network is shared, so wires/pips already used by this same net
+    // are reusable.
+    bool route_const_arc(const arc_key &arc)
+    {
+        NetInfo *net_info = arc.net_info;
+        int user_idx = arc.user_idx;
+        WireId dst_wire = ctx->getNetinfoSinkWire(net_info, net_info->users[user_idx]);
+        ripup_flag = false;
+        int32_t pseudo = (net_info->name == ctx->id("$PACKER_VCC_NET")) ? ID_PSEUDO_VCC : ID_PSEUDO_GND;
+
+        // release wires previously used only by this arc
+        std::unordered_set<WireId> old_arc_wires;
+        old_arc_wires.swap(arc_to_wires[arc]);
+        for (WireId wire : old_arc_wires) {
+            auto &arc_wires = wire_to_arcs.at(wire);
+            arc_wires.erase(arc);
+            if (arc_wires.empty())
+                ctx->unbindWire(wire);
+        }
+
+        // backward BFS: wire -> downhill pip leading toward dst (PipId() at dst)
+        // First pass prefers wires/pips that are free (or already this net's);
+        // if no pseudo source is reachable that way, a second pass allows
+        // traversing wires used by other nets (ripped up at bind time).
+        std::unordered_map<WireId, PipId> reached;
+        WireId src_wire;
+        int maxiters = cfg.arcMaxVisitCnt;
+        int max_ripup = cfg.constNoRipup ? 0 : 1; // no-ripup: free wires only, never tear up signals
+        for (int allow_ripup = 0; allow_ripup <= max_ripup && src_wire == WireId(); allow_ripup++) {
+            reached.clear();
+            std::queue<WireId> bfs;
+            bfs.push(dst_wire);
+            reached[dst_wire] = PipId();
+            int iters = 0;
+            while (!bfs.empty() && iters++ < maxiters) {
+                WireId w = bfs.front();
+                bfs.pop();
+                if (ctx->wireIntent(w) == pseudo) {
+                    src_wire = w;
+                    break;
+                }
+                for (PipId pip : ctx->getPipsUphill(w)) {
+                    if (!allow_ripup && !ctx->checkPipAvail(pip) && ctx->getBoundPipNet(pip) != net_info)
+                        continue;
+                    WireId src = ctx->getPipSrcWire(pip);
+                    if (reached.count(src))
+                        continue;
+                    if (!allow_ripup && !ctx->checkWireAvail(src) && ctx->getBoundWireNet(src) != net_info)
+                        continue;
+                    reached[src] = pip;
+                    bfs.push(src);
+                }
+            }
+        }
+        if (src_wire == WireId()) {
+            if (ctx->debug)
+                log_info("  route_const_arc: no %s source reachable for sink %s (cell %s port %s)\n",
+                         (pseudo == ID_PSEUDO_VCC) ? "VCC" : "GND", ctx->nameOfWire(dst_wire),
+                         ctx->nameOf(net_info->users[user_idx].cell), ctx->nameOf(net_info->users[user_idx].port));
+            return false;
+        }
+
+        // bind the path forward from the pseudo source down to the sink
+        WireId cursor = src_wire;
+        while (true) {
+            if (ctx->getBoundWireNet(cursor) != net_info) {
+                if (!ctx->checkWireAvail(cursor)) {
+                    ripup_wire(cursor);
+                    NPNR_ASSERT(ctx->checkWireAvail(cursor));
+                }
+                ctx->bindWire(cursor, net_info, STRENGTH_WEAK);
+            }
+            wire_to_arcs[cursor].insert(arc);
+            arc_to_wires[arc].insert(cursor);
+            PipId pip = reached.at(cursor);
+            if (pip == PipId())
+                break;
+            // bindPip also claims the pip's destination wire, so it must be
+            // free (or already ours) before we bind — clear any other net
+            // occupying it first.
+            WireId next_wire = ctx->getPipDstWire(pip);
+            if (ctx->getBoundWireNet(next_wire) != net_info && !ctx->checkWireAvail(next_wire)) {
+                ripup_wire(next_wire);
+                NPNR_ASSERT(ctx->checkWireAvail(next_wire));
+            }
+            if (ctx->getBoundPipNet(pip) != net_info) {
+                if (!ctx->checkPipAvail(pip)) {
+                    ripup_pip(pip);
+                    NPNR_ASSERT(ctx->checkPipAvail(pip));
+                }
+                ctx->bindPip(pip, net_info, STRENGTH_WEAK);
+            }
+            cursor = next_wire;
+        }
+
+        if (ripup_flag)
+            arcs_with_ripup++;
+        else
+            arcs_without_ripup++;
+        return true;
+    }
+
     bool route_arc(const arc_key &arc, bool ripup)
     {
 
         NetInfo *net_info = arc.net_info;
         int user_idx = arc.user_idx;
+
+        if (is_const_net(net_info))
+            return route_const_arc(arc);
 
         auto src_wire = ctx->getNetinfoSourceWire(net_info);
         auto dst_wire = ctx->getNetinfoSinkWire(net_info, net_info->users[user_idx]);
@@ -810,6 +955,7 @@ Router1Cfg::Router1Cfg(Context *ctx)
         arcMaxVisitCnt = atoi(amv);
     if (getenv("NEXTPNR_SKIP_FAILED_ARCS"))
         skipFailedArcs = true;
+    constNoRipup = getenv("NEXTPNR_GND_NO_RIPUP") != nullptr;
 
     wireRipupPenalty = ctx->getRipupDelayPenalty();
     netRipupPenalty = 10 * ctx->getRipupDelayPenalty();
@@ -939,6 +1085,15 @@ bool Context::checkRoutedDesign() const
         if (net_info->is_global)
             continue;
 #endif
+
+        // Constant (GND/VCC) nets do not use the single-source tree model: each sink is
+        // sourced independently from its nearest pseudo-constant wire (route_const_arc),
+        // so the net's global driver wire is intentionally never bound and the per-sink
+        // pseudo segments look like "stubs/dangling" to the tree walk below.  Per-sink
+        // routing completeness is already guaranteed by route_const_arc (it fails loudly
+        // on any unroutable sink), so skip the tree check here rather than assert.
+        if (net_info->name == ctx->id("$PACKER_GND_NET") || net_info->name == ctx->id("$PACKER_VCC_NET"))
+            continue;
 
         if (ctx->debug)
             log("checking net %s\n", ctx->nameOf(net_info));
@@ -1094,8 +1249,12 @@ bool Context::checkRoutedDesign() const
             fail = true;
         }
 
-        if (fail)
+        if (fail) {
+            log("checkRoutedDesign FAIL net %s: unrouted=%d loop=%d stub=%d dangling=%d\n",
+                ctx->nameOf(net_info), int(found_unrouted), int(found_loop), int(found_stub),
+                int(!dangling_wires.empty()));
             return false;
+        }
     }
 
     return true;

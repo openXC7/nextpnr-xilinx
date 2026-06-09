@@ -813,7 +813,38 @@ struct FasmBackend
                 write_bit("SRL", is_srl);
                 pop();
             }
-            write_routing_bel(get_site_wire(bel_in_half, std::string("") + ("ABCD"[i]) + std::string("MUX")));
+            WireId xmux = get_site_wire(bel_in_half, std::string("") + ("ABCD"[i]) + std::string("MUX"));
+            write_routing_bel(xmux);
+            // Slice combinational output mux (xOUTMUX).  write_routing_bel emits
+            // it when the O6/O5->xMUX selection is a bound pip — but when the
+            // same LUT O6 also drives the local FF, the FFMUX binding from that
+            // O6 shadows the OUTMUX site-pip, so nothing is emitted and the
+            // fabric fanout (e.g. a clock-enable network) is left unconfigured.
+            // Emit the selection explicitly when the xMUX wire carries a LUT
+            // output but no uphill pip was emitted above.
+            if (xmux != WireId()) {
+                NetInfo *xnet = ctx->getBoundWireNet(xmux);
+                if (xnet != nullptr) {
+                    bool pip_emitted = false;
+                    for (auto pip : ctx->getPipsUphill(xmux))
+                        if (ctx->getBoundPipNet(pip) != nullptr) {
+                            pip_emitted = true;
+                            break;
+                        }
+                    if (!pip_emitted) {
+                        const char *sel = nullptr;
+                        if (lut6 != nullptr && lut6->lutInfo.output_sigs[0] == xnet)
+                            sel = "O6";
+                        else if (lut6 != nullptr && lut6->lutInfo.output_count == 2 &&
+                                 lut6->lutInfo.output_sigs[1] == xnet)
+                            sel = "O5";
+                        else if (lut5 != nullptr && lut5->lutInfo.output_sigs[0] == xnet)
+                            sel = "O5";
+                        if (sel != nullptr)
+                            write_bit(std::string("") + ("ABCD"[i]) + "OUTMUX." + sel);
+                    }
+                }
+            }
         }
         write_bit("WA7USED", wa7_used);
         write_bit("WA8USED", wa8_used);
@@ -839,7 +870,6 @@ struct FasmBackend
         push(tname);
         push(get_half_name(half, is_mtile));
 
-        write_routing_bel(get_site_wire(carry->bel, "PRECYINIT_OUT"));
         // Select the CARRY4 carry-in source.  PRECYINIT.CIN takes the carry
         // chain input (the slice below's CO), which only makes sense mid-chain
         // and requires that wire to be physically driven.  At a chain ROOT the
@@ -855,12 +885,30 @@ struct FasmBackend
             NetInfo *cyinit = get_net_or_empty(carry, ctx->id("CYINIT"));
             IdString gnd = ctx->id("$PACKER_GND_NET");
             IdString vcc = ctx->id("$PACKER_VCC_NET");
-            bool cin_is_chain = cin != nullptr && cin->name != gnd && cin->name != vcc;
-            if (cin_is_chain) {
+            bool cin_is_chain  = cin    != nullptr && cin->name    != gnd && cin->name != vcc;
+            bool cyinit_is_dyn = cyinit != nullptr && cyinit->name != gnd && cyinit->name != vcc;
+            // The carry packer disconnects a constant carry-in and records its
+            // value here, so router2 needn't route GND/VCC into CIN/CYINIT.
+            int precyinit_const = int_or_default(carry->params, ctx->id("PRECYINIT_CONST"), -1);
+            if (precyinit_const >= 0) {
+                write_bit(precyinit_const ? "PRECYINIT.C1" : "PRECYINIT.C0");
+            } else if (cin_is_chain) {
+                // Mid-chain CARRY4: carry-in is the slice-below CO via the CIN
+                // cascade.  Select it explicitly; do NOT emit the PRECYINIT_OUT
+                // routing bel — when nextpnr has also routed the (unused) CYINIT
+                // via the AX path, that routing bel emits a PRECYINIT.AX bit
+                // whose segbits conflict with PRECYINIT.CIN (FasmInconsistentBits).
                 write_bit("PRECYINIT.CIN");
+            } else if (cyinit_is_dyn) {
+                // Chain root with a *dynamic* carry-in: CYINIT is driven by a
+                // real net, routed in via the AX pin.  Emit the PRECYINIT_OUT
+                // routing bel, which selects PRECYINIT.AX.  (Forcing C0/C1 here
+                // would tie the carry-in to a constant and break the adder.)
+                write_routing_bel(get_site_wire(carry->bel, "PRECYINIT_OUT"));
             } else {
-                // Constant carry-in: take the value from CYINIT (preferred) or a
-                // constant CIN.  VCC -> C1, anything else (GND/unconnected) -> C0.
+                // Constant carry-in: the PRECYINIT mux selects C0/C1 directly
+                // (no routing bel -> no conflicting AX bit).  Take the value
+                // from CYINIT (preferred) or a constant CIN: VCC -> C1, else C0.
                 NetInfo *konst = cyinit != nullptr ? cyinit : cin;
                 if (konst != nullptr && konst->name == vcc)
                     write_bit("PRECYINIT.C1");
@@ -1077,22 +1125,72 @@ struct FasmBackend
             // HP-bank IBUF glue — fires per active input site (parallel to
             // OBUF_HP_BANK_GLUE).  For differential inputs Vivado uses a
             // different "IBUFDS_BANK_GLUE" bit on Y0 only.
+            // LEFT HP bank (LIOB18) single-ended input on the SLAVE site (IOB_Y1,
+            // e.g. the N pin of a diff pair) is a special case: it has no input
+            // amplifier of its own, so Vivado receives it through the MASTER half's
+            // (IOB_Y0) differential amplifier -- partner-half LVDS glue emitted below
+            // -- and does NOT set IBUF_HP_BANK_GLUE nor the standalone
+            // LVCMOS12_LVCMOS15.IN, and its narrow IN_ONLY group INCLUDES LVCMOS18.
+            // Setting IBUF_HP_BANK_GLUE alongside the partner LVDS receiver selects a
+            // conflicting receiver and the pin stays dead (HW-confirmed on UART rx,
+            // AU33 = L9N = IOB_Y1).  An input on the MASTER site (IOB_Y0, e.g. rst on
+            // AV40 = L13P) uses its OWN buffer (IBUF_HP_BANK_GLUE) and must NOT get
+            // partner glue -- so gate on yLoc==1.
+            // EXPERIMENT (NEXTPNR_RX_PLAIN_LVCMOS): treat a left-HP slave-site
+            // single-ended input as a PLAIN LVCMOS18 input (IBUF_HP_BANK_GLUE, no
+            // partner differential-amplifier) instead of borrowing the master diff
+            // amp.  The diff-amp reference is the prime suspect for the open-flow rx
+            // long-run/AC-coupling-like distortion.  Default off (matches golden);
+            // set the env to try plain.
+            bool is_lefthp_se_in = is_hp_bank && !is_riob18 && !is_output && !is_diff && yLoc == 1
+                                   && (getenv("NEXTPNR_RX_PLAIN_LVCMOS") == nullptr);
             if (is_hp_bank && !is_output) {
                 if (is_diff) {
+                    // RIGHT HP bank uses IBUFDS_BANK_GLUE; LEFT HP bank (LIOB18) uses
+                    // IBUF_HP_BANK_GLUE for a differential input (per Vivado).
                     if (yLoc == 0)
-                        write_bit("IBUFDS_BANK_GLUE");
-                } else {
+                        write_bit(is_riob18 ? "IBUFDS_BANK_GLUE" : "IBUF_HP_BANK_GLUE");
+                } else if (!is_lefthp_se_in) {
                     write_bit("IBUF_HP_BANK_GLUE");
                 }
             }
-            // Additional low-volt LVCMOS input bit on HP banks.
-            if (is_hp_bank && !is_diff && is_low_volt_lvcmos)
+            // Additional low-volt LVCMOS input bit on HP banks (not for a left-HP
+            // single-ended LVCMOS18 input, which uses the combined .IN below).
+            if (is_hp_bank && !is_diff && is_low_volt_lvcmos &&
+                !(is_lefthp_se_in && iostandard == "LVCMOS18"))
                 write_bit("LVCMOS12_LVCMOS15.IN");
             // HP-bank IN_ONLY input-only variant (parallel to the wider one
             // emitted in the is_riob18 branch below).  Vivado emits both
-            // for HP-bank input-only sites.
-            if (is_hp_bank && !is_output && !is_diff)
-                write_bit("LVCMOS12_LVCMOS15_SSTL12_SSTL135_SSTL15.IN_ONLY");
+            // for HP-bank input-only sites; the left-HP LVCMOS18 group includes
+            // LVCMOS18.
+            if (is_hp_bank && !is_output && !is_diff) {
+                if (is_lefthp_se_in && iostandard == "LVCMOS18")
+                    write_bit("LVCMOS12_LVCMOS15_LVCMOS18_SSTL12_SSTL135_SSTL15.IN_ONLY");
+                else
+                    write_bit("LVCMOS12_LVCMOS15_SSTL12_SSTL135_SSTL15.IN_ONLY");
+            }
+            // LEFT HP bank (LIOB18) single-ended input: Vivado receives it through
+            // the differential input amplifier, enabling the receiver via the
+            // PARTNER half (IOB_Y<other>): LVDS.IN_DIFF + IN_USE + IN_ONLY (+ a
+            // PULLDOWN).  Without this the input buffer never senses the line and
+            // the pin is dead -- HW-confirmed: the open-flow UART 'rx' on AU33
+            // (LIOB18_X81Y33) was silent while the Vivado build (which sets these
+            // partner bits) works.  The differential (clock) input case is handled
+            // separately below; this covers the single-ended LVCMOS path.  Emit on
+            // the partner half via a fasm-context swap.
+            if (is_hp_bank && !is_riob18 && !is_output && !is_diff) {
+                std::string saved = fasm_ctx.back();          // "IOB_Y<yLoc>"
+                fasm_ctx.back() = "IOB_Y" + std::to_string(1 - yLoc);
+                if (is_lefthp_se_in) {
+                    // slave-site (Y1) input borrows the master half's diff amplifier
+                    write_bit("LVDS.IN_DIFF");
+                    write_bit("LVDS.IN_USE");
+                    write_bit("LVDS.IN_ONLY");
+                }
+                // unused partner pin is pulled down in both cases (Vivado default)
+                write_bit("PULLTYPE.PULLDOWN");
+                fasm_ctx.back() = saved;
+            }
             if (!is_diff) {
                 if (iostandard == "LVCMOS33" || iostandard == "LVTTL" || iostandard == "LVCMOS25") {
                     if (!is_riob18)
@@ -1125,6 +1223,15 @@ struct FasmBackend
                         if (iostandard == "LVDS")
                             write_bit("LVDS.IN_USE");
                     }
+                } else if (is_hp_bank) {
+                    // LEFT HP bank (LIOB18): an LVDS input on a High-Performance bank
+                    // uses the SSTL differential-input group (Y0 only), NOT the
+                    // High-Range LVDS_25 group.  The old code only special-cased
+                    // is_riob18 (the RIGHT HP bank), so a LEFT-bank diff clock input
+                    // (e.g. USER_CLOCK on AK34 = LIOB18) was mis-encoded as LVDS_25 and
+                    // the differential receiver never delivered a clock -> dead design.
+                    if (yLoc == 0)
+                        write_bit("SSTL12_SSTL135_SSTL15.IN_DIFF");
                 } else {
                     if (iostandard == "TDMS_33")
                         write_bit("TDMS_33.IN_DIFF");
@@ -1146,6 +1253,28 @@ struct FasmBackend
                         write_bit("LVCMOS12_LVCMOS15_LVCMOS18_SSTL12_SSTL135_SSTL15.IN_ONLY");
                 } else
                     write_bit("LVCMOS12_LVCMOS15_LVCMOS18_LVCMOS25_LVCMOS33_LVDS_25_LVTTL_SSTL135_SSTL15_TMDS_33.IN_ONLY");
+            }
+            // LEFT HP-bank DIFFERENTIAL input (e.g. user_clock LVDS on AK34/AL34):
+            // Vivado emits SLEW.SLOW (wide+narrow) + STEPDOWN + a narrow IN_ONLY on
+            // BOTH halves, plus a tile-level DIFF.ZIBUF_LOW_PWR (= IBUF_LOW_PWR FALSE,
+            // the HIGH-PERFORMANCE input buffer).  The open flow omitted all of these
+            // (the SLEW/STEPDOWN paths are gated !is_diff, and ZIBUF_LOW_PWR was never
+            // emitted), so the clock came in through the LOW-POWER buffer with degraded
+            // duty-cycle/jitter -> deterministic rx-sample skew (HW: bit-echo distorts
+            // varying bytes while Vivado is clean).  Emit to match golden.
+            if (is_diff && is_hp_bank && !is_riob18 && !is_output) {
+                write_bit("LVCMOS12_LVCMOS15_LVCMOS18_LVCMOS25_LVCMOS33_LVTTL_SSTL135_SSTL15.SLEW.SLOW");
+                write_bit("LVCMOS12_LVCMOS15_LVCMOS18.SLEW.SLOW");
+                write_bit("LVCMOS12_LVCMOS15_LVCMOS18_SSTL135_SSTL15.STEPDOWN");
+                if (yLoc == 0)
+                    write_bit("LVCMOS12_LVCMOS15_SSTL12_SSTL135_SSTL15.IN_ONLY");           // P half (no LVCMOS18)
+                else
+                    write_bit("LVCMOS12_LVCMOS15_LVCMOS18_SSTL12_SSTL135_SSTL15.IN_ONLY");  // N half (with LVCMOS18)
+                if (yLoc == 0) {   // tile-level, emit once: high-performance input buffer
+                    std::string saved = fasm_ctx.back(); fasm_ctx.pop_back();
+                    write_bit("DIFF.ZIBUF_LOW_PWR");
+                    fasm_ctx.push_back(saved);
+                }
             }
         }
 
@@ -1928,11 +2057,34 @@ struct FasmBackend
         }
         pop();
 
-        // FIXME: should these be calculated somehow?
+        // PLL loop-filter / lock lookup.  These MUST be computed from CLKFBOUT_MULT
+        // (same lock table as the MMCM); the old hardcoded LKTABLE/TABLE were wrong for
+        // most MULT values, giving a PLL with the wrong loop filter -> a clock clean
+        // enough for a free-running counter but too jittery for synchronous logic (the
+        // open-flow USER_CLOCK/PLL designs were silent on HW while Vivado's worked).
+        // lk_table[] is the same per-MULT table write_mmcm() uses (verified: lk_table[3]
+        // == Vivado's LKTABLE for MULT=4).
+        static const int64_t lk_table[64] = {
+            0x31BE8FA401LL, 0x31BE8FA401LL, 0x423E8FA401LL, 0x5AFE8FA401LL, 0x73BE8FA401LL,
+            0x8C7E8FA401LL, 0x9CFE8FA401LL, 0xB5BE8FA401LL, 0xCE7E8FA401LL, 0xE73E8FA401LL,
+            0xFF7E8FA401LL, 0xFF7E8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL,
+            0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL,
+            0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL,
+            0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL,
+            0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL,
+            0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL,
+            0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL,
+            0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL,
+            0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL,
+            0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL,
+            0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL};
+        int pll_mult = (int)float_or_default(ci, "CLKFBOUT_MULT", 1);
+        if (pll_mult < 1) pll_mult = 1;
+        if (pll_mult > 64) pll_mult = 64;
         write_int_vector("FILTREG1_RESERVED[11:0]", 0x8, 12);
-        write_int_vector("LKTABLE[39:0]", 0xB5BE8FA401ULL, 40);
+        write_int_vector("LKTABLE[39:0]", lk_table[pll_mult - 1], 40);
         write_bit("LOCKREG3_RESERVED[0]");
-        write_int_vector("TABLE[9:0]", 0x3B4, 10);
+        write_int_vector("TABLE[9:0]", 0x1FC, 10);
         pop(2);
     }
 
@@ -4358,13 +4510,27 @@ void write_gtx_channel(CellInfo *ci)
             }
         };
 
+        // Tolerant parameter read: SVS/yosys store all-binary parameter values
+        // (e.g. USE_DPORT="0", PATTERN, MASK -- and even a "FALSE" that the
+        // front-end normalised to "0") as *numeric* Properties, on which
+        // str_or_default()/as_string() assert (is_string == false). Property::str
+        // holds the literal for string params AND the [01xz] bit-string for
+        // numeric ones (exactly what as_string() would have returned), so reading
+        // it directly is bit-for-bit equivalent but never aborts.
+        auto dsp_str = [&](const char *pname, std::string def) -> std::string {
+            auto it = ci->params.find(ctx->id(pname));
+            if (it == ci->params.end())
+                return def;
+            return it->second.str;
+        };
+
         // value 1 is equivalent to 2, according to UG479
         // but in real life, Vivado sets AREG_0 is 0,
         // no bit is 1, and AREG_2 is 2
         auto areg = int_or_default(ci->params, ctx->id("AREG"), 1);
         if (areg == 0 || areg == 2) write_bit("AREG_" + std::to_string(areg));
 
-        auto ainput = str_or_default(ci->params, ctx->id("A_INPUT"), "DIRECT");
+        auto ainput = dsp_str("A_INPUT", "DIRECT");
         if (ainput == "CASCADE") write_bit("A_INPUT[0]");
 
         // value 1 is equivalent to 2, according to UG479
@@ -4373,18 +4539,20 @@ void write_gtx_channel(CellInfo *ci)
         auto breg = int_or_default(ci->params, ctx->id("BREG"), 1);
         if (breg == 0 || breg == 2) write_bit("BREG_" + std::to_string(breg));
 
-        auto binput = str_or_default(ci->params, ctx->id("B_INPUT"), "DIRECT");
+        auto binput = dsp_str("B_INPUT", "DIRECT");
         if (binput == "CASCADE") write_bit("B_INPUT[0]");
 
-        auto use_dport = str_or_default(ci->params, ctx->id("USE_DPORT"), "FALSE");
-        if (use_dport == "TRUE") write_bit("USE_DPORT[0]");
+        // USE_DPORT may arrive as the string "TRUE"/"FALSE" (Vivado/RapidWright)
+        // or as a 1-bit numeric "1"/"0" (SVS normalises the boolean), so accept both.
+        auto use_dport = dsp_str("USE_DPORT", "FALSE");
+        if (use_dport == "TRUE" || use_dport == "1") write_bit("USE_DPORT[0]");
 
-        auto use_simd = str_or_default(ci->params, ctx->id("USE_SIMD"), "ONE48");
+        auto use_simd = dsp_str("USE_SIMD", "ONE48");
         if (use_simd == "TWO24")  write_bit("USE_SIMD_FOUR12_TWO24");
         if (use_simd == "FOUR12") write_bit("USE_SIMD_FOUR12");
 
         // PATTERN
-        auto pattern_str = str_or_default(ci->params, ctx->id("PATTERN"), "");
+        auto pattern_str = dsp_str("PATTERN", "");
         if (!boost::empty(pattern_str)) {
             const size_t pattern_size = 48;
             std::vector<bool> pattern_vector(pattern_size, true);
@@ -4395,12 +4563,12 @@ void write_gtx_channel(CellInfo *ci)
             write_vector("PATTERN[47:0]", pattern_vector);
         }
 
-        auto autoreset_patdet = str_or_default(ci->params, ctx->id("AUTORESET_PATDET"), "NO_RESET");
+        auto autoreset_patdet = dsp_str("AUTORESET_PATDET", "NO_RESET");
         if (autoreset_patdet == "RESET_MATCH")     write_bit("AUTORESET_PATDET_RESET");
         if (autoreset_patdet == "RESET_NOT_MATCH") write_bit("AUTORESET_PATDET_RESET_NOT_MATCH");
 
         // MASK
-        auto mask_str = str_or_default(ci->params, ctx->id("MASK"), "001111111111111111111111111111111111111111111111");
+        auto mask_str = dsp_str("MASK", "001111111111111111111111111111111111111111111111");
         // Yosys gives us 48 bit, but prjxray only recognizes 46 bits
         // The most significant two bits seem to be zero, so let us just truncate them
         const size_t mask_size = 46;
@@ -4411,7 +4579,7 @@ void write_gtx_channel(CellInfo *ci)
         }
         write_vector("MASK[45:0]", mask_vector);
 
-        auto sel_mask = str_or_default(ci->params, ctx->id("SEL_MASK"), "MASK");
+        auto sel_mask = dsp_str("SEL_MASK", "MASK");
         if (sel_mask == "C")              write_bit("SEL_MASK_C");
         if (sel_mask == "ROUNDING_MODE1") write_bit("SEL_MASK_ROUNDING_MODE1");
         if (sel_mask == "ROUNDING_MODE2") write_bit("SEL_MASK_ROUNDING_MODE2");
@@ -4431,7 +4599,7 @@ void write_gtx_channel(CellInfo *ci)
         write_bit("ZMREG[0]", !bool_or_default(ci->params, ctx->id("MREG")));
         write_bit("ZOPMODEREG[0]", !bool_or_default(ci->params, ctx->id("OPMODEREG")));
         write_bit("ZPREG[0]", !bool_or_default(ci->params, ctx->id("PREG")));
-        write_bit("USE_DPORT[0]", str_or_default(ci->params, ctx->id("USE_DPORT"), "FALSE") == "TRUE");
+        write_bit("USE_DPORT[0]", (use_dport == "TRUE" || use_dport == "1"));
         write_bit("ZIS_CLK_INVERTED", !bool_or_default(ci->params, ctx->id("IS_CLK_INVERTED")));
         write_bit("ZIS_CARRYIN_INVERTED", !bool_or_default(ci->params, ctx->id("IS_CARRYIN_INVERTED")));
         pop(2);

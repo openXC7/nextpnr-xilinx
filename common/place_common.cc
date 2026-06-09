@@ -309,6 +309,33 @@ class ConstraintLegaliseWorker
             lockdown_chain(child);
     }
 
+    // Bind chain children that have no bel yet at the location implied by the
+    // (already-placed) root's bel + the child's relative constraints.  Needed
+    // for the Vivado-place/nextpnr-route hybrid flow: the carry packer creates
+    // feed-through LUTs as children of an absolutely-locked CARRY4 root, and
+    // Vivado never placed them, so lockdown_chain (which only sets strength)
+    // would leave them unbound -> "Found unbound cell".
+    void bind_unplaced_children(CellInfo *root)
+    {
+        if (root->bel == BelId())
+            return;
+        Loc rootLoc = ctx->getBelLocation(root->bel);
+        for (auto child : root->constr_children) {
+            if (child->bel == BelId()) {
+                Loc cl;
+                cl.x = rootLoc.x + (child->constr_x == child->UNCONSTR ? 0 : child->constr_x);
+                cl.y = rootLoc.y + (child->constr_y == child->UNCONSTR ? 0 : child->constr_y);
+                cl.z = child->constr_abs_z
+                               ? child->constr_z
+                               : rootLoc.z + (child->constr_z == child->UNCONSTR ? 0 : child->constr_z);
+                BelId target = ctx->getBelByLocation(cl);
+                if (target != BelId() && ctx->checkBelAvail(target))
+                    ctx->bindBel(target, child, STRENGTH_STRONG);
+            }
+            bind_unplaced_children(child);
+        }
+    }
+
     // Legalise placement constraints on a cell
     bool legalise_cell(CellInfo *cell)
     {
@@ -316,8 +343,10 @@ class ConstraintLegaliseWorker
             return true; // Only process chain roots
         if (constraints_satisfied(cell)) {
             if (cell->constr_children.size() > 0 || cell->constr_x != cell->UNCONSTR ||
-                cell->constr_y != cell->UNCONSTR || cell->constr_z != cell->UNCONSTR)
+                cell->constr_y != cell->UNCONSTR || cell->constr_z != cell->UNCONSTR) {
+                bind_unplaced_children(cell);
                 lockdown_chain(cell);
+            }
         } else {
             IncreasingDiameterSearch xRootSearch, yRootSearch, zRootSearch;
             Loc currentLoc;

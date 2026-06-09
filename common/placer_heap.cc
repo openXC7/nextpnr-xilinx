@@ -283,6 +283,11 @@ class HeAPPlacer
             BelId bel;
             PlaceStrength strength;
             std::tie(cell, bel, strength) = sc;
+            if (bel == BelId()) {
+                log_warning("HeAP: cell '%s' (type %s) has no bel in solution\n",
+                            cell->name.c_str(ctx), cell->type.c_str(ctx));
+                continue;
+            }
             ctx->bindBel(bel, cell, strength);
         }
 
@@ -639,6 +644,24 @@ class HeAPPlacer
             if (!cell->constr_children.empty())
                 update_chain(cell, cell);
         }
+        // Hybrid Vivado-place/nextpnr-route flow: chain roots that are absolutely
+        // BEL-locked are NOT in place_cells, so their children would never get a
+        // cell_locs entry (-> out_of_range in build_equations/total_hpwl/legalise).
+        // Process locked chain roots here too so every chained child is located.
+        // Collect first to avoid invalidating the cell_locs iterator (update_chain
+        // inserts into it).
+        std::vector<CellInfo *> locked_roots;
+        for (auto &cl : cell_locs) {
+            if (!cl.second.locked)
+                continue;
+            CellInfo *ci = ctx->cells.at(cl.first).get();
+            if (ci->constr_parent == nullptr && !ci->constr_children.empty())
+                locked_roots.push_back(ci);
+        }
+        for (auto ci : locked_roots) {
+            chain_size[ci->name] = 1;
+            update_chain(ci, ci);
+        }
     }
 
     // Run a function on all ports of a net - including the driver and all users
@@ -780,12 +803,23 @@ class HeAPPlacer
             NetInfo *ni = net.second;
             if (ni->driver.cell == nullptr)
                 continue;
-            CellLocation &drvloc = cell_locs.at(ni->driver.cell->name);
+            // Cells constrained relative to a parent (e.g. CARRY4 chain members,
+            // or any externally BEL-locked cell whose name the solver doesn't
+            // track) may not have a cell_locs entry; skip them rather than
+            // throwing out_of_range (needed for the Vivado-place/nextpnr-route
+            // hybrid flow, where most cells are absolutely BEL-locked).
+            auto dit = cell_locs.find(ni->driver.cell->name);
+            if (dit == cell_locs.end())
+                continue;
+            CellLocation &drvloc = dit->second;
             if (drvloc.global)
                 continue;
             int xmin = drvloc.x, xmax = drvloc.x, ymin = drvloc.y, ymax = drvloc.y;
             for (auto &user : ni->users) {
-                CellLocation &usrloc = cell_locs.at(user.cell->name);
+                auto uit = cell_locs.find(user.cell->name);
+                if (uit == cell_locs.end())
+                    continue;
+                CellLocation &usrloc = uit->second;
                 xmin = std::min(xmin, usrloc.x);
                 xmax = std::max(xmax, usrloc.x);
                 ymin = std::min(ymin, usrloc.y);

@@ -348,7 +348,20 @@ void Arch::setup_pip_blacklist()
             for (int j = 0; j < td.num_pips; j++) {
                 auto &pd = td.pip_data[j];
                 std::string dest_name = IdString(td.wire_data[pd.dst_index].name).str(this);
+                std::string src_name  = IdString(td.wire_data[pd.src_index].name).str(this);
                 if (boost::contains(dest_name, "FREQ_REF"))
+                    blacklist_pips[td.type].insert(j);
+                // prjxray has no segbits for HCLK_CMT_CK_IN0.HCLK_CMT_MUX_CLK_8 (the
+                // 045-hclk-cmt-pips fuzzer never solved that one source), so any
+                // clock routed through it is silently dropped by fasm2frames and the
+                // clock dies there.  routeClock's BFS otherwise picks exactly this
+                // pip for a GT/SGMII refclk -> BUFG transit.  Blacklist it so both
+                // routeClock and the general router instead use one of the many
+                // solved CMT pips (e.g. CK_IN8.MUX_CLK_8, CK_IN0.CK_BUFHCLK8),
+                // matching the dedicated path Vivado takes.  (Matched on tile-local
+                // wire names; CK_IN8 does not contain "HCLK_CMT_CK_IN0".)
+                if (boost::contains(dest_name, "HCLK_CMT_CK_IN0") &&
+                    boost::contains(src_name, "HCLK_CMT_MUX_CLK_8"))
                     blacklist_pips[td.type].insert(j);
             }
         } else if (boost::starts_with(type, "CLK_HROW_TOP")) {
@@ -674,6 +687,27 @@ bool Arch::place()
         cfg.hpwl_scale_y = 2;
         cfg.spread_scale_x = 2;
         cfg.spread_scale_y = 1;
+        // Congestion-reduction knobs, env-adjustable.  The HeAP cut-spreader
+        // treats a region as over-used (and spreads cells out of it) once its
+        // occupancy exceeds beta*capacity.  LOWERING beta lowers the target
+        // density, so cells spread further and leave more free bels/routing
+        // tracks per region -- trading wirelength/timing for routability on
+        // designs the default placement leaves unroutable (e.g. the dsr_0_ /
+        // txu_iLast hard arcs).  spread_scale_{x,y} = how aggressively an
+        // over-used region is grown each spreading pass.
+        //   NEXTPNR_PLACER_BETA   (default 0.4; try 0.2-0.3 to de-congest)
+        //   NEXTPNR_SPREAD_SCALE_X / _Y  (defaults 2 / 1)
+        //   NEXTPNR_PLACER_ALPHA  (solver/spread blend, default 0.08)
+        if (const char *e = getenv("NEXTPNR_PLACER_BETA"))
+            cfg.beta = float(atof(e));
+        if (const char *e = getenv("NEXTPNR_SPREAD_SCALE_X"))
+            cfg.spread_scale_x = atoi(e);
+        if (const char *e = getenv("NEXTPNR_SPREAD_SCALE_Y"))
+            cfg.spread_scale_y = atoi(e);
+        if (const char *e = getenv("NEXTPNR_PLACER_ALPHA"))
+            cfg.alpha = float(atof(e));
+        log_info("HeAP congestion knobs: beta=%.3f spread_scale=%d,%d alpha=%.3f\n",
+                 cfg.beta, cfg.spread_scale_x, cfg.spread_scale_y, cfg.alpha);
         cfg.netShareWeight = 0.2;
         cfg.solverTolerance = 0.6e-6;
         cfg.cellGroups.emplace_back();
@@ -741,6 +775,10 @@ void Arch::routeVcc()
                 visit.push(src);
             }
         }
+        if (dest == WireId())
+            log_error("routeVcc: no Vcc path to pin '%s' of cell '%s' (type %s) bel '%s', sink wire '%s'\n",
+                      usr.port.c_str(this), usr.cell->name.c_str(this), usr.cell->type.c_str(this),
+                      nameOfBel(usr.cell->bel), nameOfWire(sink));
         NPNR_ASSERT(dest != WireId());
         while (backtrace.count(dest)) {
             auto uh = backtrace[dest];

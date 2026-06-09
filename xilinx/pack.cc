@@ -234,6 +234,36 @@ void XilinxPacker::pack_ffs()
     ff_rules[ctx->id("FDSE_1")].set_params.emplace_back(ctx->id("IS_CLK_INVERTED"), 1);
 
     generic_xform(ff_rules, true);
+
+    // Const-tied FF control pins (SR=GND meaning "no reset", CE=VCC meaning "always
+    // enabled") are realised by SLICE-local config muxes (SRUSEDMUX/CEUSEDMUX), not by
+    // fabric routing. The FASM backend already derives those bits from the pin being on
+    // $PACKER_GND_NET / $PACKER_VCC_NET (or absent) -- see is_srused/is_ceused in
+    // fasm.cc -- so disconnecting these pins is bitstream-neutral. It does, however, keep
+    // them off the global const nets, which the router would otherwise have to fan out as
+    // one enormous net (the dominant open-flow routing bottleneck: ~141 FF resets alone).
+    {
+        IdString gnd = ctx->id("$PACKER_GND_NET");
+        IdString vcc = ctx->id("$PACKER_VCC_NET");
+        int n_sr = 0, n_ce = 0;
+        for (auto cell : sorted(ctx->cells)) {
+            CellInfo *ci = cell.second;
+            if (ci->type != id_SLICE_FFX)
+                continue;
+            NetInfo *sr = get_net_or_empty(ci, id_SR);
+            if (sr != nullptr && sr->name == gnd) {
+                disconnect_port(ctx, ci, id_SR);
+                ++n_sr;
+            }
+            NetInfo *ce = get_net_or_empty(ci, id_CE);
+            if (ce != nullptr && ce->name == vcc) {
+                disconnect_port(ctx, ci, id_CE);
+                ++n_ce;
+            }
+        }
+        log_info("    local-const FF control: disconnected %d SR(=GND) + %d CE(=VCC) pins "
+                 "from global nets\n", n_sr, n_ce);
+    }
 }
 
 void XilinxPacker::pack_lutffs()
@@ -245,11 +275,20 @@ void XilinxPacker::pack_lutffs()
             continue;
         if (ci->type != id_SLICE_FFX)
             continue;
+        // Don't force a LUT+FF cluster onto cells whose placement is already
+        // pinned by an absolute BEL attribute (e.g. an imported Vivado
+        // placement): the LUT and the FF it drives may legitimately sit in
+        // different slices, and a relative-Z constraint would contradict the
+        // pin and break legalisation.
+        if (ci->attrs.count(ctx->id("BEL")))
+            continue;
         NetInfo *d = get_net_or_empty(ci, id_D);
         if (d->driver.cell == nullptr || d->driver.cell->type != id_SLICE_LUTX || d->driver.port != id_O6)
             continue;
         CellInfo *lut = d->driver.cell;
         if (lut->constr_parent != nullptr || !lut->constr_children.empty())
+            continue;
+        if (lut->attrs.count(ctx->id("BEL")))
             continue;
         lut->constr_children.push_back(ci);
         ci->constr_parent = lut;

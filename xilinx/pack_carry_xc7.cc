@@ -156,17 +156,34 @@ void XC7Packer::pack_carries_atomic()
                 NetInfo *c4_s  = get_net_or_empty(prev, ctx->id("S["  + zs + "]"));
                 NetInfo *c4_di = get_net_or_empty(prev, ctx->id("DI[" + zs + "]"));
 
-                // Constant-driven inputs ($PACKER_GND_NET / $PACKER_VCC_NET)
-                // don't need a feed-through LUT: the CARRY4 BEL ties them
-                // internally.  The original split-and-repack code was
-                // similarly conservative; spurious feed-through LUTs were
-                // what hung the heap placer when we tried to constrain them.
+                // Constant-driven DI inputs ($PACKER_GND_NET / $PACKER_VCC_NET)
+                // don't need a feed-through LUT: the CARRY4 DI mux defaults to 0
+                // when the DI route is simply omitted, so a const DI is tied
+                // internally.  (Spurious DI feed-throughs were what hung the
+                // heap placer when we tried to constrain them.)
+                //
+                // S inputs are different: the carry's S (propagate) input MUST
+                // be driven by a real LUT output -- there is no internal tie.  A
+                // constant S therefore needs a feed-through LUT that buffers the
+                // VCC/GND net into S; otherwise routeVcc() is asked to route the
+                // constant to a LUT *output* sitewire, which no fabric pip can
+                // reach (arch.cc:744 assert).  So DON'T null a const S here --
+                // let the s_lut==nullptr path below insert the feed-through.
                 auto is_const = [&](NetInfo *n) {
                     return n && (n->name == ctx->id("$PACKER_GND_NET") ||
                                  n->name == ctx->id("$PACKER_VCC_NET"));
                 };
-                if (is_const(c4_s))  c4_s  = nullptr;
-                if (is_const(c4_di)) c4_di = nullptr;
+                // A constant-driven CARRY4 DI must NOT be left on $PACKER_GND_NET: the
+                // global pseudo-constant router does not negotiate congestion, so the
+                // const DI fought real signals for the scarce SLICE bypass inputs and the
+                // route stalled.  A DI cannot be driven from a *remote* LUT either -- a
+                // 5LUT's O5 output only reaches its own slice's DI mux, not the fabric.
+                // So let the const DI fall through to the normal di_lut path below, which
+                // inserts a feed-through LUT (a local ground reference, O5=const) and
+                // CONSTRAINS it into THIS slice's BEL_5LUT -> the internal O5->DI path,
+                // using no fabric bypass at all.  (The earlier code nulled const DI here
+                // to skip that, on a stale worry about the HeAP placer; the constrained S
+                // feed-throughs prove slice-constrained feed-throughs place fine.)
 
                 std::unordered_set<IdString> unique_lut_inputs;
                 int s_inputs = 0;
@@ -316,6 +333,39 @@ void XC7Packer::pack_carries_atomic()
     if (remaining_muxcy || remaining_xorcy)
         log_info("   Blasted %d non-chain MUXCYs and %d non-chain XORCYs to soft logic\n",
                  remaining_muxcy, remaining_xorcy);
+
+    // router2 fix: realize a CONSTANT CARRY4 carry-in (a chain ROOT whose
+    // CIN/CYINIT is $PACKER_GND_NET/$PACKER_VCC_NET) via the PRECYINIT.C0/.C1
+    // config bit (see fasm.cc) instead of routing the GND/VCC pseudo-net into
+    // the CIN/CYINIT pins.  Leaving those constant pins connected makes router2
+    // fail ("Unrouteable $PACKER_GND_NET sink ...CIN"); router1 tolerated it.
+    // Record the constant value, then disconnect the constant carry pins so they
+    // are no longer routing sinks.  A real cascade CIN (mid-chain) and a dynamic
+    // CYINIT (routed in via AX) are left untouched.
+    {
+        IdString gnd = ctx->id("$PACKER_GND_NET");
+        IdString vcc = ctx->id("$PACKER_VCC_NET");
+        int nfix = 0, ncarry = 0;
+        for (auto cell : sorted(ctx->cells)) {
+            CellInfo *ci = cell.second;
+            if (ci->type != ctx->id("CARRY4"))
+                continue;
+            ++ncarry;
+            NetInfo *cin    = get_net_or_empty(ci, ctx->id("CIN"));
+            NetInfo *cyinit = get_net_or_empty(ci, ctx->id("CYINIT"));
+            bool cin_chain    = cin    != nullptr && cin->name    != gnd && cin->name != vcc;
+            bool cin_const    = cin    != nullptr && (cin->name    == gnd || cin->name == vcc);
+            bool cyinit_const = cyinit != nullptr && (cyinit->name == gnd || cyinit->name == vcc);
+            if (!cin_chain && (cyinit_const || cin_const)) {
+                NetInfo *konst = cyinit_const ? cyinit : cin;
+                int val = (konst->name == vcc) ? 1 : 0;
+                ci->params[ctx->id("PRECYINIT_CONST")] = Property(val, 1);
+            }
+            if (cin_const) { disconnect_port(ctx, ci, ctx->id("CIN")); ++nfix; }
+            if (cyinit_const) { disconnect_port(ctx, ci, ctx->id("CYINIT")); ++nfix; }
+        }
+        log_info("router2 PRECYINIT fix: %d CARRY4 cells, %d constant carry pins disconnected\n", ncarry, nfix);
+    }
 }
 
 void XC7Packer::pack_carries()
