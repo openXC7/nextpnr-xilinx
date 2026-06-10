@@ -1445,11 +1445,20 @@ struct Router2
             } else {
                 ++stall_iters;
             }
-            if (!failed_nets.empty() && (iter > max_iter || stall_iters >= max_stall))
+            if (!failed_nets.empty() && (iter > max_iter || stall_iters >= max_stall)) {
+                for (auto &wire : flat_wires) {
+                    if (int(wire.bound_nets.size()) <= 1)
+                        continue;
+                    log_info("overused wire %s (%d nets):\n", ctx->nameOfWire(wire.w),
+                             int(wire.bound_nets.size()));
+                    for (auto &bound : wire.bound_nets)
+                        log_info("    net %s\n", nets_by_udata.at(bound.first)->name.c_str(ctx));
+                }
                 log_error("router2: failed to converge - %d overused wire(s) after %d iterations "
                           "(no improvement for %d); design is unroutable in this placement "
                           "(try a different --seed or placement).\n",
                           overused_wires, iter - 1, stall_iters);
+            }
         } while (!failed_nets.empty());
         if (cfg.perf_profile) {
             std::vector<std::pair<int, IdString>> nets_by_runtime;

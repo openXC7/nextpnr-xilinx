@@ -507,6 +507,27 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
                 }
                 mux_output_used = true;
             }
+            if (carry4 != nullptr && carry4->carryInfo.cout_sigs[i % 4] != nullptr) {
+                NetInfo *co = carry4->carryInfo.cout_sigs[i % 4];
+                bool co_uses_mux = false;
+                if ((i % 4) == 3) {
+                    // CO3 leaves on the dedicated COUT->CIN spine; only other
+                    // (fabric) users need this subslice's output mux
+                    for (auto &usr : co->users)
+                        if (usr.port != id_CIN)
+                            co_uses_mux = true;
+                } else {
+                    // CO0..CO2 can only reach the fabric through the output mux
+                    co_uses_mux = !co->users.empty();
+                }
+                if (co_uses_mux) {
+                    if (mux_output_used) {
+                        DBG();
+                        return false;
+                    }
+                    mux_output_used = true;
+                }
+            }
             if (out_fmux != nullptr) {
                 NetInfo *f7f8 = out_fmux->muxInfo.out;
                 if (f7f8 != nullptr && (f7f8->users.size() > 1 || ((ff1 == nullptr || f7f8 != ff1->ffInfo.d)))) {
