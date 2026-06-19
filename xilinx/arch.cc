@@ -23,6 +23,7 @@
 #include <boost/range/adaptor/reversed.hpp>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <queue>
 #include "log.h"
 #include "nextpnr.h"
@@ -344,6 +345,83 @@ void Arch::setup_pip_blacklist()
     for (int i = 0; i < chip_info->num_tiletypes; i++) {
         auto &td = chip_info->tile_types[i];
         std::string type = IdString(td.type).str(this);
+        // Clock plumbing tiles with NO prjxray documentation at all (no
+        // pip db, tilegrid bits:{}) -- any route through them is silently
+        // unprogrammable and the clock dies in an unconfigured mux.
+        // Proven on HW with the clk_wiz counter: nextpnr sent MMCM
+        // CLKOUT0 -> BUFG via HCLK_CLB_CK_IN/CLK_FEED while Vivado's
+        // golden uses the documented CLK_HROW CK_IN_R path.
+        if (type == "HCLK_CLB" || boost::starts_with(type, "CLK_FEED") ||
+            boost::starts_with(type, "HCLK_FEEDTHRU")) {
+            for (int j = 0; j < td.num_pips; j++)
+                blacklist_pips[td.type].insert(j);
+            continue;
+        }
+        // LIOI (left HP-bank IOI): the pad's ONLY way to fabric is
+        // through the ILOGIC (default config = transparent, matches
+        // golden's zero bits), but two detours must be blocked:
+        //  - IDELAY (unprogrammable IDELAY config; golden goes I0->ILOGIC_D)
+        //  - I2GCLK (the clock-capable spine; golden only exits via the
+        //    LOGIC_OUTS ppip for ordinary signals, and our boards have no
+        //    left-bank clock-capable inputs)
+        if (boost::starts_with(type, "LIOI") && !boost::starts_with(type, "LIOI3")) {
+            for (int j = 0; j < td.num_pips; j++) {
+                auto &pd = td.pip_data[j];
+                std::string dest_name = IdString(td.wire_data[pd.dst_index].name).str(this);
+                if ((boost::contains(dest_name, "IDELAY") && boost::contains(dest_name, "IDATAIN")) ||
+                    boost::contains(dest_name, "I2GCLK"))
+                    blacklist_pips[td.type].insert(j);
+            }
+        }
+        // BUFGCTRL bel routethrus: the chipdb models I0/I1 -> O through the
+        // global buffer as a pseudo-pip, and the router will happily pass a
+        // clock through an UNUSED BUFG slot -- which emits no BUFGCTRL
+        // config (IN_USE/CE/S), so the buffer never propagates on silicon,
+        // and the unused-slot I-mux defaults collide with the route's IMUX
+        // choice (fasm2frames FasmInconsistentBits).  A real BUFG cell
+        // sources its O from the bel pin, never from this pseudo-pip.
+        if (boost::starts_with(type, "CLK_BUFG_BOT_R") || boost::starts_with(type, "CLK_BUFG_TOP_R")) {
+            for (int j = 0; j < td.num_pips; j++) {
+                auto &pd = td.pip_data[j];
+                std::string dest_name = IdString(td.wire_data[pd.dst_index].name).str(this);
+                std::string src_name = IdString(td.wire_data[pd.src_index].name).str(this);
+                if (boost::contains(src_name, "BUFGCTRL") &&
+                    (boost::ends_with(src_name, "_I0") || boost::ends_with(src_name, "_I1")) &&
+                    boost::contains(dest_name, "BUFGCTRL") && boost::ends_with(dest_name, "_O"))
+                    blacklist_pips[td.type].insert(j);
+            }
+        }
+        // BRAM address-cascade and FIFO-alias plumbing: the router uses the
+        // inter-BRAM ADDR cascade muxes (CASCOUT/CASCINTOP, real bits) and
+        // the FIFO36/FIFO18 address/data alias wires as shortcuts to fan
+        // BRAM addresses/data between vertically adjacent tiles.  Vivado
+        // never routes user nets this way (golden ethsoc has zero such
+        // features) and the silicon behaviour of a cascade carrying a
+        // foreign fanout is unproven -- top functional suspect for the
+        // dark ethsoc R0 build.  Force golden-style INT fanout instead.
+        if (boost::starts_with(type, "BRAM_L") || boost::starts_with(type, "BRAM_R")) {
+            for (int j = 0; j < td.num_pips; j++) {
+                auto &pd = td.pip_data[j];
+                std::string dest_name = IdString(td.wire_data[pd.dst_index].name).str(this);
+                std::string src_name = IdString(td.wire_data[pd.src_index].name).str(this);
+                if (boost::contains(dest_name, "CASCOUT") || boost::contains(src_name, "CASCOUT") ||
+                    boost::contains(dest_name, "CASCINTOP") || boost::contains(src_name, "CASCINTOP") ||
+                    boost::contains(dest_name, "CASCINBOT") || boost::contains(src_name, "CASCINBOT"))
+                    blacklist_pips[td.type].insert(j);
+            }
+        }
+        // PHASER/DQS plumbing: present in the chipdb graph but prjxray has
+        // no bits for any of it -- the router used INT_DQS_IOTOPHASER as a
+        // shortcut onto CMT CLK_IN wires and the clock died unprogrammed
+        // (proven on HW with the clk_wiz counter).  No PHASER primitives are
+        // supported anyway, so blacklist every pip touching those wires.
+        for (int j = 0; j < td.num_pips; j++) {
+            auto &pd = td.pip_data[j];
+            std::string dest_name = IdString(td.wire_data[pd.dst_index].name).str(this);
+            std::string src_name = IdString(td.wire_data[pd.src_index].name).str(this);
+            if (boost::contains(dest_name, "PHASER") || boost::contains(src_name, "PHASER"))
+                blacklist_pips[td.type].insert(j);
+        }
         if (boost::starts_with(type, "HCLK_CMT")) {
             for (int j = 0; j < td.num_pips; j++) {
                 auto &pd = td.pip_data[j];
@@ -351,18 +429,31 @@ void Arch::setup_pip_blacklist()
                 std::string src_name  = IdString(td.wire_data[pd.src_index].name).str(this);
                 if (boost::contains(dest_name, "FREQ_REF"))
                     blacklist_pips[td.type].insert(j);
-                // prjxray has no segbits for HCLK_CMT_CK_IN0.HCLK_CMT_MUX_CLK_8 (the
-                // 045-hclk-cmt-pips fuzzer never solved that one source), so any
-                // clock routed through it is silently dropped by fasm2frames and the
-                // clock dies there.  routeClock's BFS otherwise picks exactly this
-                // pip for a GT/SGMII refclk -> BUFG transit.  Blacklist it so both
-                // routeClock and the general router instead use one of the many
-                // solved CMT pips (e.g. CK_IN8.MUX_CLK_8, CK_IN0.CK_BUFHCLK8),
-                // matching the dedicated path Vivado takes.  (Matched on tile-local
-                // wire names; CK_IN8 does not contain "HCLK_CMT_CK_IN0".)
-                if (boost::contains(dest_name, "HCLK_CMT_CK_IN0") &&
-                    boost::contains(src_name, "HCLK_CMT_MUX_CLK_8"))
-                    blacklist_pips[td.type].insert(j);
+                // prjxray has no segbits for the whole CK_IN<n> <- MUX_CLK_<m>
+                // family (the 045-hclk-cmt-pips fuzzer solved CK_IN <- CCIO/
+                // BUFHCLK/MUX_CLK_MMCM*/MUX_CLK_PLL* sources, but never the
+                // numbered intermediate MUX_CLK_<m> hops), so any clock routed
+                // through one is silently dropped by fasm2frames and the clock
+                // dies there.  Seen on HW twice: a GT/SGMII refclk -> BUFG
+                // transit through CK_IN0 <- MUX_CLK_8, and the ethsoc IP clocks
+                // through CK_IN1 <- MUX_CLK_8 / CK_IN0 <- MUX_CLK_7 /
+                // CK_IN10 <- MUX_CLK_5.  Blacklist the family so routing uses
+                // the solved CMT pips instead (matching Vivado's paths).
+                if (boost::contains(dest_name, "HCLK_CMT_CK_IN")) {
+                    auto pos = src_name.find("HCLK_CMT_MUX_CLK_");
+                    if (pos != std::string::npos) {
+                        char next = src_name[pos + sizeof("HCLK_CMT_MUX_CLK_") - 1];
+                        // Three combos solved 2026-06-11 by targeted specimens
+                        // (see prjxray database FIXES.md): the GT MGT-spine
+                        // taps used for quad-113 GT clocks.
+                        bool solved =
+                            (dest_name == "HCLK_CMT_CK_IN1" && src_name == "HCLK_CMT_MUX_CLK_8") ||
+                            (dest_name == "HCLK_CMT_CK_IN0" && src_name == "HCLK_CMT_MUX_CLK_7") ||
+                            (dest_name == "HCLK_CMT_CK_IN10" && src_name == "HCLK_CMT_MUX_CLK_5");
+                        if (next >= '0' && next <= '9' && !solved)
+                            blacklist_pips[td.type].insert(j);
+                    }
+                }
             }
         } else if (boost::starts_with(type, "CLK_HROW_TOP")) {
             for (int j = 0; j < td.num_pips; j++) {
@@ -730,63 +821,200 @@ bool Arch::place()
 
 void Arch::routeVcc()
 {
-    log_info("Routing Vcc connections...\n");
-    // Special pass for faster routing of Vcc psuedo-net
-    NetInfo *vcc = nets[id("$PACKER_VCC_NET")].get();
-    bindWire(getCtx()->getNetinfoSourceWire(vcc), vcc, STRENGTH_STRONG);
-#if 0
-    WireId wire0 = getCtx()->getNetinfoSourceWire(vcc);
-    Loc drvloc = getBelLocation(vcc->driver.cell->bel);
-    BelId bel = vcc->driver.cell->bel;
-    log_info("%d %d %d %d\n", vcc->driver.cell->bel.tile, drvloc.x, drvloc.y, (getBelType(bel) == id_PSEUDO_GND || getBelType(bel) == id_PSEUDO_VCC));
-    log_info("%s\n", nameOfWire(wire0));
-    for (auto pip1 : getPipsDownhill(wire0)) {
-        WireId wire1 = getPipDstWire(pip1);
-        log_info("   -> %s\n", nameOfWire(wire1));
-        for (auto pip2 : getPipsDownhill(wire1))
-            log_info("       -> %s\n", nameOfWire(getPipDstWire(pip2)));
-
+    // Route BOTH constant pseudo-nets (Vcc and Gnd) through their real bridge
+    // pips before the main router, so fasm.cc emits the const distribution and
+    // silicon actually gets the constants.  (Originally Vcc-only + router1-only;
+    // Gnd was left to defaults, which floated address-path const-0 inputs high
+    // -> corrupt PC = 0x..fff0.)  Per-sink uphill BFS to the const backbone,
+    // BOUNDED and terminating at ANY PSEUDO_VCC/GND-intent wire (the tile's
+    // local row/global pseudo wire, a few hops above VCC_WIRE/GND_WIRE) instead
+    // of traversing the whole pseudo network to the single bound source -> no
+    // O(device) stall.  Real sink-side bridge pips get bound + emitted to FASM.
+    const int iter_max = 50000;
+    std::vector<std::pair<IdString, int>> cnets = {
+        { id("$PACKER_VCC_NET"), ID_PSEUDO_VCC },
+        { id("$PACKER_GND_NET"), ID_PSEUDO_GND },
+    };
+    // Record GND sinks the backbone fill can't reach, so a second pass can drive
+    // them from a local LUT1(INIT=0) instead (see pack_carry_xc7.cc).  One line
+    // per holdout: "<cell> <port>" (e.g. "mem_addr_reg_13__i_2 DI0").
+    std::ofstream holdout_out;
+    if (const char *hf = getenv("NEXTPNR_GND_HOLDOUT_FILE"))
+        holdout_out.open(hf);
+    for (auto &cn : cnets) {
+        if (!nets.count(cn.first))
+            continue;
+        NetInfo *net = nets[cn.first].get();
+        int pseudo_intent = cn.second;
+        log_info("Routing %s connections...\n", cn.first.c_str(this));
+        WireId src = getCtx()->getNetinfoSourceWire(net);
+        if (src != WireId())
+            bindWire(src, net, STRENGTH_STRONG);
+        int unrouted = 0, max_iter_seen = 0;
+        for (auto &usr : net->users) {
+            std::queue<WireId> visit;
+            std::unordered_map<WireId, PipId> backtrace;
+            WireId dest = WireId();
+            WireId sink = getCtx()->getNetinfoSinkWire(net, usr);
+            if (sink == WireId())
+                log_error("Pin '%s' of bel '%s' has no associated wire\n", usr.port.c_str(this), nameOfBel(usr.cell->bel));
+            visit.push(sink);
+            int iter = 0;
+            while (!visit.empty() && iter < iter_max) {
+                ++iter;
+                WireId curr = visit.front();
+                visit.pop();
+                if (getBoundWireNet(curr) == net || wireIntent(curr) == pseudo_intent) {
+                    dest = curr;
+                    break;
+                }
+                for (auto uh : getPipsUphill(curr)) {
+                    if (!checkPipAvail(uh))
+                        continue;
+                    WireId s = getPipSrcWire(uh);
+                    if (backtrace.count(s))
+                        continue;
+                    if (!checkWireAvail(s) && getBoundWireNet(s) != net)
+                        continue;
+                    backtrace[s] = uh;
+                    visit.push(s);
+                }
+            }
+            if (iter > max_iter_seen)
+                max_iter_seen = iter;
+            if (dest == WireId()) {
+                ++unrouted;
+                if (getenv("NEXTPNR_LOG_CONST_HOLDOUTS"))
+                    log_info("    %s HOLDOUT: %s.%s (bel %s)\n", cn.first.c_str(this),
+                             usr.cell->name.c_str(this), usr.port.c_str(this),
+                             nameOfBel(usr.cell->bel));
+                // GND holdouts only: a local LUT1(INIT=0) can replace these.
+                if (holdout_out.is_open() && cn.second == ID_PSEUDO_GND)
+                    holdout_out << usr.cell->name.c_str(this) << " "
+                                << usr.port.c_str(this) << "\n";
+                continue;
+            }
+            while (backtrace.count(dest)) {
+                auto uh = backtrace[dest];
+                dest = getPipDstWire(uh);
+                bindWire(dest, net, STRENGTH_STRONG);
+                bindPip(uh, net, STRENGTH_STRONG);
+            }
+        }
+        log_info("    %s: %d/%d sinks bridged (%d left to main router; max BFS %d)\n",
+                 cn.first.c_str(this), int(net->users.size()) - unrouted, int(net->users.size()),
+                 unrouted, max_iter_seen);
     }
-#endif
-    for (auto &usr : vcc->users) {
-        std::queue<WireId> visit;
-        std::unordered_map<WireId, PipId> backtrace;
-        WireId dest = WireId();
-        WireId sink = getCtx()->getNetinfoSinkWire(vcc, usr);
-        if (sink == WireId())
-            log_error("Pin '%s' of bel '%s' has no associated wire\n", usr.port.c_str(this), nameOfBel(usr.cell->bel));
-        visit.push(sink);
-        while (!visit.empty()) {
-            WireId curr = visit.front();
-            visit.pop();
-            if (getBoundWireNet(curr) == vcc) {
-                dest = curr;
+}
+
+// BODGE: template a GT-clock -> BUFG route from the known-good Vivado path.
+// The chipdb graph has no edge from the GT clock spine into the CLK_HROW
+// CK_IN_R inputs, so no router can find this route; but the pips along
+// Vivado's dedicated path all exist per-tile.  Bind them by name with
+// STRENGTH_LOCKED (router2 then leaves the net alone) exactly as the golden
+// ethsoc bitstream routes its three GT clocks on xc7vx485t quad 113:
+//   CK_IN_R<k> (HROW of the GT region, Y26) -> CASCO<L> -> CASCIN/CASCO
+//   cascade up Y78/Y130/Y182 -> CK_MUXED<L> -> BUFGCTRL<L/2>_I0 (tile Y204),
+// with lane L in {2,6,12}.  The sink BUFGCTRL is moved to the lane's site.
+// Hardcoded for xc7vx485t bottom-right; enable with NEXTPNR_GT_CLK_BODGE=1.
+bool Arch::gtClockTemplateRoute(NetInfo *clk_net, PortRef &usr)
+{
+    if (!getenv("NEXTPNR_GT_CLK_BODGE"))
+        return false;
+    auto driver_type = clk_net->driver.cell ? clk_net->driver.cell->type : IdString();
+    std::string dtype = driver_type.str(this);
+    if (dtype.find("GTXE2") == std::string::npos && dtype.find("IBUFDS_GTE2") == std::string::npos)
+        return false;
+    if (usr.cell->type != id_BUFGCTRL)
+        return false;
+
+    static int next_slot = 0;
+    static const int lanes[3] = {2, 6, 12};
+    static const int ck_in[3] = {0, 1, 2};
+    if (next_slot >= 3) {
+        log_warning("GT clock bodge: out of template lanes for net %s\n", nameOf(clk_net));
+        return false;
+    }
+    int L = lanes[next_slot], K = ck_in[next_slot];
+    next_slot++;
+
+    // Move the sink BUFGCTRL to the lane's dedicated site (BUFGCTRL_X0Y<L/2>)
+    std::string target_site = "BUFGCTRL_X0Y" + std::to_string(L / 2);
+    BelId target = getBelByName(id(target_site + "/BUFGCTRL"));
+    if (target == BelId()) {
+        log_warning("GT clock bodge: no bel %s/BUFGCTRL\n", target_site.c_str());
+        return false;
+    }
+    if (usr.cell->bel != target) {
+        CellInfo *evicted = getBoundBelCell(target);
+        BelId old_bel = usr.cell->bel;
+        if (old_bel != BelId())
+            unbindBel(old_bel);
+        if (evicted != nullptr) {
+            unbindBel(target);
+            if (old_bel != BelId())
+                bindBel(old_bel, evicted, STRENGTH_STRONG);
+        }
+        bindBel(target, usr.cell, STRENGTH_STRONG);
+        log_info("    GT clock bodge: moved %s to %s\n", nameOf(usr.cell), target_site.c_str());
+    }
+
+    // Bind the golden pip chain, resolving pips by tile + local wire names
+    struct TPip { std::string tile, dst, src; };
+    std::vector<TPip> pips;
+    pips.push_back({"CLK_HROW_BOT_R_X192Y26",
+                    "CLK_HROW_BOT_R_CK_BUFG_CASCO" + std::to_string(L),
+                    "CLK_HROW_CK_IN_R" + std::to_string(K)});
+    for (int y : {78, 130, 182})
+        pips.push_back({"CLK_HROW_BOT_R_X192Y" + std::to_string(y),
+                        "CLK_HROW_BOT_R_CK_BUFG_CASCO" + std::to_string(L),
+                        "CLK_HROW_BOT_R_CK_BUFG_CASCIN" + std::to_string(L)});
+    pips.push_back({"CLK_BUFG_BOT_R_X192Y204",
+                    "CLK_BUFG_BUFGCTRL" + std::to_string(L / 2) + "_I0",
+                    "CLK_BUFG_BOT_R_CK_MUXED" + std::to_string(L)});
+    int bound = 0;
+    setup_byname();
+    for (auto &tp : pips) {
+        auto tbn = tile_by_name.find(tp.tile);
+        if (tbn == tile_by_name.end()) {
+            log_warning("GT clock bodge: tile not found: %s\n", tp.tile.c_str());
+            continue;
+        }
+        int tile = tbn->second;
+        auto &td = chip_info->tile_types[chip_info->tile_insts[tile].type];
+        PipId pip;
+        for (int i = 0; i < td.num_pips; i++) {
+            auto &pd = td.pip_data[i];
+            if (pd.site != -1)
+                continue;
+            if (IdString(td.wire_data[pd.dst_index].name).str(this) == tp.dst &&
+                IdString(td.wire_data[pd.src_index].name).str(this) == tp.src) {
+                pip.tile = tile;
+                pip.index = i;
                 break;
             }
-            for (auto uh : getPipsUphill(curr)) {
-                if (!checkPipAvail(uh))
-                    continue;
-                WireId src = getPipSrcWire(uh);
-                if (backtrace.count(src))
-                    continue;
-                if (!checkWireAvail(src) && getBoundWireNet(src) != vcc)
-                    continue;
-                backtrace[src] = uh;
-                visit.push(src);
-            }
         }
-        if (dest == WireId())
-            log_error("routeVcc: no Vcc path to pin '%s' of cell '%s' (type %s) bel '%s', sink wire '%s'\n",
-                      usr.port.c_str(this), usr.cell->name.c_str(this), usr.cell->type.c_str(this),
-                      nameOfBel(usr.cell->bel), nameOfWire(sink));
-        NPNR_ASSERT(dest != WireId());
-        while (backtrace.count(dest)) {
-            auto uh = backtrace[dest];
-            dest = getPipDstWire(uh);
-            bindWire(dest, vcc, STRENGTH_STRONG);
-            bindPip(uh, vcc, STRENGTH_STRONG);
+        if (pip == PipId()) {
+            log_warning("GT clock bodge: pip not found: %s/%s.%s\n", tp.tile.c_str(),
+                        tp.dst.c_str(), tp.src.c_str());
+            continue;
         }
+        WireId src = getPipSrcWire(pip), dst = getPipDstWire(pip);
+        if (getBoundWireNet(src) == nullptr)
+            bindWire(src, clk_net, STRENGTH_LOCKED);
+        if (getBoundWireNet(dst) == nullptr)
+            bindWire(dst, clk_net, STRENGTH_LOCKED);
+        bindPip(pip, clk_net, STRENGTH_LOCKED);
+        bound++;
     }
+    // Bind the (relocated) sink site wire so the general router sees the
+    // arc as complete.
+    WireId sink_wire = getCtx()->getNetinfoSinkWire(clk_net, usr);
+    if (sink_wire != WireId() && getBoundWireNet(sink_wire) == nullptr)
+        bindWire(sink_wire, clk_net, STRENGTH_LOCKED);
+    log_info("    GT clock bodge: net %s lane %d via CK_IN_R%d (%d/%d pips bound)\n",
+             nameOf(clk_net), L, K, bound, int(pips.size()));
+    return bound > 0;
 }
 
 void Arch::routeClock()
@@ -920,8 +1148,11 @@ void Arch::routeClock()
                             visit.push(src);
                         }
                     }
-                    if (dest == WireId())
+                    if (dest == WireId()) {
+                        if (gtClockTemplateRoute(clk_net, usr))
+                            continue;
                         continue;
+                    }
                 } else {
                     continue;
                 }
@@ -1102,8 +1333,6 @@ bool Arch::route()
         archInfoToAttributes();
         return true;
     }
-    if (router != "router2")
-        routeVcc();
     findSourceSinkLocations();
 
     bool result;
@@ -1120,6 +1349,13 @@ bool Arch::route()
     } else {
         log_error("Xilinx architecture does not support router '%s'\n", router.c_str());
     }
+    // routeVcc as a FILL pass: run AFTER the main router so signal nets claim
+    // their wires first, then bridge the constant (pwr/gnd) nets through whatever
+    // real pips remain free (the BFS already gates on checkWireAvail/checkPipAvail).
+    // Pre-router binding over-constrained routing and made router2 fail to route
+    // address-path FF arcs (e.g. mem_addr O5->AFFMUX), so const-routed builds
+    // exited 255; as a post-router fill it only consumes leftover resources.
+    routeVcc();
     fixupRouting();
     getCtx()->settings[getCtx()->id("route")] = 1;
     archInfoToAttributes();

@@ -19,8 +19,10 @@
 
 #include <algorithm>
 #include <boost/optional.hpp>
+#include <fstream>
 #include <iterator>
 #include <queue>
+#include <set>
 #include <unordered_set>
 #include "cells.h"
 #include "chain_utils.h"
@@ -173,6 +175,18 @@ void XC7Packer::pack_carries_atomic()
                     return n && (n->name == ctx->id("$PACKER_GND_NET") ||
                                  n->name == ctx->id("$PACKER_VCC_NET"));
                 };
+                // CARRY4 DI=GND: OMIT the route entirely.  The DI mux defaults to 0
+                // when its input is left unconnected (golden sets no DImux feature
+                // for a GND DI), so the carry is tied low internally with no fabric
+                // route, no AX bypass and no feed-through LUT.  Routing GND to these
+                // DIs (via the sparse GND backbone -> AX) is exactly what produced
+                // the unroutable holdouts in congested slots.  (VCC DIs still fall
+                // through to the feed-through/AX path below -- omitting would give 0,
+                // not 1.)
+                if (c4_di != nullptr && c4_di->name == ctx->id("$PACKER_GND_NET")) {
+                    disconnect_port(ctx, prev, ctx->id("DI[" + zs + "]"));
+                    c4_di = nullptr;
+                }
                 // A constant-driven CARRY4 DI must NOT be left on $PACKER_GND_NET: the
                 // global pseudo-constant router does not negotiate congestion, so the
                 // const DI fought real signals for the scarce SLICE bypass inputs and the
@@ -189,18 +203,26 @@ void XC7Packer::pack_carries_atomic()
                 int s_inputs = 0;
                 CellInfo *s_lut = nullptr, *di_lut = nullptr;
 
-                if (c4_s && c4_s->users.size() == 1 &&
-                    c4_s->driver.cell != nullptr &&
-                    lut_types.count(c4_s->driver.cell->type)) {
+                // A BEL-pinned LUT driver (imported placement) is adopted
+                // regardless of fanout: Vivado already placed it at this
+                // slot's 6LUT, where O6 legally feeds the carry S AND the
+                // fabric simultaneously.  Creating a feed-through here
+                // would collide with the pinned cell.
+                if (c4_s && c4_s->driver.cell != nullptr &&
+                    ((lut_types.count(c4_s->driver.cell->type) && c4_s->users.size() == 1) ||
+                     // pinned import: any LUT1-6 Vivado placed at this slot
+                     ((lut_types.count(c4_s->driver.cell->type) || c4_s->driver.cell->type == ctx->id("LUT6")) &&
+                      c4_s->driver.cell->attrs.count(ctx->id("BEL"))))) {
                     s_lut = c4_s->driver.cell;
                     for (int j = 0; j < 5; j++) {
                         NetInfo *ix = get_net_or_empty(s_lut, ctx->id("I" + std::to_string(j)));
                         if (ix) { unique_lut_inputs.insert(ix->name); s_inputs++; }
                     }
                 }
-                if (c4_di && c4_di->users.size() == 1 &&
-                    c4_di->driver.cell != nullptr &&
-                    lut_types.count(c4_di->driver.cell->type)) {
+                if (c4_di && c4_di->driver.cell != nullptr &&
+                    ((lut_types.count(c4_di->driver.cell->type) && c4_di->users.size() == 1) ||
+                     (lut_types.count(c4_di->driver.cell->type) &&
+                      c4_di->driver.cell->attrs.count(ctx->id("BEL"))))) {
                     di_lut = c4_di->driver.cell;
                     for (int j = 0; j < 5; j++) {
                         NetInfo *ix = get_net_or_empty(di_lut, ctx->id("I" + std::to_string(j)));
@@ -211,36 +233,140 @@ void XC7Packer::pack_carries_atomic()
                 if (!s_lut)  ++lut_inp_count;
                 if (!di_lut) ++lut_inp_count;
                 if (lut_inp_count > 5) {
-                    di_lut = nullptr;
-                    if (s_inputs > 4) s_lut = nullptr;
+                    // BEL-pinned LUTs (imported placement) stay adopted --
+                    // Vivado already proved the input sharing legal.
+                    if (!(di_lut && di_lut->attrs.count(ctx->id("BEL"))))
+                        di_lut = nullptr;
+                    if (s_inputs > 4 && !(s_lut && s_lut->attrs.count(ctx->id("BEL"))))
+                        s_lut = nullptr;
                 }
                 if (!s_lut && c4_s) {
                     PortRef pr; pr.cell = prev;
                     pr.port = ctx->id("S[" + zs + "]");
                     auto s_feed = feed_through_lut(c4_s, {pr});
                     s_lut = s_feed.get();
+                    if (ctx->debug)
+                        log_info("feedthru %s for %s.S[%s]\n", ctx->nameOf(s_lut), ctx->nameOf(prev), zs.c_str());
+                    if (getenv("DBG_SFEED"))
+                        log_info("SFEED s_lut=%s for %s.S[%d] prevBEL=%s\n", ctx->nameOf(s_lut),
+                                 ctx->nameOf(prev), z,
+                                 prev->attrs.count(ctx->id("BEL")) ?
+                                   prev->attrs.at(ctx->id("BEL")).as_string().c_str() : "NONE");
                     new_cells.push_back(std::move(s_feed));
                 }
-                if (!di_lut && c4_di) {
+                // Imported placement: DI comes from O5 (feed-through in
+                // the free 5LUT, golden's xCY0=O5) UNLESS the slot's 6LUT
+                // is a pinned LUT using all six inputs -- then the 5LUT
+                // is physically unusable and golden routes DI via the AX
+                // bypass (xCY0=AX) instead.
+                // A dynamic carry-in (CYINIT driven by a real net) is routed
+                // into the slice via the AX bypass pin -- the SAME pin DI[0]'s
+                // ACY0 mux would use for an AX-routed const DI[0].  They cannot
+                // share AX, so for z==0 with a dynamic CYINIT the const DI[0]
+                // must NOT go via AX; fall through to the O5 feed-through path.
+                // (Symptom: "Failed to route ... AQ -> PRECYINIT_OUT" -- the
+                // dynamic CYINIT could not reach AX because DI[0] had taken it.)
+                NetInfo *cyi = get_net_or_empty(prev, ctx->id("CYINIT"));
+                bool dyn_cyinit = cyi != nullptr && !is_const(cyi);
+                bool di_via_ax = false;
+                // A DI driven by a cell OTHER than this slot's own S-LUT is a
+                // "remote" operand (golden's xCY0=AX).  It cannot be sourced from
+                // the slot's free 5LUT O5: a feed-through LUT for it carries a
+                // distinct input net, which the slot's shared-input packing must
+                // place on a 6th pin (A6) -- a pin the 5LUT bel does not have
+                // ("No wire found for port A6").  So for an imported (BEL-pinned)
+                // CARRY4 with no same-slot di_lut, route the DI via the AX bypass
+                // (as the const-DI case already does) whenever the DI is constant
+                // OR driven by a different cell than S -- matching golden's
+                // xCY0=AX encoding.  Only the genuine dual-output case (DI and S
+                // from the SAME LUT, i.e. golden's xCY0=O5) keeps the feed-through.
+                bool di_remote = c4_di && c4_di->driver.cell != nullptr &&
+                                 (c4_s == nullptr || c4_s->driver.cell != c4_di->driver.cell);
+                // A genuinely remote (non-const) DI prefers the O5 feed-through
+                // over AX whenever this slot has an S-LUT to anchor it AND the
+                // feed-through's single input still fits the 5LUT alongside the
+                // S-LUT's inputs (<=5 unique nets, so the feed-through input
+                // never spills onto the nonexistent 5LUT A6 pin).  Routing DI
+                // via O5 leaves the column's X bypass free for a co-packed
+                // main-FF whose D can ONLY arrive through X (its 6LUT is the
+                // carry S-LUT, so no O6 routethru).  This is golden's encoding
+                // for the 72 columns where a CARRY4 DI and a regfile FF.D
+                // contend for the same X pin -- forcing DI onto AX there made
+                // router1 fail ~2099 FF.D arcs.  AX is still used when the
+                // feed-through is infeasible (no S-LUT anchor, or the DI input
+                // would need A6) -- the original "No wire found for port A6"
+                // guard -- and unconditionally for a constant DI.
+                bool di_remote_real = di_remote && !is_const(c4_di);
+                int di_feed_inputs = int(unique_lut_inputs.size());
+                if (c4_di && !unique_lut_inputs.count(c4_di->name))
+                    di_feed_inputs++;
+                bool di_feed_fits = (s_lut != nullptr) && di_feed_inputs <= 5;
+                if (prev->attrs.count(ctx->id("BEL")) && !di_lut &&
+                    (is_const(c4_di) || di_remote) &&
+                    !(z == 0 && dyn_cyinit) &&
+                    !(di_remote_real && di_feed_fits)) {
+                    // Imported (BEL-pinned) placement with a CONSTANT DI
+                    // (GND/VCC).  Realise it by routing the constant in via the
+                    // slot's bypass pin (xCY0=AX) -- the reliable path the
+                    // wide-LUT slots already use successfully.
+                    //
+                    // The alternative (a const-0 feed-through LUT constrained
+                    // into THIS slot's free 5LUT, O5->DI internal) is fragile:
+                    // whenever the slot's 5LUT can't legally share inputs with a
+                    // const-0 LUT -- a BEL-pinned 6-input S-LUT, a thin LUT1
+                    // S-routethru, OR simply no S-LUT to anchor the slot -- the
+                    // validity check relocates the feed-through to a REMOTE
+                    // slice, and the intended O5->DI path becomes an unroutable
+                    // cross-slice arc ("Failed to route ... C6LUT_O6 ->
+                    // DCY0_OUT").  Going via AX needs no same-slot 5LUT at all,
+                    // so it is immune to every one of those collisions.  A
+                    // const DI is don't-care-routed-to-0 either way, so this is
+                    // functionally identical to golden's xCY0=O5 encoding.
+                    di_via_ax = true;
+                }
+                if (!di_lut && c4_di && !di_via_ax) {
                     PortRef pr; pr.cell = prev;
                     pr.port = ctx->id("DI[" + zs + "]");
                     auto di_feed = feed_through_lut(c4_di, {pr});
                     di_lut = di_feed.get();
+                    if (ctx->debug)
+                        log_info("feedthru %s for %s.DI[%s]\n", ctx->nameOf(di_lut), ctx->nameOf(prev), zs.c_str());
                     new_cells.push_back(std::move(di_feed));
                 }
+                // Cells with absolute BEL pins (imported Vivado placement)
+                // must not be chain-constrained: Vivado legally places some
+                // carry feeder LUTs in NEIGHBOUR slices, so a relative
+                // constraint can never be satisfied and the legaliser would
+                // relocate the whole pinned chain.
+                if (s_lut && s_lut->attrs.count(ctx->id("BEL")))
+                    s_lut = nullptr;
+                if (di_lut && di_lut->attrs.count(ctx->id("BEL")))
+                    di_lut = nullptr;
+                // When the segment carry itself is BEL-pinned (imported
+                // placement), anchor created feed-throughs to IT with zero
+                // offset -- the root-relative row arithmetic (idx + idx/25)
+                // mis-phases across HCLK rows depending on the root's
+                // position within the clock region.
+                CellInfo *anchor = prev->attrs.count(ctx->id("BEL")) ? prev : root;
+                int anchor_y = (anchor == prev) ? 0 : constr_y;
+                if (getenv("DBG_SFEED") && s_lut == nullptr && c4_s)
+                    log_info("SFEED-NULLED %s.S[%d] (s_lut nulled before constrain) prevBEL=%s\n",
+                             ctx->nameOf(prev), z,
+                             prev->attrs.count(ctx->id("BEL")) ?
+                               prev->attrs.at(ctx->id("BEL")).as_string().c_str() : "NONE");
                 if (s_lut) {
-                    root->constr_children.push_back(s_lut);
-                    s_lut->constr_parent = root;
+                    anchor->constr_children.push_back(s_lut);
+                    s_lut->constr_parent = anchor;
                     s_lut->constr_x = 0;
-                    s_lut->constr_y = constr_y;
+                    s_lut->constr_y = anchor_y;
                     s_lut->constr_abs_z = true;
                     s_lut->constr_z = (z << 4 | BEL_6LUT);
                 }
                 if (di_lut) {
-                    root->constr_children.push_back(di_lut);
-                    di_lut->constr_parent = root;
+                    anchor->constr_children.push_back(di_lut);
+                    di_lut->constr_parent = anchor;
                     di_lut->constr_x = 0;
-                    di_lut->constr_y = constr_y;
+                    di_lut->constr_y = anchor_y;
                     di_lut->constr_abs_z = true;
                     di_lut->constr_z = (z << 4 | BEL_5LUT);
                 }
@@ -268,6 +394,11 @@ void XC7Packer::pack_carries_atomic()
             }
             if (!next) break;
             ++idx_in_chain;
+            if (next->attrs.count(ctx->id("BEL"))) {
+                // pinned chain segment: placement comes from the import
+                prev = next;
+                continue;
+            }
             // Constrain next CARRY4 relative to the root.
             next->constr_parent = root;
             root->constr_children.push_back(next);
@@ -284,6 +415,9 @@ void XC7Packer::pack_carries_atomic()
     }
     log_info("   Packed %d CARRY4 cells into %d chains (atomic).\n",
              cell_count, chain_count);
+
+    // (CARRY4 DI=GND is omitted at the per-bit handling below: the DI mux defaults
+    // to 0 when left unrouted, so no GND route/LUT is needed -- matches golden.)
 
     // feed_through_lut() pushes newly-created LUT cells into new_cells
     // (not ctx->cells).  Flush them in now so pack_luts (which runs after

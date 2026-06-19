@@ -83,8 +83,23 @@ bool Arch::xcu_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
                             }
                         }
                         if (shared < need_shared) {
-                            DBG();
-                            return false;
+                            // Imported (Vivado/golden) CARRY4 slot: the operand LUT
+                            // (O6->S) and the DI feed-through (O5->DI) are ONE
+                            // dual-output LUT on real hardware -- O5 and O6 of the
+                            // same 5-input LUT -- so they share all physical inputs
+                            // by construction.  SVS/pack represents that as two cells
+                            // whose lone feed-through input is a renamed net copy, so
+                            // input_sigs no longer match by identity (shared=0 here)
+                            // even though the placement is physically legal (golden
+                            // uses it and runs).  When the slot's 6LUT is BEL-pinned
+                            // (imported) and the 5LUT only drives the carry, trust the
+                            // import instead of rejecting a valid slot.
+                            bool imported_carry_feedthrough =
+                                lut6->attrs.count(id_BEL) && lut5->lutInfo.only_drives_carry;
+                            if (!imported_carry_feedthrough) {
+                                DBG();
+                                return false;
+                            }
                         }
                     }
                 }
@@ -337,13 +352,18 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
                         DBG();
                         return false;
                     }
-                    // If all 6 inputs or 2 outputs are used, 5LUT can't also be present
-                    if (lut6->lutInfo.input_count == 6 || lut6->lutInfo.output_count == 2) {
+                    bool srl_pair = lut6->lutInfo.is_srl && lut5->lutInfo.is_srl;
+                    // If all 6 inputs or 2 outputs are used, 5LUT can't also be
+                    // present.  SRL16E pairs are exempt: their address pins are
+                    // constant-tied and shared by construction (Vivado packs
+                    // two SRL16Es per slot routinely).
+                    if (!srl_pair &&
+                        (lut6->lutInfo.input_count == 6 || lut6->lutInfo.output_count == 2)) {
                         DBG();
                         return false;
                     }
                     // If more than 5 total inputs are used, need to check number of shared input
-                    if ((lut6->lutInfo.input_count + lut5->lutInfo.input_count) > 5) {
+                    if (!srl_pair && (lut6->lutInfo.input_count + lut5->lutInfo.input_count) > 5) {
                         int shared = 0, need_shared = (lut6->lutInfo.input_count + lut5->lutInfo.input_count - 5);
                         for (int j = 0; j < lut6->lutInfo.input_count; j++) {
                             for (int k = 0; k < lut5->lutInfo.input_count; k++) {
@@ -354,8 +374,23 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
                             }
                         }
                         if (shared < need_shared) {
-                            DBG();
-                            return false;
+                            // Imported (Vivado/golden) CARRY4 slot: the operand LUT
+                            // (O6->S) and the DI feed-through (O5->DI) are ONE
+                            // dual-output LUT on real hardware -- O5 and O6 of the
+                            // same 5-input LUT -- so they share all physical inputs
+                            // by construction.  SVS/pack represents that as two cells
+                            // whose lone feed-through input is a renamed net copy, so
+                            // input_sigs no longer match by identity (shared=0 here)
+                            // even though the placement is physically legal (golden
+                            // uses it and runs).  When the slot's 6LUT is BEL-pinned
+                            // (imported) and the 5LUT only drives the carry, trust the
+                            // import instead of rejecting a valid slot.
+                            bool imported_carry_feedthrough =
+                                lut6->attrs.count(id_BEL) && lut5->lutInfo.only_drives_carry;
+                            if (!imported_carry_feedthrough) {
+                                DBG();
+                                return false;
+                            }
                         }
                     }
                 }
@@ -427,8 +462,17 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
             bool ff1_uses_x = false;
             if (ff1 != nullptr && ff1->ffInfo.d != nullptr && ff1->ffInfo.d->driver.cell != nullptr) {
                 auto &drv = ff1->ffInfo.d->driver;
-                if ((drv.cell == lut6 && drv.port != id_MC31) || drv.cell == lut5 || drv.cell == out_fmux) {
-                    // Direct, OK
+                if ((drv.cell == lut6 && drv.port != id_MC31) || drv.cell == lut5 || drv.cell == out_fmux ||
+                    (carry4 != nullptr && drv.cell == carry4)) {
+                    // Direct, OK (LUT O6/O5, F7/F8 mux out, or the slot's
+                    // CARRY4 O/CO via the XOR/CY xFFMUX paths)
+                } else if (ff1->attrs.count(id_BEL) && (lut6 == nullptr || lut5 == nullptr)) {
+                    // Imported (Vivado-placed) FF with a free LUT position in
+                    // the slot: Vivado feeds the main FF through a LUT
+                    // routethru (free 6LUT: INIT buffer + xFFMUX.O6; free
+                    // 5LUT: lower-half INIT buffer + xFFMUX.O5) and leaves
+                    // the X bypass for the 5FF -- no X usage here.  The
+                    // router realises this via the route-thru pseudo pip.
                 } else {
                     // Indirect, must use X input
                     ff1_uses_x = true;
@@ -468,7 +512,13 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
             // MUX (xFFMUX) from X — it silently leaves the main FF's D floating
             // (observed via physical sim: the bypass-fed AFF's D = X, corrupting
             // an LFSR).  Forbid that co-pack so the placer separates the two FFs.
-            if (ff1_uses_x && ff2 != nullptr) {
+            // Exception: when BOTH FFs carry absolute BEL pins (imported
+            // Vivado placement), trust the import -- Vivado co-packs this
+            // legally, and the route-only flow cannot separate them.  Any
+            // residual xFFMUX emission bug then shows up as a bit-level
+            // diff against the golden bitstream instead of a place error.
+            if (ff1_uses_x && ff2 != nullptr &&
+                !(ff1->attrs.count(id_BEL) && ff2->attrs.count(id_BEL))) {
                 DBG();
                 return false;
             }
@@ -500,12 +550,18 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
             }
 
             if (carry4 != nullptr && carry4->carryInfo.out_sigs[i % 4] != nullptr) {
-                // FIXME: direct connections to FF
-                if (mux_output_used) {
-                    DBG();
-                    return false; // Memory and SRLs only valid in SLICEMs
+                // The carry O output reaches the main FF directly through
+                // the XOR path of xFFMUX; only fabric fanout (or feeding
+                // anything else) needs this subslice's output mux.
+                NetInfo *o = carry4->carryInfo.out_sigs[i % 4];
+                bool o_uses_mux = o->users.size() > 1 || ff1 == nullptr || o != ff1->ffInfo.d;
+                if (o_uses_mux) {
+                    if (mux_output_used) {
+                        DBG();
+                        return false;
+                    }
+                    mux_output_used = true;
                 }
-                mux_output_used = true;
             }
             if (carry4 != nullptr && carry4->carryInfo.cout_sigs[i % 4] != nullptr) {
                 NetInfo *co = carry4->carryInfo.cout_sigs[i % 4];
@@ -671,6 +727,17 @@ bool Arch::isValidBelForCell(CellInfo *cell, BelId bel) const
 
 void Arch::fixupPlacement()
 {
+    if (getenv("DBG_SFEED")) {
+        for (auto cell : sorted(cells)) {
+            CellInfo *ci = cell.second;
+            std::string nm = ci->name.str(this);
+            if (nm.find("$LUT$24") != std::string::npos || nm.find("$LUT$26") != std::string::npos)
+                log_info("FEEDPOS %s bel=%s strength=%d constr_parent=%s\n", nm.c_str(),
+                         ci->bel == BelId() ? "UNBOUND" : getBelName(ci->bel).c_str(this),
+                         int(ci->belStrength),
+                         ci->constr_parent ? ci->constr_parent->name.c_str(this) : "none");
+        }
+    }
     log_info("Running post-placement legalisation...\n");
     for (auto &ts : tileStatus) {
         if (ts.lts == nullptr)
@@ -697,7 +764,11 @@ void Arch::fixupPlacement()
                         lut6->ports[id_A6].name = id_A6;
                         lut6->ports[id_A6].type = PORT_IN;
                     }
-                    connect_port(getCtx(), nets[id("$PACKER_VCC_NET")].get(), lut6, id_A6);
+                    // pack_srls already ties A6 for 6LUT SRLs -- only
+                    // connect when still floating (connect_port asserts
+                    // on an already-driven port)
+                    if (lut6->ports.at(id_A6).net == nullptr)
+                        connect_port(getCtx(), nets[id("$PACKER_VCC_NET")].get(), lut6, id_A6);
                 }
                 continue;
             }
@@ -758,7 +829,11 @@ void Arch::fixupPlacement()
                     lut6->ports[id_A6].name = id_A6;
                     lut6->ports[id_A6].type = PORT_IN;
                 }
-                connect_port(getCtx(), nets[id("$PACKER_VCC_NET")].get(), lut6, id_A6);
+                // Only tie A6 to VCC when still floating: the input de-dup above
+                // may already have routed a shared input onto A6 (connect_port
+                // asserts on an already-driven port -- same guard as the SRL A6 tie).
+                if (lut6->ports.at(id_A6).net == nullptr)
+                    connect_port(getCtx(), nets[id("$PACKER_VCC_NET")].get(), lut6, id_A6);
             }
         }
     }
