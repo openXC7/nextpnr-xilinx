@@ -202,9 +202,9 @@ endif()
 include_directories(common/ json/ frontend/ 3rdparty/json11/ ${Boost_INCLUDE_DIRS} ${Python3_INCLUDE_DIRS})
 
 if(BUILD_HEAP)
-    find_package (Eigen3 REQUIRED NO_MODULE)
+    find_package(PkgConfig)
+    pkg_check_modules(EIGEN3 REQUIRED eigen3)
     include_directories(${EIGEN3_INCLUDE_DIRS})
-    add_definitions(${EIGEN3_DEFINITIONS})
     add_definitions(-DWITH_HEAP)
 endif()
 
