@@ -325,12 +325,24 @@ class ConstraintLegaliseWorker
                 Loc cl;
                 cl.x = rootLoc.x + (child->constr_x == child->UNCONSTR ? 0 : child->constr_x);
                 cl.y = rootLoc.y + (child->constr_y == child->UNCONSTR ? 0 : child->constr_y);
+                // xc7: chains never cross slice halves -- impose the
+                // root's half (z bit 6) on absolute chain z values
                 cl.z = child->constr_abs_z
-                               ? child->constr_z
+                               ? (child->constr_z | (rootLoc.z & ~0x3F))
                                : rootLoc.z + (child->constr_z == child->UNCONSTR ? 0 : child->constr_z);
                 BelId target = ctx->getBelByLocation(cl);
-                if (target != BelId() && ctx->checkBelAvail(target))
+                if (target != BelId() && ctx->checkBelAvail(target)) {
                     ctx->bindBel(target, child, STRENGTH_STRONG);
+                    if (getenv("DBG_BIND") && std::string(ctx->nameOf(child)).find("$LUT$") != std::string::npos)
+                        log_info("BIND-OK child %s -> %s\n", ctx->nameOf(child), ctx->nameOfBel(target));
+                }
+                else if (getenv("DBG_BIND"))
+                    log_info("BIND-FAIL child %s -> loc(%d,%d,%d) bel=%s %s\n",
+                             ctx->nameOf(child), cl.x, cl.y, cl.z,
+                             target == BelId() ? "NONE" : ctx->nameOfBel(target),
+                             target == BelId() ? "" :
+                               (ctx->checkBelAvail(target) ? "avail" :
+                                 ("occupied-by:" + std::string(ctx->nameOf(ctx->getBoundBelCell(target)))).c_str()));
             }
             bind_unplaced_children(child);
         }
@@ -341,6 +353,34 @@ class ConstraintLegaliseWorker
     {
         if (cell->constr_parent != nullptr)
             return true; // Only process chain roots
+        // BEL-pinned roots (imported Vivado placement): bind any children
+        // created during packing (carry feed-throughs etc.) relative to the
+        // pinned root, then lock the chain.  Never run the relocation
+        // search on a pinned root -- it would silently override the import
+        // (and can churn for hours scanning the grid).
+        if (cell->attrs.count(ctx->id("BEL")) && cell->bel != BelId()) {
+            if (!cell->constr_children.empty())
+                bind_unplaced_children(cell);
+            // The relative constraints have served their purpose (children
+            // are bound and the chain locked); the xc7 half-bit z encoding
+            // would otherwise read as a nonzero constraint distance and trip
+            // the final satisfaction sweep.  Clear them.
+            std::function<void(CellInfo *)> clear_constrs = [&](CellInfo *c) {
+                c->constr_x = c->UNCONSTR;
+                c->constr_y = c->UNCONSTR;
+                c->constr_z = c->UNCONSTR;
+                c->constr_abs_z = false;
+                for (auto ch : c->constr_children) {
+                    if (ch->bel == BelId())
+                        log_warning("chain child '%s' of pinned root '%s' is still unbound\n", ctx->nameOf(ch),
+                                    ctx->nameOf(cell));
+                    clear_constrs(ch);
+                }
+            };
+            clear_constrs(cell);
+            lockdown_chain(cell);
+            return true;
+        }
         if (constraints_satisfied(cell)) {
             if (cell->constr_children.size() > 0 || cell->constr_x != cell->UNCONSTR ||
                 cell->constr_y != cell->UNCONSTR || cell->constr_z != cell->UNCONSTR) {

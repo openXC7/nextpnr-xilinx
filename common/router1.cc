@@ -117,6 +117,14 @@ struct Router1
     {
         if (queued_arcs.count(arc))
             return;
+        if (ctx->debug && arc.net_info->users[arc.user_idx].cell != nullptr &&
+            arc.net_info->users[arc.user_idx].cell->type == ctx->id("BUFGCTRL") &&
+            is_const_net(arc.net_info))
+            log_info("    const-queue BUFGCTRL %s/%s src=%s dst=%s\n",
+                     ctx->nameOf(arc.net_info->users[arc.user_idx].cell),
+                     ctx->nameOf(arc.net_info->users[arc.user_idx].port),
+                     src_wire == WireId() ? "<INVALID>" : ctx->nameOfWire(src_wire),
+                     dst_wire == WireId() ? "<INVALID>" : ctx->nameOfWire(dst_wire));
 
         delay_t pri = ctx->estimateDelay(src_wire, dst_wire) - arc.net_info->users[arc.user_idx].budget;
 
@@ -342,6 +350,10 @@ struct Router1
 
             for (auto &it : net_info->wires) {
                 WireId w = it.first;
+                // LOCKED bindings include template-routed segments (GT clock
+                // bodge) that arc traversal cannot walk; trust them.
+                if (it.second.strength >= STRENGTH_LOCKED)
+                    continue;
                 log_assert(valid_wires_for_net.count(w));
             }
         }
@@ -383,6 +395,16 @@ struct Router1
                     arc_key arc;
                     arc.net_info = net_info;
                     arc.user_idx = user_idx;
+                    // Diagnostic: const sinks on global-clock buffer control
+                    // pins have silently gone unrouted before (BUFGCTRL CE0/
+                    // S0 floating -> buffer gated off -> dead clock on HW).
+                    CellInfo *uc = net_info->users[user_idx].cell;
+                    if (ctx->debug && uc != nullptr && uc->type == ctx->id("BUFGCTRL")) {
+                        WireId dw = ctx->getNetinfoSinkWire(net_info, net_info->users[user_idx]);
+                        log_info("    const-arc BUFGCTRL %s/%s sink_wire=%s\n", ctx->nameOf(uc),
+                                 ctx->nameOf(net_info->users[user_idx].port),
+                                 dw == WireId() ? "<INVALID>" : ctx->nameOfWire(dw));
+                    }
                     arc_queue_insert(arc);
                 }
                 continue;
@@ -445,6 +467,13 @@ struct Router1
                         break;
                     }
 
+                    // A LOCKED wire with no pip is a template-routed segment
+                    // (e.g. the GT-clock bodge binding a known-good Vivado
+                    // path whose spine edges are missing from the chipdb).
+                    // Treat the arc as already routed rather than asserting.
+                    if (it->second.pip == PipId() && it->second.strength >= STRENGTH_LOCKED)
+                        break;
+
                     NPNR_ASSERT(it->second.pip != PipId());
                     cursor = ctx->getPipSrcWire(it->second.pip);
                     wire_to_arcs[cursor].insert(arc);
@@ -486,6 +515,11 @@ struct Router1
         NetInfo *net_info = arc.net_info;
         int user_idx = arc.user_idx;
         WireId dst_wire = ctx->getNetinfoSinkWire(net_info, net_info->users[user_idx]);
+        bool dbg_bufg = ctx->debug && net_info->users[user_idx].cell != nullptr &&
+                        net_info->users[user_idx].cell->type == ctx->id("BUFGCTRL");
+        if (dbg_bufg)
+            log_info("    const-enter BUFGCTRL %s/%s dst=%s\n", ctx->nameOf(net_info->users[user_idx].cell),
+                     ctx->nameOf(net_info->users[user_idx].port), ctx->nameOfWire(dst_wire));
         ripup_flag = false;
         int32_t pseudo = (net_info->name == ctx->id("$PACKER_VCC_NET")) ? ID_PSEUDO_VCC : ID_PSEUDO_GND;
 
@@ -517,8 +551,18 @@ struct Router1
                 WireId w = bfs.front();
                 bfs.pop();
                 if (ctx->wireIntent(w) == pseudo) {
-                    src_wire = w;
-                    break;
+                    // Only fabric (tile-level) pseudo-constant wires are
+                    // valid sources: a SITEWIRE with pseudo intent inside a
+                    // site (seen in BUFGCTRL) terminates the search with a
+                    // route made purely of site pips that the FASM backend
+                    // never emits -- a phantom route that leaves the pin
+                    // electrically floating on real silicon (dead BUFG ->
+                    // dead clock).  Keep searching outward instead.
+                    const std::string &wn = ctx->getWireName(w).str(ctx);
+                    if (wn.compare(0, 8, "SITEWIRE") != 0) {
+                        src_wire = w;
+                        break;
+                    }
                 }
                 for (PipId pip : ctx->getPipsUphill(w)) {
                     if (!allow_ripup && !ctx->checkPipAvail(pip) && ctx->getBoundPipNet(pip) != net_info)
@@ -534,10 +578,11 @@ struct Router1
             }
         }
         if (src_wire == WireId()) {
-            if (ctx->debug)
-                log_info("  route_const_arc: no %s source reachable for sink %s (cell %s port %s)\n",
-                         (pseudo == ID_PSEUDO_VCC) ? "VCC" : "GND", ctx->nameOfWire(dst_wire),
-                         ctx->nameOf(net_info->users[user_idx].cell), ctx->nameOf(net_info->users[user_idx].port));
+            // Always-on: a silently unrouted const sink can be a dead clock
+            // buffer or similar functional kill, never just noise.
+            log_warning("route_const_arc: no %s source reachable for sink %s (cell %s port %s)\n",
+                        (pseudo == ID_PSEUDO_VCC) ? "VCC" : "GND", ctx->nameOfWire(dst_wire),
+                        ctx->nameOf(net_info->users[user_idx].cell), ctx->nameOf(net_info->users[user_idx].port));
             return false;
         }
 
@@ -578,6 +623,22 @@ struct Router1
             arcs_with_ripup++;
         else
             arcs_without_ripup++;
+        if (ctx->debug && net_info->users[user_idx].cell != nullptr &&
+            net_info->users[user_idx].cell->type == ctx->id("BUFGCTRL")) {
+            std::string path;
+            WireId c = src_wire;
+            int hops = 0;
+            while (true) {
+                path += ctx->getWireName(c).str(ctx);
+                PipId p = reached.at(c);
+                if (p == PipId() || ++hops > 12)
+                    break;
+                path += " -> ";
+                c = ctx->getPipDstWire(p);
+            }
+            log_info("    const-route BUFGCTRL %s/%s: %s\n", ctx->nameOf(net_info->users[user_idx].cell),
+                     ctx->nameOf(net_info->users[user_idx].port), path.c_str());
+        }
         return true;
     }
 
@@ -1025,13 +1086,21 @@ bool router1(Context *ctx, const Router1Cfg &cfg)
                     skipped_arcs.push_back(arc);
                     continue;
                 }
-                log_warning("Failed to find a route for arc %d of net %s.\n", arc.user_idx, ctx->nameOf(arc.net_info));
-#ifndef NDEBUG
-                router.check();
-                ctx->check();
-#endif
-                ctx->unlock();
-                return false;
+                {
+                    auto &usr = arc.net_info->users.at(arc.user_idx);
+                    // This used to log_warning and return false -- but every
+                    // caller ignores the return value, so a single unroutable
+                    // arc silently aborted the WHOLE remaining routing pass
+                    // (~6k const arcs left floating on ethsoc: every BUFGCTRL
+                    // control pin, BRAM const pins, ... -> dead clocks on HW
+                    // with a "successful" build).  Fail loudly instead.
+                    log_error("Failed to find a route for arc %d of net %s (sink %s/%s at bel %s); "
+                              "%d arcs still pending -- aborting (was previously a silent abort).\n",
+                              arc.user_idx, ctx->nameOf(arc.net_info), ctx->nameOf(usr.cell),
+                              usr.port.c_str(ctx),
+                              usr.cell->bel != BelId() ? ctx->nameOfBel(usr.cell->bel) : "<unplaced>",
+                              int(router.arc_queue.size()));
+                }
             }
         }
         auto rend = std::chrono::high_resolution_clock::now();

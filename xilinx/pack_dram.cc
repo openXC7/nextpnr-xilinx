@@ -464,6 +464,45 @@ void XilinxPacker::pack_dram()
             log_error("Cannot pack unsupported primitive: %s\n", cs.memtype.c_str(ctx));
         }
     }
+    // Raw distributed-RAM leaf primitives (RAMD64E / RAMD32 / RAMS32),
+    // e.g. from an imported Vivado netlist where the Unisim Transform
+    // already decomposed RAM32M/RAM64M.  Reuse the same xform rules the
+    // macro path applies via create_dram_lut/create_dram32_lut.  The
+    // 5LUT-vs-6LUT variant for 32-bit cells is taken from the absolute
+    // BEL attribute when present (imported placements pin them anyway).
+    for (auto cell : sorted(ctx->cells)) {
+        CellInfo *ci = cell.second;
+        if (packed_cells.count(ci->name))
+            continue;
+        if (ci->type == ctx->id("RAMD64E")) {
+            xform_cell(dram_rules, ci);
+        } else if (ci->type == ctx->id("RAMD32") || ci->type == ctx->id("RAMS32")) {
+            bool is5 = false;
+            auto bel = ci->attrs.find(ctx->id("BEL"));
+            if (bel != ci->attrs.end() &&
+                bel->second.as_string().find("5LUT") != std::string::npos)
+                is5 = true;
+            if (ci->type == ctx->id("RAMS32")) {
+                // single-port: the slice write address is the read
+                // address -- mirror the ADR nets onto WADR before the
+                // xform so the WA pins are modelled like the macro path
+                for (int i = 0; i < 5; i++) {
+                    IdString adr = ctx->id("ADR" + std::to_string(i));
+                    IdString wadr = ctx->id("WADR" + std::to_string(i));
+                    NetInfo *a = get_net_or_empty(ci, adr);
+                    rename_port(ctx, ci, adr, ctx->id("RADR" + std::to_string(i)));
+                    if (a != nullptr) {
+                        ci->ports[wadr].name = wadr;
+                        ci->ports[wadr].type = PORT_IN;
+                        connect_port(ctx, a, ci, wadr);
+                    }
+                }
+                ci->type = ctx->id("RAMD32");
+            }
+            xform_cell(is5 ? dram32_5_rules : dram32_6_rules, ci);
+        }
+    }
+
     // Whole-SLICE DRAM
     for (auto cell : sorted(ctx->cells)) {
         CellInfo *ci = cell.second;

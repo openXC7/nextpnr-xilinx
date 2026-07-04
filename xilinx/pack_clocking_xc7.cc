@@ -160,8 +160,12 @@ void XC7Packer::pack_plls()
             }
             set_default(ci, ctx->id("COMPENSATION"), Property("INTERNAL"));
 
-            // Fixup routing
-            if (str_or_default(ci->params, ctx->id("COMPENSATION"), "INTERNAL") == "INTERNAL") {
+            // Fixup routing.  Imported (BEL-pinned) MMCMs keep the real
+            // CLKFBOUT->CLKFBIN loop: golden bitstreams realise INTERNAL
+            // compensation via the dedicated CLKFBOUT2IN pip, and a
+            // VCC-tied CLKFBIN never locks on hardware.
+            if (str_or_default(ci->params, ctx->id("COMPENSATION"), "INTERNAL") == "INTERNAL" &&
+                !ci->attrs.count(ctx->id("BEL"))) {
                 disconnect_port(ctx, ci, ctx->id("CLKFBIN"));
                 connect_port(ctx, ctx->nets[ctx->id("$PACKER_VCC_NET")].get(), ci, ctx->id("CLKFBIN"));
             }
@@ -182,10 +186,15 @@ void XC7Packer::pack_plls()
                                         "DADDR0", "DADDR1", "DADDR2", "DADDR3", "DADDR4", "DADDR5", "DADDR6"};
         for (int i = 0; i < 16; i++)
             drp.push_back("DI" + std::to_string(i));
+        // MMCME2 additionally has the phase-shift port; a fabric-routed
+        // PSCLK/PSEN with random IMUX levels walks the output phase away.
+        std::vector<std::string> mmcm_extra = {"PSCLK", "PSEN", "PSINCDEC", "RST"};
         int n = 0;
         for (auto cell : sorted(ctx->cells)) {
             CellInfo *ci = cell.second;
-            if (ci->type != ctx->id("PLLE2_ADV_PLLE2_ADV"))
+            bool is_pll = ci->type == ctx->id("PLLE2_ADV_PLLE2_ADV");
+            bool is_mmcm = ci->type == ctx->id("MMCME2_ADV_MMCME2_ADV");
+            if (!is_pll && !is_mmcm)
                 continue;
             for (auto &p : drp) {
                 NetInfo *nn = get_net_or_empty(ci, ctx->id(p));
@@ -194,9 +203,18 @@ void XC7Packer::pack_plls()
                     ++n;
                 }
             }
+            if (is_mmcm) {
+                for (auto &p : mmcm_extra) {
+                    NetInfo *nn = get_net_or_empty(ci, ctx->id(p));
+                    if (nn != nullptr && (nn->name == gnd || nn->name == vcc)) {
+                        disconnect_port(ctx, ci, ctx->id(p));
+                        ++n;
+                    }
+                }
+            }
         }
         if (n)
-            log_info("    PLLE2: disconnected %d const DRP/control pins (Vivado leaves them unrouted)\n", n);
+            log_info("    PLL/MMCM: disconnected %d const DRP/control pins (Vivado leaves them unrouted)\n", n);
     }
 }
 

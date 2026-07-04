@@ -198,6 +198,75 @@ class SAPlacer
             log_info("Placed %d cells based on constraints.\n", int(placed_cells));
             ctx->yield();
 
+            // Bind packer-created chain children of BEL-pinned roots before
+            // building the autoplace set, so SA doesn't scatter them
+            // (imported Vivado placements: carry feed-through LUTs etc.)
+            int chain_children_placed = 0;
+            std::function<void(CellInfo *)> bind_children = [&](CellInfo *root) {
+                Loc rootLoc = ctx->getBelLocation(root->bel);
+                for (auto child : root->constr_children) {
+                    if (getenv("DBG_SFEED") && std::string(ctx->nameOf(child)).find("$LUT$") != std::string::npos)
+                        log_info("BINDCH child=%s root=%s childBel=%s\n", ctx->nameOf(child),
+                                 ctx->getBelName(root->bel).c_str(ctx),
+                                 child->bel == BelId() ? "UNBOUND" : ctx->getBelName(child->bel).c_str(ctx));
+                    if (child->bel == BelId()) {
+                        Loc cl;
+                        cl.x = rootLoc.x + (child->constr_x == child->UNCONSTR ? 0 : child->constr_x);
+                        cl.y = rootLoc.y + (child->constr_y == child->UNCONSTR ? 0 : child->constr_y);
+                        // xc7: an "absolute" chain z encodes the slot within
+                        // one slice half; chains never cross halves, so the
+                        // root's half (z bit 6) is ALWAYS imposed on children
+                        cl.z = child->constr_abs_z
+                                       ? (child->constr_z | (rootLoc.z & ~0x3F))
+                                       : rootLoc.z + (child->constr_z == child->UNCONSTR ? 0 : child->constr_z);
+                        BelId target = ctx->getBelByLocation(cl);
+                        if (target != BelId() && ctx->checkBelAvail(target)) {
+                            ctx->bindBel(target, child, STRENGTH_STRONG);
+                            chain_children_placed++;
+                        } else {
+                            log_warning("chain child '%s' pre-bind failed: root=%s loc=(%d,%d,%d) target=%s bound=%s\n",
+                                        ctx->nameOf(child), ctx->getBelName(root->bel).c_str(ctx), cl.x, cl.y, cl.z,
+                                        target == BelId() ? "none" : ctx->getBelName(target).c_str(ctx),
+                                        target == BelId() ? "-" : ctx->nameOf(ctx->getBoundBelCell(target)));
+                        }
+                    }
+                    if (child->bel != BelId())
+                        bind_children(child);
+                }
+            };
+            std::function<void(CellInfo *)> clear_constrs = [&](CellInfo *c) {
+                c->constr_x = c->UNCONSTR;
+                c->constr_y = c->UNCONSTR;
+                c->constr_z = c->UNCONSTR;
+                c->constr_abs_z = false;
+                for (auto ch : c->constr_children) {
+                    if (ch->bel == BelId())
+                        log_warning("chain child '%s' of pinned root '%s' is still unbound\n", ctx->nameOf(ch),
+                                    ctx->nameOf(c));
+                    clear_constrs(ch);
+                }
+            };
+            for (auto &cell : ctx->cells) {
+                CellInfo *ci = cell.second.get();
+                if (ci->constr_parent == nullptr && !ci->constr_children.empty() && ci->bel != BelId() &&
+                    ci->attrs.count(ctx->id("BEL"))) {
+                    bind_children(ci);
+                    // constraints have served their purpose; the xc7 half-bit
+                    // z encoding would otherwise trip the final distance sweep
+                    clear_constrs(ci);
+                }
+            }
+            // pinned chain SEGMENTS with no children (skipped from chaining)
+            // may still carry the root abs-z constraint from pack_carries
+            for (auto &cell : ctx->cells) {
+                CellInfo *ci = cell.second.get();
+                if (ci->constr_parent == nullptr && ci->bel != BelId() && ci->attrs.count(ctx->id("BEL")) &&
+                    ci->constr_abs_z)
+                    clear_constrs(ci);
+            }
+            if (chain_children_placed > 0)
+                log_info("Bound %d chain children of BEL-pinned roots.\n", chain_children_placed);
+
             // Sort to-place cells for deterministic initial placement
 
             for (auto &cell : ctx->cells) {

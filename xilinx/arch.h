@@ -1634,6 +1634,7 @@ struct Arch : BaseCtx
 
     void routeVcc();
     void routeClock();
+    bool gtClockTemplateRoute(NetInfo *clk_net, PortRef &usr);
     void findSourceSinkLocations();
     std::unordered_map<WireId, Loc> sink_locs, source_locs;
     // -------------------------------------------------

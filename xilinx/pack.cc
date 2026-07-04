@@ -263,6 +263,58 @@ void XilinxPacker::pack_ffs()
         }
         log_info("    local-const FF control: disconnected %d SR(=GND) + %d CE(=VCC) pins "
                  "from global nets\n", n_sr, n_ce);
+
+        // Unused RAMB36 data-cascade inputs are tied to a constant by the
+        // netlist but are don't-care when the cascade is off, and Vivado
+        // leaves them unrouted.  With the BRAM cascade pips blacklisted
+        // (they were being abused as address-fanout shortcuts) the tie is
+        // also UNROUTABLE -- and one unroutable const arc aborts router1's
+        // whole final pass.  Disconnect like the FF controls above.
+        int n_casc = 0;
+        for (auto cell : sorted(ctx->cells)) {
+            CellInfo *ci = cell.second;
+            if (ci->type != ctx->id("RAMB36E1_RAMB36E1"))
+                continue;
+            for (auto p : {"CASCADEINA", "CASCADEINB"}) {
+                NetInfo *nn = get_net_or_empty(ci, ctx->id(p));
+                if (nn != nullptr && (nn->name == gnd || nn->name == vcc)) {
+                    disconnect_port(ctx, ci, ctx->id(p));
+                    ++n_casc;
+                }
+            }
+        }
+        if (n_casc > 0)
+            log_info("    local-const BRAM cascade: disconnected %d CASCADEIN pins\n", n_casc);
+
+        // GT dedicated refclk inputs (GTNORTHREFCLK*, GTSOUTHREFCLK*,
+        // GTGREFCLK*) are tied to constants by the netlist but have NO
+        // general-fabric route (dedicated clock spines, absent from the
+        // open db); refclk selection is GT config, and Vivado leaves the
+        // unused inputs unrouted.  An unroutable const arc here was the
+        // arc that silently aborted router1's whole final const pass on
+        // every ethsoc build (thousands of const sinks left floating).
+        int n_gt = 0;
+        for (auto cell : sorted(ctx->cells)) {
+            CellInfo *ci = cell.second;
+            if (ci->type != ctx->id("GTXE2_COMMON") && ci->type != ctx->id("GTXE2_CHANNEL"))
+                continue;
+            std::vector<IdString> victims;
+            for (auto &port : ci->ports) {
+                const std::string &pn = port.first.str(ctx);
+                if (pn.find("GTNORTHREFCLK") != 0 && pn.find("GTSOUTHREFCLK") != 0 &&
+                    pn.find("GTGREFCLK") != 0)
+                    continue;
+                NetInfo *nn = port.second.net;
+                if (nn != nullptr && (nn->name == gnd || nn->name == vcc))
+                    victims.push_back(port.first);
+            }
+            for (auto p : victims) {
+                disconnect_port(ctx, ci, p);
+                ++n_gt;
+            }
+        }
+        if (n_gt > 0)
+            log_info("    local-const GT refclk: disconnected %d dedicated-input pins\n", n_gt);
     }
 }
 
@@ -314,6 +366,9 @@ void XilinxPacker::legalise_muxf_tree(CellInfo *curr, std::vector<CellInfo *> &m
         if (pn == nullptr || pn->driver.cell == nullptr)
             continue;
         if (curr->type == ctx->id("MUXF7")) {
+            if (curr->attrs.count(ctx->id("BEL")) && pn->driver.cell->attrs.count(ctx->id("BEL")) &&
+                pn->driver.cell->type.str(ctx).substr(0, 3) == "LUT")
+                continue;   // pinned pair: stamped placement is authoritative
             if (pn->driver.cell->type.str(ctx).substr(0, 3) != "LUT" || is_constrained(pn->driver.cell)) {
                 PortRef pr;
                 pr.cell = curr;
@@ -330,8 +385,18 @@ void XilinxPacker::legalise_muxf_tree(CellInfo *curr, std::vector<CellInfo *> &m
                 next_type = ctx->id("MUXF7");
             else
                 NPNR_ASSERT_FALSE("bad mux type");
-            if (pn->driver.cell->type != next_type || is_constrained(pn->driver.cell) ||
-                bool_or_default(pn->driver.cell->attrs, ctx->id("MUX_TREE_ROOT"))) {
+            // BEL-pinned trees (R0 flow: Vivado placement stamped as BEL
+            // attrs): a pinned F7 feeding a pinned F8 in the same slice is
+            // hardware-direct even when the F7 output ALSO fans out to
+            // fabric (F7MUX_OUT drives the F8 leg and the slice output mux
+            // simultaneously) -- never feed it through, the synthetic $MUX$
+            // child could not bind anyway (the real pinned mux owns the
+            // BEL).
+            bool pinned_pair = curr->attrs.count(ctx->id("BEL")) &&
+                               pn->driver.cell->attrs.count(ctx->id("BEL"));
+            if (!pinned_pair &&
+                (pn->driver.cell->type != next_type || is_constrained(pn->driver.cell) ||
+                 bool_or_default(pn->driver.cell->attrs, ctx->id("MUX_TREE_ROOT")))) {
                 PortRef pr;
                 pr.cell = curr;
                 pr.port = p;
@@ -374,7 +439,7 @@ void XilinxPacker::constrain_muxf_tree(CellInfo *curr, CellInfo *base, int zoffs
         input_spacing = 4;
     } else
         curr_z += BEL_6LUT;
-    if (curr != base) {
+    if (curr != base && !curr->attrs.count(ctx->id("BEL"))) {
         curr->constr_x = 0;
         curr->constr_y = 0;
         curr->constr_z = curr_z - base_z;
@@ -465,7 +530,20 @@ void XilinxPacker::pack_srls()
             for (int i = 3; i >= 0; i--) {
                 rename_port(ctx, ci, ctx->id("A" + std::to_string(i)), ctx->id("A" + std::to_string(i + 2)));
             }
-            for (auto tp : {id_A1, id_A6}) {
+            // A 5LUT-position SRL16E (imported Vivado placement) takes its
+            // data in via DI1 (the AI pin) and outputs on O5; the default
+            // mapping above assumes the 6LUT position (DI2/O6).  A6 also
+            // doesn't exist on the 5LUT bel.
+            bool is5 = false;
+            auto bel = ci->attrs.find(ctx->id("BEL"));
+            if (bel != ci->attrs.end() &&
+                bel->second.as_string().find("5LUT") != std::string::npos)
+                is5 = true;
+            if (is5) {
+                rename_port(ctx, ci, id_DI2, id_DI1);
+                rename_port(ctx, ci, id_O6, id_O5);
+            }
+            for (auto tp : is5 ? std::vector<IdString>{id_A1} : std::vector<IdString>{id_A1, id_A6}) {
                 ci->ports[tp].name = tp;
                 ci->ports[tp].type = PORT_IN;
                 connect_port(ctx, ctx->nets[ctx->id("$PACKER_VCC_NET")].get(), ci, tp);
@@ -1041,13 +1119,17 @@ void Arch::assignCellInfo(CellInfo *cell)
         cell->lutInfo.is_srl = cell->attrs.count(id("X_LUT_AS_SRL"));
         cell->lutInfo.is_memory = cell->attrs.count(id("X_LUT_AS_DRAM"));
         cell->lutInfo.only_drives_carry = false;
+        // Connectivity is sufficient: a LUT whose only user is the carry
+        // drives nothing else, whether or not it is chain-constrained
+        // (imported Vivado placements pin feeder LUTs absolutely instead
+        // of via constr_parent).
         if (xc7) {
-            if (cell->constr_parent != nullptr && cell->lutInfo.output_count > 0 &&
+            if (cell->lutInfo.output_count > 0 &&
                 cell->lutInfo.output_sigs[0] != nullptr && cell->lutInfo.output_sigs[0]->users.size() == 1 &&
                 cell->lutInfo.output_sigs[0]->users.at(0).cell->type == id_CARRY4)
                 cell->lutInfo.only_drives_carry = true;
         } else {
-            if (cell->constr_parent != nullptr && cell->lutInfo.output_count > 0 &&
+            if (cell->lutInfo.output_count > 0 &&
                 cell->lutInfo.output_sigs[0] != nullptr && cell->lutInfo.output_sigs[0]->users.size() == 1 &&
                 cell->lutInfo.output_sigs[0]->users.at(0).cell->type == id_CARRY8)
                 cell->lutInfo.only_drives_carry = true;

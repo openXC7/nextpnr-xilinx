@@ -124,6 +124,12 @@ void XC7Packer::pack_carries_atomic()
     static const std::unordered_set<IdString> lut_types{
         ctx->id("LUT1"), ctx->id("LUT2"), ctx->id("LUT3"),
         ctx->id("LUT4"), ctx->id("LUT5")};
+    // FF primitives whose D may be a CARRY4 sum output (O[i]).  Vivado packs
+    // a registered adder/counter with each sum FF in the carry's OWN slice
+    // (O[i] -> FFMUX.XOR -> AFF/BFF/CFF/DFF); we co-locate them the same way.
+    static const std::unordered_set<IdString> ff_types{
+        ctx->id("FDRE"), ctx->id("FDSE"), ctx->id("FDCE"), ctx->id("FDPE"),
+        ctx->id("FDRSE")};
 
     // Find chain roots: a CARRY4 whose CI input is not driven by another
     // CARRY4's CO[3] output.
@@ -183,9 +189,72 @@ void XC7Packer::pack_carries_atomic()
                 // the unroutable holdouts in congested slots.  (VCC DIs still fall
                 // through to the feed-through/AX path below -- omitting would give 0,
                 // not 1.)
-                if (c4_di != nullptr && c4_di->name == ctx->id("$PACKER_GND_NET")) {
+                // FIX (DI-delivery): an unrouted carry-DI bypass does NOT default
+                // to 0 -- it defaults to VCC (the BYP mux VCC fallback), so omitting a
+                // GND DI silently delivers 1 and corrupts the carry (counters oscillate).
+                // Vivado drives these to 0 explicitly (GFAN).  Keep the GND DI connected
+                // so the di_feed path below buffers it to a const-0 (O5=0 -> DI=O5=0).
+                // The legacy omit (which relied on the false 0-default) is available via
+                // NEXTPNR_CARRY_OMIT_GND_DI for the old behaviour.
+                if (getenv("NEXTPNR_CARRY_OMIT_GND_DI") &&
+                    c4_di != nullptr && c4_di->name == ctx->id("$PACKER_GND_NET")) {
                     disconnect_port(ctx, prev, ctx->id("DI[" + zs + "]"));
                     c4_di = nullptr;
+                }
+
+                // ---- Counter "+1" re-encode (robust replacement for the I5
+                // trick) ----
+                // yosys encodes a counter's bottom +1 as CYINIT=0, DI[0]=VCC,
+                // S[0]=~cnt[0] (an inverter).  Delivering DI[0]=1 needs O5=1 in
+                // the A5LUT, but that O5 SHARES INIT bits with the co-located
+                // S[0] inverter's O6 (forcing O5=1 corrupts S[0]); the AX/VCC
+                // route hits the const-network's CARRY4-DI delivery weakness;
+                // and pinning the inverter onto physical A6 (the literal I5
+                // trick) fights nextpnr's LUT-input permuter.  Use the
+                // ALGEBRAICALLY IDENTICAL encoding CYINIT=1, S[0]=cnt[0],
+                // DI[0]=0:  O[0]=cnt[0]^1=~cnt[0] and CI[1]=cnt[0]?1:0=cnt[0].
+                // CYINIT=1 is the PRECYINIT.C1 config bit (no routing), DI[0]=0
+                // ties internally, and S[0]=cnt[0] becomes a plain routethru
+                // like S[1..3] -- no O5/O6 sharing, no constant delivery.
+                if (getenv("NEXTPNR_CARRY_COUNTER_FIX") &&
+                    z == 0 && prev == root && c4_di != nullptr &&
+                    c4_di->name == ctx->id("$PACKER_VCC_NET") && c4_s != nullptr) {
+                    NetInfo *cyi = get_net_or_empty(prev, ctx->id("CYINIT"));
+                    NetInfo *cin = get_net_or_empty(prev, ctx->id("CI"));
+                    bool cyinit_zero = (cyi == nullptr || cyi->name == ctx->id("$PACKER_GND_NET"));
+                    bool cin_zero    = (cin == nullptr || cin->name == ctx->id("$PACKER_GND_NET"));
+                    CellInfo *inv = c4_s->driver.cell;
+                    IdString inv_in_port;
+                    bool is_inv = false;
+                    if (inv != nullptr) {
+                        if (inv->type == ctx->id("INV")) {
+                            is_inv = true; inv_in_port = ctx->id("I");
+                        } else if (inv->type == ctx->id("LUT1")) {
+                            // LUT1 inverter O=~I0 has INIT="01" = value 1
+                            // (INIT param is stored as bits, not a string).
+                            if (int_or_default(inv->params, ctx->id("INIT"), -1) == 1) {
+                                is_inv = true; inv_in_port = ctx->id("I0");
+                            }
+                        }
+                    }
+                    NetInfo *inv_in = is_inv ? get_net_or_empty(inv, inv_in_port) : nullptr;
+                    bool sole = is_inv && c4_s->users.size() == 1;
+                    if (is_inv && sole && inv_in != nullptr && cyinit_zero && cin_zero) {
+                        // S[0] <- cnt[0] (bypass the inverter)
+                        disconnect_port(ctx, prev, ctx->id("S[0]"));
+                        connect_port(ctx, inv_in, prev, ctx->id("S[0]"));
+                        // DI[0] <- 0 (omit; tied internally)
+                        disconnect_port(ctx, prev, ctx->id("DI[0]"));
+                        c4_di = nullptr;
+                        // CYINIT <- 1 -> the PRECYINIT pass below emits PRECYINIT.C1
+                        disconnect_port(ctx, prev, ctx->id("CYINIT"));
+                        connect_port(ctx, ctx->nets.at(ctx->id("$PACKER_VCC_NET")).get(),
+                                     prev, ctx->id("CYINIT"));
+                        c4_s = get_net_or_empty(prev, ctx->id("S[0]"));
+                        if (getenv("DBG_CARRYFF"))
+                            log_info("CARRY +1 re-encode %s: CYINIT=1, DI[0]=0, S[0]<-%s\n",
+                                     ctx->nameOf(prev), ctx->nameOf(inv_in));
+                    }
                 }
                 // A constant-driven CARRY4 DI must NOT be left on $PACKER_GND_NET: the
                 // global pseudo-constant router does not negotiate congestion, so the
@@ -329,8 +398,11 @@ void XC7Packer::pack_carries_atomic()
                     pr.port = ctx->id("DI[" + zs + "]");
                     auto di_feed = feed_through_lut(c4_di, {pr});
                     di_lut = di_feed.get();
-                    if (ctx->debug)
-                        log_info("feedthru %s for %s.DI[%s]\n", ctx->nameOf(di_lut), ctx->nameOf(prev), zs.c_str());
+                    if (ctx->debug || getenv("DBG_DIFEED"))
+                        log_info("DIFEED %s for %s.DI[%s] di_net=%s prevBEL=%s\n", ctx->nameOf(di_lut),
+                                 ctx->nameOf(prev), zs.c_str(), ctx->nameOf(c4_di),
+                                 prev->attrs.count(ctx->id("BEL")) ?
+                                   prev->attrs.at(ctx->id("BEL")).as_string().c_str() : "NONE");
                     new_cells.push_back(std::move(di_feed));
                 }
                 // Cells with absolute BEL pins (imported Vivado placement)
@@ -369,6 +441,58 @@ void XC7Packer::pack_carries_atomic()
                     di_lut->constr_y = anchor_y;
                     di_lut->constr_abs_z = true;
                     di_lut->constr_z = (z << 4 | BEL_5LUT);
+                }
+
+                // Co-locate the sum FF into this carry slice (Vivado's pattern
+                // for registered adders/counters: O[i] -> FFMUX.XOR -> the
+                // AFF/BFF/CFF/DFF in the carry's OWN slice).  Without this,
+                // nextpnr places the sum FF in a foreign slice and exports the
+                // sum via xOUTMUX -> fabric -> bypass-X, which on V7 leaves the
+                // carry DI/sum mis-delivered and the counter non-functional
+                // (the sum never returns to drive S correctly).  Constrain the
+                // single FF whose D is driven by this O[z] with the SAME anchor
+                // / abs-z pattern as the S/DI LUTs above -> BEL_FF of lane z.
+                // (Constraint is set on the FDRE here; pack_ffs xforms it in
+                // place to SLICE_FFX preserving constr_*, and pack_lutffs skips
+                // already-constrained FFs.)
+                NetInfo *c4_o = get_net_or_empty(prev, ctx->id("O[" + zs + "]"));
+                if (getenv("NEXTPNR_CARRY_COUNTER_FIX") && c4_o != nullptr) {
+                    CellInfo *sum_ff = nullptr;
+                    bool ambiguous = false;
+                    for (auto &u : c4_o->users) {
+                        if (u.port != ctx->id("D"))
+                            continue;
+                        if (!ff_types.count(u.cell->type))
+                            continue;
+                        if (sum_ff != nullptr && sum_ff != u.cell) {
+                            ambiguous = true;
+                            break;
+                        }
+                        sum_ff = u.cell;
+                    }
+                    // Only adopt a plain, un-pinned, un-constrained FF whose D
+                    // is THIS O[z] (single FF sink).  Leave anything exotic
+                    // (multiple FF sinks, pinned, already clustered) to the
+                    // generic packer.
+                    if (sum_ff != nullptr && !ambiguous &&
+                        !sum_ff->attrs.count(ctx->id("BEL")) &&
+                        sum_ff->constr_parent == nullptr &&
+                        sum_ff->constr_children.empty()) {
+                        anchor->constr_children.push_back(sum_ff);
+                        sum_ff->constr_parent = anchor;
+                        sum_ff->constr_x = 0;
+                        sum_ff->constr_y = anchor_y;
+                        sum_ff->constr_abs_z = true;
+                        sum_ff->constr_z = (z << 4 | BEL_FF);
+                        if (getenv("DBG_CARRYFF"))
+                            log_info("CARRYFF %s -> %s.O[%d] @ lane %d (z<<4|FF)\n",
+                                     ctx->nameOf(sum_ff), ctx->nameOf(prev), z, z);
+                    } else if (getenv("DBG_CARRYFF") && sum_ff != nullptr) {
+                        log_info("CARRYFF SKIP %s for %s.O[%d] amb=%d pinned=%d constr=%d\n",
+                                 ctx->nameOf(sum_ff), ctx->nameOf(prev), z, ambiguous,
+                                 (int)sum_ff->attrs.count(ctx->id("BEL")),
+                                 (int)(sum_ff->constr_parent != nullptr));
+                    }
                 }
             }
 

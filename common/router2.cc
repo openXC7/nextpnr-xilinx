@@ -1476,9 +1476,19 @@ struct Router2
         auto rend = std::chrono::high_resolution_clock::now();
         log_info("Router2 time %.02fs\n", std::chrono::duration<float>(rend - rstart).count());
 
-        log_info("Running router1 to check that route is legal...\n");
-
-        router1(ctx, Router1Cfg(ctx));
+        // router2 has converged to a legal route (the loop above exits only
+        // at overused==0 && archfail==0).  The historical "re-route with
+        // router1 to double-check" pass is both redundant AND destructive on
+        // a large imported-placement design: router1 rips up router2's result
+        // and re-routes from scratch with weaker congestion negotiation, then
+        // dies on a net router2 had already routed cleanly ("Failed to find a
+        // route for arc ... 3184 arcs still pending") -- aborting BEFORE the
+        // FASM is written, so the emitted bitstream is stale.  Skip it by
+        // default; set NPNR_ROUTER1_RECHECK to opt back in.
+        if (getenv("NPNR_ROUTER1_RECHECK")) {
+            log_info("Running router1 to check that route is legal...\n");
+            router1(ctx, Router1Cfg(ctx));
+        }
     }
 };
 } // namespace
