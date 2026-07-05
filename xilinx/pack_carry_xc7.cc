@@ -369,9 +369,23 @@ void XC7Packer::pack_carries_atomic()
                 int di_feed_inputs = int(unique_lut_inputs.size());
                 if (c4_di && !unique_lut_inputs.count(c4_di->name))
                     di_feed_inputs++;
-                bool di_feed_fits = (s_lut != nullptr) && di_feed_inputs <= 5;
-                if (prev->attrs.count(ctx->id("BEL")) && !di_lut &&
-                    (is_const(c4_di) || di_remote) &&
+                // A full 6-input S-LUT (I5 connected) occupies all of A1..A6, so
+                // the paired 5LUT has no free pin for a feed-through's input --
+                // the unique-input count (loop above only tallies I0..I4) can
+                // undercount and call it a fit, but golden delivers such a DI via
+                // AX, not O5.  Treat a 6-input S-LUT as "won't fit".
+                bool s_lut_full6 = s_lut != nullptr &&
+                                   get_net_or_empty(s_lut, ctx->id("I5")) != nullptr;
+                bool di_feed_fits = (s_lut != nullptr) && di_feed_inputs <= 5 && !s_lut_full6;
+                // When no O5 feed-through can fit (!di_feed_fits: the slot has a
+                // full 6-input S-LUT, a thin LUT1 S-routethru, or no S-LUT to
+                // anchor it), an O5->DI path is physically impossible -- forcing
+                // one spills the feed-through's input onto the nonexistent 5LUT
+                // A6 pin ("No wire found for port A6", e.g. the SGMII elastic-
+                // buffer wr_occupancy carries).  Route such a DI via the AX
+                // bypass too, not just constant/remote DIs.
+                if (prev->attrs.count(ctx->id("BEL")) && !di_lut && c4_di &&
+                    (is_const(c4_di) || di_remote || !di_feed_fits) &&
                     !(z == 0 && dyn_cyinit) &&
                     !(di_remote_real && di_feed_fits)) {
                     // Imported (BEL-pinned) placement with a CONSTANT DI

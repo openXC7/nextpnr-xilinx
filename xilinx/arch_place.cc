@@ -353,11 +353,22 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
                         return false;
                     }
                     bool srl_pair = lut6->lutInfo.is_srl && lut5->lutInfo.is_srl;
+                    // Imported (Vivado/golden) CARRY4 slot: a full 6-input
+                    // operand LUT (O6->S) coexisting with a DI feed-through LUT
+                    // (O5->DI, only_drives_carry) is physically legal on silicon
+                    // -- golden uses it and runs.  Trust a BEL-pinned (imported)
+                    // 6LUT whose companion 5LUT only drives the carry, for BOTH
+                    // the all-inputs/two-outputs check here and the shared-inputs
+                    // check below (the operand often uses all 6 inputs, so the
+                    // input_count==6 arm fires first and must honour the same
+                    // exemption).
+                    bool imported_carry_feedthrough =
+                            lut6->attrs.count(id_BEL) && lut5->lutInfo.only_drives_carry;
                     // If all 6 inputs or 2 outputs are used, 5LUT can't also be
                     // present.  SRL16E pairs are exempt: their address pins are
                     // constant-tied and shared by construction (Vivado packs
                     // two SRL16Es per slot routinely).
-                    if (!srl_pair &&
+                    if (!srl_pair && !imported_carry_feedthrough &&
                         (lut6->lutInfo.input_count == 6 || lut6->lutInfo.output_count == 2)) {
                         DBG();
                         return false;
@@ -563,7 +574,15 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
                     mux_output_used = true;
                 }
             }
-            if (carry4 != nullptr && carry4->carryInfo.cout_sigs[i % 4] != nullptr) {
+            // This CO-fabric vs output-mux contention check stops nextpnr's own
+            // placer from co-locating a CARRY4 CO and a 5FF into an unroutable
+            // slot.  A *stamped* vendor placement (hybrid R0 flow: Vivado places,
+            // nextpnr only routes) can legally co-locate them via muxing nextpnr
+            // doesn't model, so let that flow opt out -- a wrong guess fails
+            // loudly in the router, it can't produce a silently-bad bitstream.
+            static const bool allow_co_5ff_contention =
+                    getenv("NEXTPNR_ALLOW_CO_5FF_CONTENTION") != nullptr;
+            if (!allow_co_5ff_contention && carry4 != nullptr && carry4->carryInfo.cout_sigs[i % 4] != nullptr) {
                 NetInfo *co = carry4->carryInfo.cout_sigs[i % 4];
                 bool co_uses_mux = false;
                 if ((i % 4) == 3) {
