@@ -410,6 +410,49 @@ void Arch::setup_pip_blacklist()
                     blacklist_pips[td.type].insert(j);
             }
         }
+        // EXPERIMENT (NEXTPNR_PIP_BLACKLIST=<file>): forbid an explicit list
+        // of pip types, one "TILETYPE.DST.SRC" per line -- the generic knob
+        // for bisecting suspected-misencoded pips against hardware.
+        if (const char *blf = getenv("NEXTPNR_PIP_BLACKLIST")) {
+            static std::set<std::string> bl;
+            static bool loaded = false;
+            if (!loaded) {
+                std::ifstream f(blf);
+                std::string ln;
+                while (std::getline(f, ln))
+                    if (!ln.empty()) bl.insert(ln);
+                loaded = true;
+                log_info("pip blacklist: %d entries from %s\n", (int)bl.size(), blf);
+            }
+            for (int j = 0; j < td.num_pips; j++) {
+                auto &pd = td.pip_data[j];
+                std::string key = type + "." +
+                    IdString(td.wire_data[pd.dst_index].name).str(this) + "." +
+                    IdString(td.wire_data[pd.src_index].name).str(this);
+                if (bl.count(key))
+                    blacklist_pips[td.type].insert(j);
+            }
+        }
+        // EXPERIMENT (NEXTPNR_NO_LONGLINES=1): avoid the LV/LH/LVB long
+        // lines entirely.  They are non-directional pips whose reverse-
+        // orientation segbits were never validated by a working Vivado
+        // design (golden ibex/ethsoc drive long lines forward only) --
+        // prime suspect for mis-encoded bits that break open-flow nets on
+        // silicon while passing every DB-space audit.
+        if (getenv("NEXTPNR_NO_LONGLINES") &&
+            (boost::starts_with(type, "INT_L") || boost::starts_with(type, "INT_R"))) {
+            for (int j = 0; j < td.num_pips; j++) {
+                auto &pd = td.pip_data[j];
+                std::string dn = IdString(td.wire_data[pd.dst_index].name).str(this);
+                std::string sn = IdString(td.wire_data[pd.src_index].name).str(this);
+                auto is_ll = [](const std::string &w) {
+                    return boost::starts_with(w, "LV") || boost::starts_with(w, "LH") ||
+                           boost::starts_with(w, "LVB");
+                };
+                if (is_ll(dn) || is_ll(sn))
+                    blacklist_pips[td.type].insert(j);
+            }
+        }
         // PHASER/DQS plumbing: present in the chipdb graph but prjxray has
         // no bits for any of it -- the router used INT_DQS_IOTOPHASER as a
         // shortcut onto CMT CLK_IN wires and the clock died unprogrammed
