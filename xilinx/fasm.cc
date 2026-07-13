@@ -678,9 +678,17 @@ struct FasmBackend
                     continue;
                 push(get_bel_name(ff->bel));
                 bool zrst = false, zinit = false;
-                zinit = (int_or_default(ff->params, ctx->id("INIT"), 0) != 1);
                 IdString srsig;
                 std::string type = str_or_default(ff->attrs, ctx->id("X_ORIG_TYPE"), "");
+                // Vivado write_verilog omits parameters at their primitive
+                // default, so a bare FDSE/FDPE arrives with NO INIT param --
+                // and their primitive default is INIT=1 (FDRE/FDCE default 0).
+                // A hardcoded 0 default set ZINI (init=0) on every set/preset
+                // FF, breaking reset synchronizers and INIT=1 startup FSMs
+                // (PCS/PMA gmii_rst_sync, GT TX startup) at configuration.
+                int def_init = (type == "FDSE" || type == "FDSE_1" ||
+                                type == "FDPE" || type == "FDPE_1") ? 1 : 0;
+                zinit = (int_or_default(ff->params, ctx->id("INIT"), def_init) != 1);
                 if (type == "FDRE") {
                     zrst = true;
                     SET_CHECK(negedge_ff, false);

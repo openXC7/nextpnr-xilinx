@@ -1392,12 +1392,24 @@ struct Arch : BaseCtx
                 src_intent == ID_NODE_GLOBAL_VROUTE || src_intent == ID_NODE_GLOBAL_HDISTR ||
                 src_intent == ID_NODE_GLOBAL_LEAF || src_intent == ID_NODE_GLOBAL_BUFG) {
 
+                // Global clock-network per-hop delays, CALIBRATED to the golden
+                // Vivado write_sdf on the VC707 ethloop design (see
+                // ethsoc/openflow/opentimer/globalchar.{py,json}).  The BUFG->sink
+                // insertion delay of the 994-fanout userclk2/eth_clk global net is
+                // 2.05 ns median (tight, p95 2.09 -- low skew).  A BUFG->leaf path
+                // = a few dedicated spine hops (global->global, shared low-R clock
+                // metal) + exactly ONE leaf tap (global->local) into the sink's
+                // fabric tile, and that once-per-path tap carries the bulk of the
+                // insertion delay.  Loading the exit (fires once/sink) makes the
+                // total robust to the spine hop-count the SDF can't resolve.
+                // Old flat values were 100/250 ps -> ~650 ps total, 3x under Vivado.
+                const delay_t GLOBAL_SPINE_HOP = 70;   // global->global dedicated spine
+                const delay_t GLOBAL_EXIT_HOP = 1697;  // global->local/long leaf tap
                 if (dst_intent == ID_NODE_LOCAL || dst_intent == ID_NODE_HLONG || dst_intent == ID_NODE_VLONG ||
                     dst_intent == ID_NODE_VQUAD || dst_intent == ID_NODE_HQUAD) {
-                    // Assign a high penalty from global to local
-                    delay.delay = 250;
+                    delay.delay = GLOBAL_EXIT_HOP;
                 } else {
-                    delay.delay = 100;
+                    delay.delay = GLOBAL_SPINE_HOP;
                 }
             } else if (dst_intent == ID_NODE_LAGUNA_DATA) {
                 delay.delay = 5000;
@@ -1547,6 +1559,7 @@ struct Arch : BaseCtx
 
     // Return true whether all Bels at a given location are valid
     bool isBelLocationValid(BelId bel) const;
+    void dumpTileStatus(BelId bel) const;
 
     bool xcu_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const;
     bool xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const;
@@ -1634,6 +1647,8 @@ struct Arch : BaseCtx
 
     void routeVcc();
     void routeClock();
+    void applyFixedRoutes(const std::string &filename);
+    void writeFixedRoutes(const std::string &filename) const;
     bool gtClockTemplateRoute(NetInfo *clk_net, PortRef &usr);
     void findSourceSinkLocations();
     std::unordered_map<WireId, Loc> sink_locs, source_locs;

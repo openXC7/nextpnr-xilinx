@@ -469,8 +469,14 @@ void XC7Packer::pack_carries_atomic()
                 // (Constraint is set on the FDRE here; pack_ffs xforms it in
                 // place to SLICE_FFX preserving constr_*, and pack_lutffs skips
                 // already-constrained FFs.)
+                // Sum-FF co-location is DEFAULT-ON: it is a no-op for imported
+                // (BEL-pinned) placements -- the guard below only adopts a plain,
+                // un-pinned, un-constrained, single-O[z]-sink FF -- so it never
+                // perturbs the stamped flows, and it is exactly what fresh-synth
+                // registered counters/adders need (sum returns intra-slice to
+                // drive S).  Opt out with NEXTPNR_NO_CARRY_COUNTER_FIX.
                 NetInfo *c4_o = get_net_or_empty(prev, ctx->id("O[" + zs + "]"));
-                if (getenv("NEXTPNR_CARRY_COUNTER_FIX") && c4_o != nullptr) {
+                if (!getenv("NEXTPNR_NO_CARRY_COUNTER_FIX") && c4_o != nullptr) {
                     CellInfo *sum_ff = nullptr;
                     bool ambiguous = false;
                     for (auto &u : c4_o->users) {
@@ -628,7 +634,16 @@ void XC7Packer::pack_carries_atomic()
             bool cin_chain    = cin    != nullptr && cin->name    != gnd && cin->name != vcc;
             bool cin_const    = cin    != nullptr && (cin->name    == gnd || cin->name == vcc);
             bool cyinit_const = cyinit != nullptr && (cyinit->name == gnd || cyinit->name == vcc);
-            if (!cin_chain && (cyinit_const || cin_const)) {
+            bool cyinit_dyn   = cyinit != nullptr && cyinit->name != gnd && cyinit->name != vcc;
+            // A Vivado chain root often has BOTH CIN=GND and CYINIT=<real net>
+            // (the PRECYINIT mux selects the AX-routed CYINIT; the GND CIN is
+            // vestigial).  Treating that GND CIN as a "constant carry-in" here
+            // stamped PRECYINIT_CONST=0, which fasm.cc prioritises over the
+            // dynamic-CYINIT AX path -> silicon carry-in tied to 0 -> every
+            // Vivado down-counter / borrow-comparator chain dead (uart baud
+            // counters, busy-polls, branch compares...).  Only realize a
+            // constant when there is NO dynamic CYINIT.
+            if (!cin_chain && !cyinit_dyn && (cyinit_const || cin_const)) {
                 NetInfo *konst = cyinit_const ? cyinit : cin;
                 int val = (konst->name == vcc) ? 1 : 0;
                 ci->params[ctx->id("PRECYINIT_CONST")] = Property(val, 1);

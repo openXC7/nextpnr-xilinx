@@ -517,6 +517,11 @@ void XilinxPacker::pack_srls()
     srl_rules[ctx->id("SRLC32E")].port_xform[ctx->id("CE")] = id_WE;
     srl_rules[ctx->id("SRLC32E")].port_xform[ctx->id("D")] = id_DI1;
     srl_rules[ctx->id("SRLC32E")].port_xform[ctx->id("Q")] = id_O6;
+    // Cascade shiftout: SRLC32E.Q31 is the dedicated MC31 output that feeds the
+    // next SRL's DI mux (?DI1MUX <- ?MC31).  Map it to the MC31 port so the
+    // cascade routes through the dedicated path (kept as .Q31 by patch_netlist)
+    // rather than being dropped ("FIXME: Q31 support").
+    srl_rules[ctx->id("SRLC32E")].port_xform[ctx->id("Q31")] = id_MC31;
     srl_rules[ctx->id("SRLC32E")].set_attrs.emplace_back(ctx->id("X_LUT_AS_SRL"), "1");
     // FIXME: Q31 support
     generic_xform(srl_rules, true);
@@ -1089,6 +1094,54 @@ bool Arch::pack()
         packer.pack_lutffs();
     }
 
+    // Confine FRESH (unstamped) fabric logic to a compact region hugging the
+    // frozen macro.  Without this the SA placer scatters the sparse fresh cells
+    // (arp_ctrl + reset/clock glue) across the WHOLE die -- e.g. a 6-bit reset
+    // counter split X8..X210 / Y132..Y327 -- so cpu_clk combinational paths span
+    // the chip, fmax fails, the reset counter never settles and the design is
+    // stuck in reset (phy_reset held -> board dark).  NEXTPNR_FRESH_REGION_MARGIN
+    // = N expands the stamped-cell bbox by N tiles and pins every unstamped
+    // SLICE/CARRY cell inside it (IO/clock/GT stay free -- they must reach pads).
+    if (const char *mg = getenv("NEXTPNR_FRESH_REGION_MARGIN")) {
+        int margin = atoi(mg);
+        int x0 = 1 << 30, y0 = 1 << 30, x1 = -1, y1 = -1;
+        for (auto &cell : cells) {
+            CellInfo *ci = cell.second.get();
+            auto it = ci->attrs.find(id("BEL"));
+            if (it == ci->attrs.end())
+                continue; // fresh cell: not part of the stamped-macro bbox
+            std::string t = ci->type.str(this);
+            if (t.substr(0, 6) != "SLICE_" && t != "CARRY4")
+                continue;
+            BelId b = getBelByName(id(it->second.as_string()));
+            if (b == BelId())
+                continue;
+            Loc l = getBelLocation(b);
+            x0 = std::min(x0, l.x); x1 = std::max(x1, l.x);
+            y0 = std::min(y0, l.y); y1 = std::max(y1, l.y);
+        }
+        if (x1 >= 0) {
+            x0 = std::max(0, x0 - margin);           y0 = std::max(0, y0 - margin);
+            x1 = std::min(getGridDimX() - 1, x1 + margin);
+            y1 = std::min(getGridDimY() - 1, y1 + margin);
+            IdString rname = id("fresh_region");
+            createRectangularRegion(rname, x0, y0, x1, y1);
+            int n = 0;
+            for (auto &cell : cells) {
+                CellInfo *ci = cell.second.get();
+                if (ci->attrs.count(id("BEL")))
+                    continue; // stamped/frozen: leave where it is
+                std::string t = ci->type.str(this);
+                if (t.substr(0, 6) != "SLICE_" && t != "CARRY4")
+                    continue; // only fabric logic; IO/clock/GT reach pads freely
+                ci->region = region.at(rname).get();
+                ++n;
+            }
+            log_info("NEXTPNR_FRESH_REGION_MARGIN=%d: fresh region (%d,%d)-(%d,%d), "
+                     "constrained %d fresh cells\n", margin, x0, y0, x1, y1, n);
+        }
+    }
+
     assignArchInfo();
     attrs[id("step")] = std::string("pack");
     archInfoToAttributes();
@@ -1098,6 +1151,12 @@ bool Arch::pack()
 void Arch::assignCellInfo(CellInfo *cell)
 {
     if (cell->type == id_SLICE_LUTX) {
+        // input_count = number of connected input PORTS (NOT distinct nets):
+        // physical pin usage decides bel legality -- a LUT6 with I5 connected
+        // drives A6 and needs a 6LUT bel even if I5 duplicates another net.
+        // (The imported-6LUT+5LUT shared-input case that once motivated a
+        // distinct-net count is now handled by the fully-frozen-tile fast
+        // path in xc7_logic_tile_valid, so no dedup is needed here.)
         cell->lutInfo.input_count = 0;
         for (IdString a : {id_A1, id_A2, id_A3, id_A4, id_A5, id_A6}) {
             NetInfo *pn = get_net_or_empty(cell, a);

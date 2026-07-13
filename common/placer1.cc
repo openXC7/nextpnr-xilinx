@@ -196,6 +196,7 @@ class SAPlacer
             }
             int constr_placed_cells = placed_cells;
             log_info("Placed %d cells based on constraints.\n", int(placed_cells));
+            setup_exclusion_bbox();
             ctx->yield();
 
             // Bind packer-created chain children of BEL-pinned roots before
@@ -476,6 +477,9 @@ class SAPlacer
         log_info("SA placement time %.02fs\n", std::chrono::duration<float>(saplace_end - saplace_start).count());
 
         // Final post-pacement validitiy check
+        extern bool dbg_validity_runtime;
+        if (getenv("NEXTPNR_DUMP_INVALID_TILE") != nullptr)
+            dbg_validity_runtime = true;
         ctx->yield();
         for (auto bel : ctx->getBels()) {
             CellInfo *cell = ctx->getBoundBelCell(bel);
@@ -483,6 +487,17 @@ class SAPlacer
                 std::string cell_text = "no cell";
                 if (cell != nullptr)
                     cell_text = std::string("cell '") + ctx->nameOf(cell) + "'";
+                if (getenv("NEXTPNR_DUMP_INVALID_TILE") != nullptr) {
+                    Loc l = ctx->getBelLocation(bel);
+                    for (auto tb : ctx->getBelsByTile(l.x, l.y)) {
+                        CellInfo *tc = ctx->getBoundBelCell(tb);
+                        if (tc != nullptr)
+                            log_info("  tile occupant: %s = %s (%s)%s\n", ctx->getBelName(tb).c_str(ctx),
+                                     ctx->nameOf(tc), tc->type.c_str(ctx),
+                                     tc->attrs.count(ctx->id("BEL")) ? " [stamped]" : "");
+                    }
+                    ctx->dumpTileStatus(bel);
+                }
                 if (ctx->force) {
                     log_warning("post-placement validity check failed for Bel '%s' "
                                 "(%s)\n",
@@ -744,12 +759,13 @@ class SAPlacer
                 add_move_cell(moveChange, bound, db.second);
         }
         for (const auto &mm : moves_made) {
-            if (!ctx->isBelLocationValid(mm.first->bel) || !check_cell_bel_region(mm.first, mm.first->bel))
+            if (!ctx->isBelLocationValid(mm.first->bel) || !check_cell_bel_region(mm.first, mm.first->bel) ||
+                bel_excluded(mm.first, mm.first->bel))
                 goto swap_fail;
             if (!ctx->isBelLocationValid(mm.second))
                 goto swap_fail;
             CellInfo *bound = ctx->getBoundBelCell(mm.second);
-            if (bound && !check_cell_bel_region(bound, bound->bel))
+            if (bound && (!check_cell_bel_region(bound, bound->bel) || bel_excluded(bound, bound->bel)))
                 goto swap_fail;
         }
         compute_cost_changes(moveChange);
@@ -780,6 +796,47 @@ class SAPlacer
 
     // Find a random Bel of the correct type for a cell, within the specified
     // diameter
+    // Exclusion bbox (NEXTPNR_EXCLUDE_STAMPED_BBOX=1): unstamped cells stay
+    // out of the bounding box of pre-placed (BEL-attr) fabric cells -- i.e.
+    // the frozen macro's region, whose routing is LOCKED so densely that
+    // arcs into it are unroutable for foreign logic.
+    int excl_x0 = -1, excl_y0 = -1, excl_x1 = -1, excl_y1 = -1;
+    void setup_exclusion_bbox()
+    {
+        if (getenv("NEXTPNR_EXCLUDE_STAMPED_BBOX") == nullptr)
+            return;
+        for (auto &cell : ctx->cells) {
+            CellInfo *ci = cell.second.get();
+            if (ci->bel == BelId() || !ci->attrs.count(ctx->id("BEL")))
+                continue;
+            std::string t = ci->type.str(ctx);
+            if (t.substr(0, 6) != "SLICE_" && t.substr(0, 4) != "RAMD" && t != "CARRY4")
+                continue;
+            Loc l = ctx->getBelLocation(ci->bel);
+            if (excl_x0 < 0) {
+                excl_x0 = excl_x1 = l.x;
+                excl_y0 = excl_y1 = l.y;
+            } else {
+                excl_x0 = std::min(excl_x0, l.x);
+                excl_x1 = std::max(excl_x1, l.x);
+                excl_y0 = std::min(excl_y0, l.y);
+                excl_y1 = std::max(excl_y1, l.y);
+            }
+        }
+        if (excl_x0 >= 0)
+            log_info("Excluding unstamped cells from stamped bbox (%d,%d)-(%d,%d)\n", excl_x0, excl_y0, excl_x1,
+                     excl_y1);
+    }
+    bool bel_excluded(const CellInfo *cell, BelId bel) const
+    {
+        if (excl_x0 < 0 || bel == BelId())
+            return false;
+        if (cell->attrs.count(ctx->id("BEL")))
+            return false; // stamped cells belong there
+        Loc l = ctx->getBelLocation(bel);
+        return l.x >= excl_x0 && l.x <= excl_x1 && l.y >= excl_y0 && l.y <= excl_y1;
+    }
+
     BelId random_bel_for_cell(CellInfo *cell, int force_z = -1)
     {
         IdString targetType = cell->type;
@@ -820,6 +877,8 @@ class SAPlacer
                     continue;
             }
             if (!check_cell_bel_region(cell, bel))
+                continue;
+            if (bel_excluded(cell, bel))
                 continue;
             if (locked_bels.find(bel) != locked_bels.end())
                 continue;

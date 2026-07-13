@@ -216,8 +216,15 @@ struct Router2
             NetInfo *bound = ctx->getBoundWireNet(wire);
             if (bound != nullptr) {
                 pwd.bound_nets[bound->udata] = std::make_pair(1, bound->wires.at(wire).pip);
-                if (bound->wires.at(wire).strength > STRENGTH_STRONG)
-                    pwd.unavailable = true;
+                if (bound->wires.at(wire).strength > STRENGTH_STRONG) {
+                    // Hard-macro contract: a LOCKED wire (frozen macro routing
+                    // or clock spine) is RESERVED to its own net -- a keepout
+                    // for every other net, but still available to its owner so
+                    // router2 can complete that net's last-mile (site-pin hops
+                    // Vivado's PIP list omits) itself, deterministically, using
+                    // a real maze route instead of an external BFS guess.
+                    pwd.reserved_net = bound->udata;
+                }
             }
 
             ArcBounds wire_loc = ctx->getRouteBoundingBox(wire, wire);
@@ -310,6 +317,15 @@ struct Router2
     void bind_pip_internal(NetInfo *net, size_t user, int wire, PipId pip)
     {
         auto &b = flat_wires.at(wire).bound_nets[net->udata];
+        if (b.first >= 1 && b.second != pip) {
+            // Frozen-macro / reserved-net contract: this wire already carries
+            // this net via its LOCKED driver pip (bound by applyFixedRoutes),
+            // and router2's last-mile maze re-approached it from the sink side
+            // with a different pip.  A wire has exactly one driver, so the
+            // pre-existing LOCKED pip is authoritative -- keep it and do NOT
+            // add a conflicting second driver (the historic NPNR_ASSERT).
+            return;
+        }
         ++b.first;
         if (b.first == 1) {
             b.second = pip;
@@ -438,12 +454,18 @@ struct Router2
         WireId sink = ctx->getNetinfoSinkWire(net, net->users.at(i));
         if (sink == WireId())
             return false;
+        // an arc already completed by locked routing (fixed-routes) needs no
+        // reservation -- and walking its locked corridor here can oscillate
+        // reserved_net against other locked nets, hanging the outer fixpoint
+        if (ctx->getBoundWireNet(sink) == net)
+            return false;
         pool<WireId> rsv;
         WireId cursor = sink;
         bool done = false;
+        int hops = 0;
         if (ctx->debug)
             log("reserving wires for arc %d of net %s\n", int(i), ctx->nameOf(net));
-        while (!done) {
+        while (!done && hops++ < 100) {
             auto &wd = wire_data(cursor);
             if (ctx->debug)
                 log("      %s\n", ctx->nameOfWire(cursor));
@@ -471,8 +493,12 @@ struct Router2
 
     void find_all_reserved_wires()
     {
-        // Run iteratively, as reserving wires for one net might limit choices for another
+        // Run iteratively, as reserving wires for one net might limit choices
+        // for another.  Cap the fixpoint: overlapping single-path corridors
+        // (dense LOCKED routing) can flip reserved_net between two nets
+        // forever otherwise.
         bool did_something = false;
+        int iters = 0;
         do {
             did_something = false;
             for (auto net : nets_by_udata) {
@@ -482,7 +508,7 @@ struct Router2
                 for (size_t i = 0; i < net->users.size(); i++)
                     did_something |= reserve_wires_for_arc(net, i);
             }
-        } while (did_something);
+        } while (did_something && ++iters < 5);
     }
 
     void reset_wires(ThreadContext &t)
@@ -959,10 +985,22 @@ struct Router2
                                   int(i), ctx->nameOf(net));
                     auto res2 = route_arc(t, net, i, is_mt, false);
                     // If this also fails, no choice but to give up
-                    if (res2 != ARC_SUCCESS)
-                        log_error("Failed to route arc %d of net '%s', from %s to %s.\n", int(i), ctx->nameOf(net),
-                                  ctx->nameOfWire(ctx->getNetinfoSourceWire(net)),
-                                  ctx->nameOfWire(ctx->getNetinfoSinkWire(net, net->users.at(i))));
+                    if (res2 != ARC_SUCCESS) {
+                        // NEXTPNR_SKIP_FAILED_ARCS: for DEBUG/visualisation only --
+                        // leave this arc unrouted and keep going, so we can --write a
+                        // partially-routed json and import it into Vivado (json2dcp)
+                        // to inspect the congestion instead of aborting the run.
+                        if (getenv("NEXTPNR_SKIP_FAILED_ARCS")) {
+                            log_warning("SKIP_FAILED_ARCS: failed to route arc %d of net '%s' (%s -> %s); leaving "
+                                        "unrouted.\n",
+                                        int(i), ctx->nameOf(net), ctx->nameOfWire(ctx->getNetinfoSourceWire(net)),
+                                        ctx->nameOfWire(ctx->getNetinfoSinkWire(net, net->users.at(i))));
+                            have_failures = true;
+                        } else
+                            log_error("Failed to route arc %d of net '%s', from %s to %s.\n", int(i),
+                                      ctx->nameOf(net), ctx->nameOfWire(ctx->getNetinfoSourceWire(net)),
+                                      ctx->nameOfWire(ctx->getNetinfoSinkWire(net, net->users.at(i))));
+                    }
                 }
             }
         }
@@ -1453,6 +1491,14 @@ struct Router2
                              int(wire.bound_nets.size()));
                     for (auto &bound : wire.bound_nets)
                         log_info("    net %s\n", nets_by_udata.at(bound.first)->name.c_str(ctx));
+                }
+                // NEXTPNR_SKIP_FAILED_ARCS: accept the partial route (overuse + any
+                // unroutable arcs) and fall through to --write, for Vivado inspection.
+                if (getenv("NEXTPNR_SKIP_FAILED_ARCS")) {
+                    log_warning("router2: SKIP_FAILED_ARCS - accepting partial route with %d overused wire(s) after "
+                                "%d iterations; %d net(s) left with unrouted arcs.\n",
+                                overused_wires, iter - 1, int(failed_nets.size()));
+                    break;
                 }
                 log_error("router2: failed to converge - %d overused wire(s) after %d iterations "
                           "(no improvement for %d); design is unroutable in this placement "
