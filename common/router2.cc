@@ -843,7 +843,19 @@ struct Router2
         // because there is not route, rather than just because the toexplore
         // heuristic is incorrect.
         bool must_drain_queue = !is_bb;
-        while (!t.queue.empty() && (must_drain_queue || iter < toexplore)) {
+        // NEXTPNR_ARC_MAX_VISIT: hard cap on wires explored PER ARC, applied even
+        // in no-BB (must_drain_queue) mode.  Without it, a genuinely-unroutable
+        // arc drains the whole device graph before failing -- with hundreds of
+        // failing arcs (e.g. a bad clock-buffer placement) a SKIP_FAILED_ARCS
+        // diagnostic route takes HOURS just to enumerate the failures.  Bounding
+        // it makes a failing arc give up in ms, so the full skip list appears in
+        // minutes.  0/unset = unbounded (old behaviour).
+        static const int arc_max_visit = []{
+            const char *v = getenv("NEXTPNR_ARC_MAX_VISIT");
+            return v ? atoi(v) : 0;
+        }();
+        while (!t.queue.empty() && (must_drain_queue || iter < toexplore)
+               && (arc_max_visit <= 0 || iter < arc_max_visit)) {
             auto curr = t.queue.top();
             auto &d = flat_wires.at(curr.wire);
             t.queue.pop();
