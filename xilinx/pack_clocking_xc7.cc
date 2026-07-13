@@ -160,14 +160,23 @@ void XC7Packer::pack_plls()
             }
             set_default(ci, ctx->id("COMPENSATION"), Property("INTERNAL"));
 
-            // Fixup routing.  Imported (BEL-pinned) MMCMs keep the real
-            // CLKFBOUT->CLKFBIN loop: golden bitstreams realise INTERNAL
-            // compensation via the dedicated CLKFBOUT2IN pip, and a
-            // VCC-tied CLKFBIN never locks on hardware.
+            // Fixup routing.  An MMCM with a REAL CLKFBOUT->CLKFBIN loop in
+            // the netlist must keep it: golden bitstreams realise INTERNAL
+            // compensation via the dedicated CLKFBOUT2IN pip (same-tile,
+            // always routable), and a VCC-tied CLKFBIN never locks on
+            // hardware.  The old guard kept the loop only for BEL-pinned
+            // (imported-placement) MMCMs; a FREE MMCM (SVS-placed flow) got
+            // its feedback tied to VCC -> never locks -> totally dead design
+            // (VC707 eth-arp: no LEDs until the fasm was hand-patched back
+            // to CLKFBOUT2IN).  Tie only when CLKFBIN is genuinely undriven.
             if (str_or_default(ci->params, ctx->id("COMPENSATION"), "INTERNAL") == "INTERNAL" &&
                 !ci->attrs.count(ctx->id("BEL"))) {
-                disconnect_port(ctx, ci, ctx->id("CLKFBIN"));
-                connect_port(ctx, ctx->nets[ctx->id("$PACKER_VCC_NET")].get(), ci, ctx->id("CLKFBIN"));
+                NetInfo *fb = get_net_or_empty(ci, ctx->id("CLKFBIN"));
+                bool has_real_fb = fb != nullptr && fb->driver.cell != nullptr;
+                if (!has_real_fb) {
+                    disconnect_port(ctx, ci, ctx->id("CLKFBIN"));
+                    connect_port(ctx, ctx->nets[ctx->id("$PACKER_VCC_NET")].get(), ci, ctx->id("CLKFBIN"));
+                }
             }
         }
     }
