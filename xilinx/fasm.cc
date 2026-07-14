@@ -652,11 +652,19 @@ struct FasmBackend
         bool is_srused  = false;
         bool is_ceused  = false;
 
+// Name the offender instead of dying with a bare assert: a half-slice where
+// two FFs disagree on a shared control-set setting (CE/SR/CLKINV/latch/sync)
+// is a placement control-set violation, and the cell/bel/tile names are what
+// you need to trace it back to the placer or an imported stamp.
 #define SET_CHECK(dst, src)                                                                                            \
     do {                                                                                                               \
-        if (found_ff)                                                                                                  \
-            NPNR_ASSERT(dst == (src));                                                                                 \
-        else                                                                                                           \
+        if (found_ff) {                                                                                                \
+            if (dst != (src))                                                                                          \
+                log_error("FASM: FF '%s' (type %s) at bel %s disagrees with its half-slice on '%s' "                   \
+                          "(tile %s) -- control-set contention in the placement\n",                                    \
+                          ff->name.c_str(ctx), type.c_str(), ctx->getBelName(ff->bel).c_str(ctx), #dst,                \
+                          tname.c_str());                                                                              \
+        } else                                                                                                         \
             dst = (src);                                                                                               \
     } while (0)
 
