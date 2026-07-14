@@ -1294,12 +1294,31 @@ class HeAPPlacer
             for (auto &cell : p->cell_locs) {
                 if (!beltype.count(ctx->cells.at(cell.first)->type))
                     continue;
+                // Skip locked cells, mirroring the extent-recording loop above.
+                // A fully BEL-locked constraint chain (e.g. a carry-stamped
+                // CARRY4 chain, strength STRENGTH_USER) records NO extent there;
+                // looking its root up here would throw a bare std::out_of_range.
+                // Locked cells are never spread, so they contribute no extent.
+                if (ctx->cells.at(cell.first)->belStrength > STRENGTH_STRONG)
+                    continue;
                 // Transfer chain extents to the actual chaines structure
                 ChainExtent *ce = nullptr;
+                IdString ext_key;
                 if (p->chain_root.count(cell.first))
-                    ce = &(cell_extents.at(p->chain_root.at(cell.first)->name));
+                    ext_key = p->chain_root.at(cell.first)->name;
                 else if (!ctx->cells.at(cell.first)->constr_children.empty())
-                    ce = &(cell_extents.at(cell.first));
+                    ext_key = cell.first;
+                if (ext_key != IdString()) {
+                    auto ext = cell_extents.find(ext_key);
+                    if (ext == cell_extents.end())
+                        log_error("HeAP spreader: no chain extent recorded for chain root '%s' "
+                                  "(reached via cell '%s' of type '%s', strength %d) — placer "
+                                  "invariant violated\n",
+                                  ext_key.c_str(ctx), cell.first.c_str(ctx),
+                                  ctx->cells.at(cell.first)->type.c_str(ctx),
+                                  int(ctx->cells.at(cell.first)->belStrength));
+                    ce = &ext->second;
+                }
                 if (ce) {
                     auto &lce = chaines.at(cell.second.x).at(cell.second.y);
                     lce.x0 = std::min(lce.x0, ce->x0);
