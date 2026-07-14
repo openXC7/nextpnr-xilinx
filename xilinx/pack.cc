@@ -233,6 +233,20 @@ void XilinxPacker::pack_ffs()
     ff_rules[ctx->id("FDSE_1")] = ff_rules[ctx->id("FDSE")];
     ff_rules[ctx->id("FDSE_1")].set_params.emplace_back(ctx->id("IS_CLK_INVERTED"), 1);
 
+    ff_rules[ctx->id("LDCE")].new_type = id_SLICE_FFX;
+    ff_rules[ctx->id("LDCE")].port_xform[ctx->id("G")] = ctx->xc7 ? id_CK : id_CLK;
+    ff_rules[ctx->id("LDCE")].port_xform[ctx->id("GE")] = id_CE;
+    ff_rules[ctx->id("LDCE")].port_xform[ctx->id("CLR")] = id_SR;
+    ff_rules[ctx->id("LDCE")].param_xform[ctx->id("IS_G_INVERTED")] = ctx->id("IS_CLK_INVERTED");
+    ff_rules[ctx->id("LDCE")].set_attrs.emplace_back(ctx->id("X_FF_AS_LATCH"), "1");
+
+    ff_rules[ctx->id("LDPE")].new_type = id_SLICE_FFX;
+    ff_rules[ctx->id("LDPE")].port_xform[ctx->id("G")] = ctx->xc7 ? id_CK : id_CLK;
+    ff_rules[ctx->id("LDPE")].port_xform[ctx->id("GE")] = id_CE;
+    ff_rules[ctx->id("LDPE")].port_xform[ctx->id("PRE")] = id_SR;
+    ff_rules[ctx->id("LDPE")].param_xform[ctx->id("IS_G_INVERTED")] = ctx->id("IS_CLK_INVERTED");
+    ff_rules[ctx->id("LDPE")].set_attrs.emplace_back(ctx->id("X_FF_AS_LATCH"), "1");
+
     generic_xform(ff_rules, true);
 }
 

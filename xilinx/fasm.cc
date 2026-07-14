@@ -568,6 +568,16 @@ struct FasmBackend
                     SET_CHECK(negedge_ff, true);
                     SET_CHECK(is_latch, false);
                     SET_CHECK(is_sync, false);
+                } else if (type == "LDCE") {
+                    zrst = true;
+                    SET_CHECK(negedge_ff, false);
+                    SET_CHECK(is_latch, true);
+                    SET_CHECK(is_sync, false);
+                } else if (type == "LDPE") {
+                    zrst = false;
+                    SET_CHECK(negedge_ff, false);
+                    SET_CHECK(is_latch, true);
+                    SET_CHECK(is_sync, false);
                 } else {
                     log_error("unsupported FF type: '%s'\n", type.c_str());
                 }
@@ -577,6 +587,12 @@ struct FasmBackend
 
                 pop();
                 if (negedge_ff) SET_CHECK(is_clkinv, true);
+                // LDCE/LDPE transparent latches are open while the gate G is HIGH,
+                // but a 7-series storage element in latch mode is transparent while
+                // its clock is LOW. Invert the gate sense by default so that G high
+                // => transparent (still XORable with IS_G_INVERTED on the primitive).
+                else if (is_latch)
+                    SET_CHECK(is_clkinv, int_or_default(ff->params, ctx->id("IS_CLK_INVERTED")) != 1);
                 else SET_CHECK(is_clkinv, int_or_default(ff->params, ctx->id("IS_CLK_INVERTED")) == 1);
 
                 NetInfo *sr = get_net_or_empty(ff, ctx->id("SR")), *ce = get_net_or_empty(ff, ctx->id("CE"));
