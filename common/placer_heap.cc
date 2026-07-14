@@ -411,6 +411,47 @@ class HeAPPlacer
                 placed_cells++;
             }
         }
+        // Bind chain children the packer created relative to a BEL-pinned
+        // parent (e.g. carry S/DI feed-through LUTs under a stamped CARRY4).
+        // They are excluded from place_cells (constr_parent != nullptr) and
+        // strict legalisation never visits the already-bound parent, so
+        // without this they end the placer unbound ("Found unbound cell").
+        // placer1 handles this via legalise_relative_constraints /
+        // bind_unplaced_children; this is the HeAP-path equivalent.
+        std::function<void(CellInfo *)> bind_children = [&](CellInfo *parent) {
+            if (parent->bel == BelId())
+                return;
+            Loc ploc = ctx->getBelLocation(parent->bel);
+            for (auto child : parent->constr_children) {
+                if (child->bel == BelId()) {
+                    Loc cl;
+                    cl.x = ploc.x + (child->constr_x == child->UNCONSTR ? 0 : child->constr_x);
+                    cl.y = ploc.y + (child->constr_y == child->UNCONSTR ? 0 : child->constr_y);
+                    // xc7: chains never cross slice halves -- impose the
+                    // parent's half (z bit 6) on absolute chain z values
+                    cl.z = child->constr_abs_z
+                                   ? (child->constr_z | (ploc.z & ~0x3F))
+                                   : ploc.z + (child->constr_z == child->UNCONSTR ? 0 : child->constr_z);
+                    BelId target = ctx->getBelByLocation(cl);
+                    if (target != BelId() && ctx->checkBelAvail(target)) {
+                        ctx->bindBel(target, child, STRENGTH_USER);
+                        placed_cells++;
+                    } else {
+                        log_warning("HeAP: cannot bind chain child '%s' (type %s) of pinned parent '%s' at "
+                                    "(%d,%d,%d): %s\n",
+                                    child->name.c_str(ctx), child->type.c_str(ctx), parent->name.c_str(ctx), cl.x,
+                                    cl.y, cl.z,
+                                    target == BelId() ? "no bel at location" : "bel not available");
+                    }
+                }
+                bind_children(child);
+            }
+        };
+        for (auto &cell_entry : ctx->cells) {
+            CellInfo *ci = cell_entry.second.get();
+            if (ci->constr_parent == nullptr && ci->bel != BelId() && !ci->constr_children.empty())
+                bind_children(ci);
+        }
         log_info("Placed %d cells based on constraints.\n", int(placed_cells));
         ctx->yield();
     }
