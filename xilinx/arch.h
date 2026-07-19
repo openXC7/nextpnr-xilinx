@@ -1143,12 +1143,23 @@ struct Arch : BaseCtx
     }
 
     dict<int, pool<int>> blacklist_pips;
+    // Per-tile-INSTANCE pip blacklist (keyed by tile index -> pip indices), for
+    // reserving a pip in ONE specific tile only -- e.g. an INT pip whose config
+    // bit overlaps a live IOB config bit (IOB config piggybacks on the adjacent
+    // INT column's frames), which must be avoided at that tile but stays usable
+    // everywhere else.  Loaded from NEXTPNR_PIP_BLACKLIST_TILE (TILENAME.DST.SRC).
+    dict<int, pool<int>> blacklist_pip_instances;
     void setup_pip_blacklist();
 
     bool usp_pip_hard_unavail(PipId pip) const
     {
         if (blacklist_pips.count(locInfo(pip).type) && blacklist_pips.at(locInfo(pip).type).count(pip.index))
             return true;
+        if (!blacklist_pip_instances.empty()) {
+            auto it = blacklist_pip_instances.find(pip.tile);
+            if (it != blacklist_pip_instances.end() && it->second.count(pip.index))
+                return true;
+        }
         if (locInfo(pip).pip_data[pip.index].flags == PIP_SITE_ENTRY) {
             WireId dst = getPipDstWire(pip);
             if (dst.tile != -1) {

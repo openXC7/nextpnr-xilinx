@@ -556,6 +556,45 @@ void Arch::setup_pip_blacklist()
             }
         }
     }
+    // NEXTPNR_PIP_BLACKLIST_TILE=<file>: reserve individual pips in NAMED tile
+    // instances (one "TILENAME.DST.SRC" per line), for pips whose config bit
+    // collides with a live IOB config bit in the shared INT frame column.  Unlike
+    // NEXTPNR_PIP_BLACKLIST (per tile TYPE) this forbids the pip in ONE tile only.
+    if (const char *blf = getenv("NEXTPNR_PIP_BLACKLIST_TILE")) {
+        if (tile_by_name.empty())
+            for (int i = 0; i < chip_info->num_tiles; i++)
+                tile_by_name[chip_info->tile_insts[i].name.get()] = i;
+        std::ifstream f(blf);
+        std::string ln;
+        int n = 0;
+        while (std::getline(f, ln)) {
+            if (ln.empty() || ln[0] == '#')
+                continue;
+            auto d2 = ln.rfind('.');
+            if (d2 == std::string::npos || d2 == 0)
+                continue;
+            auto d1 = ln.rfind('.', d2 - 1);
+            if (d1 == std::string::npos)
+                continue;
+            std::string tname = ln.substr(0, d1);
+            std::string dst = ln.substr(d1 + 1, d2 - d1 - 1);
+            std::string src = ln.substr(d2 + 1);
+            auto it = tile_by_name.find(tname);
+            if (it == tile_by_name.end())
+                continue;
+            int ti = it->second;
+            auto &td2 = chip_info->tile_types[chip_info->tile_insts[ti].type];
+            for (int j = 0; j < td2.num_pips; j++) {
+                auto &pd = td2.pip_data[j];
+                if (IdString(td2.wire_data[pd.dst_index].name).str(this) == dst &&
+                    IdString(td2.wire_data[pd.src_index].name).str(this) == src) {
+                    blacklist_pip_instances[ti].insert(j);
+                    ++n;
+                }
+            }
+        }
+        log_info("pip blacklist (per-tile-instance): %d pips from %s\n", n, blf);
+    }
 }
 
 IdString Arch::getPipType(PipId pip) const { return id("PIP"); }
