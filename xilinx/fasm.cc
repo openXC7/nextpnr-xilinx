@@ -995,6 +995,43 @@ struct FasmBackend
 
     std::unordered_map<int, BankIoConfig> ioconfig_by_hclk;
 
+    // tile -> the PAD cell at each in-tile IOB site row (index 0/1 = getSiteLocInTile.y)
+    std::unordered_map<int, std::array<CellInfo *, 2>> pads_by_tile_;
+    bool pads_map_built_ = false;
+    void build_pads_map()
+    {
+        for (auto &cell : ctx->cells) {
+            CellInfo *ci = cell.second.get();
+            if (ci->type == ctx->id("PAD") && ci->bel != BelId()) {
+                Loc l = ctx->getSiteLocInTile(ci->bel);
+                if (l.y == 0 || l.y == 1)
+                    pads_by_tile_[ci->bel.tile][l.y] = ci;
+            }
+        }
+        pads_map_built_ = true;
+    }
+    // Is the PARTNER IOB in this pad's tile (the other in-tile site) an active
+    // OUTPUT?  A single-ended LEFT-HP input on the slave site normally receives
+    // through the MASTER half's differential amplifier (partner LVDS.IN bits);
+    // if the master is driving an output that amplifier is unavailable and the
+    // partner LVDS.IN + PULLDOWN collide with the output's DRIVE bits
+    // (FasmInconsistentBits at fasm2frames).  In that case use a plain LVCMOS
+    // input instead and emit nothing on the partner.
+    bool partner_is_output(CellInfo *pad)
+    {
+        if (!pads_map_built_)
+            build_pads_map();
+        Loc l = ctx->getSiteLocInTile(pad->bel);
+        auto it = pads_by_tile_.find(pad->bel.tile);
+        if (it == pads_by_tile_.end())
+            return false;
+        CellInfo *partner = it->second[1 - l.y];
+        if (partner == nullptr)
+            return false;
+        NetInfo *pn = get_net_or_empty(partner, ctx->id("PAD"));
+        return pn != nullptr && pn->driver.cell != nullptr;
+    }
+
     void write_io_config(CellInfo *pad)
     {
         NetInfo *pad_net = get_net_or_empty(pad, ctx->id("PAD"));
@@ -1178,8 +1215,14 @@ struct FasmBackend
             // amp.  The diff-amp reference is the prime suspect for the open-flow rx
             // long-run/AC-coupling-like distortion.  Default off (matches golden);
             // set the env to try plain.
+            // If the partner (master) IOB drives an output, its differential
+            // amplifier is unavailable to borrow -- fall back to a plain LVCMOS
+            // input, and skip the partner-half writes (which would collide with
+            // the output's DRIVE bits -> FasmInconsistentBits).
+            bool partner_out = partner_is_output(pad);
             bool is_lefthp_se_in = is_hp_bank && !is_riob18 && !is_output && !is_diff && yLoc == 1
-                                   && (getenv("NEXTPNR_RX_PLAIN_LVCMOS") == nullptr);
+                                   && (getenv("NEXTPNR_RX_PLAIN_LVCMOS") == nullptr)
+                                   && !partner_out;
             if (is_hp_bank && !is_output) {
                 if (is_diff) {
                     // RIGHT HP bank uses IBUFDS_BANK_GLUE; LEFT HP bank (LIOB18) uses
@@ -1214,7 +1257,7 @@ struct FasmBackend
             // partner bits) works.  The differential (clock) input case is handled
             // separately below; this covers the single-ended LVCMOS path.  Emit on
             // the partner half via a fasm-context swap.
-            if (is_hp_bank && !is_riob18 && !is_output && !is_diff) {
+            if (is_hp_bank && !is_riob18 && !is_output && !is_diff && !partner_out) {
                 std::string saved = fasm_ctx.back();          // "IOB_Y<yLoc>"
                 fasm_ctx.back() = "IOB_Y" + std::to_string(1 - yLoc);
                 if (is_lefthp_se_in) {
