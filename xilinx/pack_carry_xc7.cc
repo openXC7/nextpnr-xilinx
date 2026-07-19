@@ -149,8 +149,17 @@ void XC7Packer::pack_carries_atomic()
     int chain_count = 0, cell_count = 0;
     for (auto *root : roots) {
         // Place root at absolute CARRY4 BEL position.
+        // A BEL-pinned root (imported placement) already has its z fixed by
+        // the BEL attribute; the CARRY4 bel z is NOT uniformly BEL_CARRY4
+        // (0xF) across the device -- some columns (e.g. X43 on xc7vx485t)
+        // encode it at 0x4F -- so hardcoding constr_z = BEL_CARRY4 makes the
+        // absolute-z constraint distance non-zero and the placer aborts
+        // ("constraint satisfaction check failed").  Leave a pinned root's z
+        // unconstrained (the BEL attr binds it); its S/DI/FF children keep
+        // their own absolute-z constraints, which are unaffected.
         root->constr_abs_z = true;
-        root->constr_z = BEL_CARRY4;
+        if (!root->attrs.count(ctx->id("BEL")))
+            root->constr_z = BEL_CARRY4;
 
         CellInfo *prev = root;
         int idx_in_chain = 0;
