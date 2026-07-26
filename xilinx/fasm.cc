@@ -1493,6 +1493,21 @@ struct FasmBackend
         }
         pop();
         if (half == 0) {
+            // A RAMB36E1 expresses its port widths through the two underlying
+            // RAMB18 halves, each carrying half the data.  Widths 1 and 9 are
+            // odd and cannot be split evenly: prjxray encodes the leftover bit
+            // (for width 9 that bit is the parity bit) with a RAMB36-scope
+            // feature.  Without it the block silently behaves as width 8, and
+            // every DIP/DOP bit reads back as 0.
+            if (ci != nullptr && ci->type == id_RAMB36E1_RAMB36E1) {
+                push("RAMB36");
+                for (auto pname : {"READ_WIDTH_A", "READ_WIDTH_B", "WRITE_WIDTH_A", "WRITE_WIDTH_B"}) {
+                    int w = int_or_default(ci->params, ctx->id(pname), 0);
+                    if (w == 1 || w == 9)
+                        write_bit(std::string("BRAM36_") + pname + "_1");
+                }
+                pop();
+            }
             auto used_rdaddrcasc = used_wires_starting_with(tile, "BRAM_CASCOUT_ADDRARDADDR", false);
             auto used_wraddrcasc = used_wires_starting_with(tile, "BRAM_CASCOUT_ADDRBWRADDR", false);
             write_bit("CASCOUT_ARD_ACTIVE", !used_rdaddrcasc.empty());
