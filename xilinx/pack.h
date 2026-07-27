@@ -209,6 +209,7 @@ struct XC7Packer : public XilinxPacker
     // Carries
     bool has_illegal_fanout(NetInfo *carry);
     void pack_carries();
+    void pack_carries_atomic();   // Vivado-compatible direct CARRY4 packer
 
     // IO
     CellInfo *insert_ibuf(IdString name, IdString type, NetInfo *i, NetInfo *o);

@@ -452,7 +452,9 @@ def import_device(name, prjxray_root, metadata_root):
 		return ij["intents"][str(ij["tiles"][tiletype][wirename])]
 
 	d = Device(name)
-	match = re.search(r"^(xc7[sakz]\d+t?)\w+-\d", name)
+	# Virtex-7 fabrics are e.g. xc7vx485t / xc7vh580t / xc7v585t (the optional
+	# x/h denotes the GTX/GTH sub-family), unlike the xc7[sakz]NNNt form.
+	match = re.search(r"^(xc7(?:[sakz]\d+t?|v[xh]?\d+t))\w+-\d", name)
 	if not match:
 		raise RuntimeError("{} is not known device name".format(name))
 	fabricname = match.groups()[0]
@@ -466,6 +468,19 @@ def import_device(name, prjxray_root, metadata_root):
 		ij = json.load(ijf)
 	with open(prjxray_root + "/" + fabricname + "/tilegrid.json") as gf:
 		tgj = json.load(gf)
+	# Numeric-aware key so site names like IOB_X1Y10 sort *after* IOB_X1Y9,
+	# matching the physical slave-at-low-Y / master-at-high-Y layout.  A
+	# lexicographic sort places Y10 before Y9, which flipped bel.site=0
+	# (always meant to be slave) to be the master in tile types whose
+	# representative tile happened to have single-digit Y coordinates —
+	# nextpnr then emitted IOB_IBUF1 (slave wire) for an IBUF placed on a
+	# master site, and Vivado's DCP DRC rejected the route.
+	def site_sort_key(name):
+		m = re.match(r'^(.+_)X(\d+)Y(\d+)$', name)
+		if m:
+			return (m.group(1), int(m.group(2)), int(m.group(3)))
+		return (name, 0, 0)
+
 	for tile, tiledata in sorted(tgj.items()):
 		x = int(tiledata["grid_x"])
 		y = int(tiledata["grid_y"])
@@ -473,7 +488,8 @@ def import_device(name, prjxray_root, metadata_root):
 		d.height = max(d.height, y + 1)
 		tiletype = tiledata["type"]
 		t = Tile(x, y, tile, get_tile_type_data(tiletype), (-1, -1), [])
-		for idx, (site, sitetype) in enumerate(sorted(tiledata["sites"].items())):
+		for idx, (site, sitetype) in enumerate(sorted(tiledata["sites"].items(),
+				key=lambda kv: site_sort_key(kv[0]))):
 				si = Site(t, site, idx, parse_xy(site), get_site_type_data(sitetype))
 				t.site_insts.append(si)
 				d.sites_by_name[site] = si

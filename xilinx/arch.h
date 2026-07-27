@@ -1161,9 +1161,20 @@ struct Arch : BaseCtx
             }
         } else if (locInfo(pip).pip_data[pip.index].flags == PIP_CONST_DRIVER) {
             WireId dst = getPipDstWire(pip);
-            LogicTileStatus *lts = tileStatus[xc7 ? dst.tile : pip.tile].lts;
-            if (lts != nullptr && (lts->cells[BEL_5LUT] != nullptr || lts->cells[BEL_6LUT] != nullptr))
-                return true; // Ground driver only available if lowest 5LUT and 6LUT not used
+            // virtex7 clock-routing fan-out reaches PIP_CONST_DRIVER pips
+            // whose getPipDstWire returns dst.tile == -1 (the pseudo-tile
+            // for the const-driver wire).  The matching PIP_SITE_ENTRY
+            // branch above already guards with `if (dst.tile != -1)` —
+            // we do the same here to avoid tileStatus[-1] (caught by
+            // ASan as a 64-byte-before-allocation read).  When dst.tile
+            // is the pseudo-tile we conservatively report the pip
+            // available (return false at the bottom of the function),
+            // since there's no LogicTileStatus to consult anyway.
+            if (dst.tile != -1) {
+                LogicTileStatus *lts = tileStatus[xc7 ? dst.tile : pip.tile].lts;
+                if (lts != nullptr && (lts->cells[BEL_5LUT] != nullptr || lts->cells[BEL_6LUT] != nullptr))
+                    return true; // Ground driver only available if lowest 5LUT and 6LUT not used
+            }
         } else if (locInfo(pip).pip_data[pip.index].flags == PIP_SITE_INTERNAL) {
             auto &pd = locInfo(pip).pip_data[pip.index];
             if (pd.bel == ID_TRIBUF)

@@ -42,24 +42,59 @@ void XC7Packer::prepare_clocking()
 
     for (auto cell : sorted(ctx->cells)) {
         CellInfo *ci = cell.second;
+        // Whenever this loop rewrites ci->type, preserve the original under
+        // X_ORIG_TYPE so downstream consumers (json2dcp / fasm.cc) know what
+        // primitive name to re-emit.  Without this, a packed BUFG looks like a
+        // BUFGCTRL with no provenance, and RapidWright can't reconstruct the
+        // BUFG EDIF cell — it gets silently dropped, leaving clk driverless.
+        auto save_orig_type = [&]() {
+            if (!ci->attrs.count(ctx->id("X_ORIG_TYPE")))
+                ci->attrs[ctx->id("X_ORIG_TYPE")] = ci->type.str(ctx);
+        };
+        // Tag a port rename so downstream consumers (json2dcp / fasm.cc)
+        // can reconstruct the source-RTL port name.  The general xform_cell
+        // path in pack.cc:70 does this automatically; this lambda mirrors
+        // that behaviour for the rename_port() calls in this loop that
+        // bypass xform_cell.  Without these tags the json2dcp EDIF leaves
+        // the packed cell's pins floating (e.g. clk_raw had no sink because
+        // BUFG.I → BUFGCTRL.I0 had no X_ORIG_PORT_I0 mapping).
+        auto save_orig_port = [&](const std::string &new_name, const std::string &orig_name) {
+            ci->attrs[ctx->id("X_ORIG_PORT_" + new_name)] = orig_name;
+        };
         if (upgrade.count(ci->type)) {
+            save_orig_type();
             IdString new_type = upgrade.at(ci->type);
             ci->type = new_type;
         } else if (ci->type == ctx->id("BUFG")) {
+            save_orig_type();
             ci->type = ctx->id("BUFGCTRL");
             rename_port(ctx, ci, ctx->id("I"), ctx->id("I0"));
+            save_orig_port("I0", "I");
+            save_orig_port("O",  "O");
             tie_port(ci, "CE0", true, true);
             tie_port(ci, "S0", true, true);
             tie_port(ci, "S1", false, true);
             tie_port(ci, "IGNORE0", true, true);
         } else if (ci->type == ctx->id("BUFGCE")) {
+            save_orig_type();
             ci->type = ctx->id("BUFGCTRL");
             rename_port(ctx, ci, ctx->id("I"), ctx->id("I0"));
             rename_port(ctx, ci, ctx->id("CE"), ctx->id("CE0"));
+            save_orig_port("I0",  "I");
+            save_orig_port("CE0", "CE");
+            save_orig_port("O",   "O");
             tie_port(ci, "S0", true, true);
             tie_port(ci, "S1", false, true);
             tie_port(ci, "IGNORE0", true, true);
         } else if (ci->type == ctx->id("BUFGMUX") || ci->type == ctx->id("BUFGMUX_CTRL")) {
+            save_orig_type();
+            // I0/I1 unchanged; S → S1 direct and S → S0 inverted (one
+            // source feeding two ports).
+            save_orig_port("I0", "I0");
+            save_orig_port("I1", "I1");
+            save_orig_port("S1", "S");
+            save_orig_port("S0", "S");
+            save_orig_port("O",  "O");
             // I same, S->S1 direct, S->S0 inverted, CE to VCC, IGNORE to GND
             ci->type = ctx->id("BUFGCTRL");
             rename_port(ctx, ci, ctx->id("S"), ctx->id("S1"));
@@ -77,6 +112,19 @@ void XC7Packer::prepare_clocking()
         } else if (ci->type == id_BUFH || ci->type == id_BUFHCE) {
             ci->type = id_BUFHCE_BUFHCE;
             tie_port(ci, "CE", true, true);
+        } else if (ci->type == id_BUFR) {
+            // BUFR site holds a single BEL of type BUFR_BUFR (per the
+            // virtex7 meta tree, ported from artix7).  Rename the cell
+            // type to match the BEL.  No port renames needed (BUFR pin
+            // names are identical: I/CE/CLR/O), but json2dcp drops any
+            // connection that lacks an X_ORIG_PORT_<name> attribute,
+            // so emit identity mappings for the four ports.
+            save_orig_type();
+            ci->type = id_BUFR_BUFR;
+            save_orig_port("I",   "I");
+            save_orig_port("CE",  "CE");
+            save_orig_port("CLR", "CLR");
+            save_orig_port("O",   "O");
         }
     }
 }

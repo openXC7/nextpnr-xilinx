@@ -38,21 +38,59 @@ BelId XilinxPacker::find_bel_with_short_route(WireId source, IdString beltype, I
         return BelId();
     const size_t max_visit = 50000; // effort/runtime tradeoff
     std::unordered_set<WireId> visited;
-    std::queue<WireId> visit;
-    visit.push(source);
-    while (!visit.empty() && visited.size() < max_visit) {
-        WireId cursor = visit.front();
-        visit.pop();
-        for (auto bp : ctx->getWireBelPins(cursor))
-            if (bp.pin == belpin && ctx->getBelType(bp.bel) == beltype && !used_bels.count(bp.bel))
-                return bp.bel;
-        for (auto pip : ctx->getPipsDownhill(cursor)) {
-            WireId dst = ctx->getPipDstWire(pip);
-            if (visited.count(dst))
-                continue;
-            visit.push(dst);
-            visited.insert(dst);
+    // Layer-by-layer BFS instead of a single FIFO.  When the original
+    // FIFO encountered two reachable target BELs at the same pip-distance
+    // from `source`, it returned whichever the chipdb iteration order
+    // surfaced first — non-deterministic and chipdb-rebuild-sensitive.
+    // On xc7vx485t that landed BUFGCTRL placements at Y10 instead of
+    // Vivado's Y3 for the same IBUFDS source, costing a placement-
+    // mismatch chunk in the direct-vs-hybrid FASM gap.
+    // The shortest pip-distance path still wins; the only behavioural
+    // change is the deterministic tie-break by lowest (y, x, z),
+    // matching Vivado's "fill from low slots upward" heuristic.
+    //
+    // TODO: 7-series and UltraScale have specific I/O pins with
+    // dedicated low-latency paths to specific BUFGs (e.g. a SYSCLK
+    // input via certain LIOB18 sites can reach one particular
+    // BUFGCTRL via a single short dedicated wire).  Vivado prefers
+    // those dedicated paths; the BFS sees them as equal pip-distance
+    // to longer-routed alternatives, so it tie-breaks by y instead.
+    // A future refinement would weight each pip by its actual delay
+    // (the chipdb already carries per-pip timing for this) and pick
+    // the lowest-delay BEL rather than the lowest-Y one.
+    std::vector<WireId> frontier{source};
+    visited.insert(source);
+    while (!frontier.empty() && visited.size() < max_visit) {
+        std::vector<BelId> matches;
+        for (WireId w : frontier) {
+            for (auto bp : ctx->getWireBelPins(w))
+                if (bp.pin == belpin &&
+                    ctx->getBelType(bp.bel) == beltype &&
+                    !used_bels.count(bp.bel))
+                    matches.push_back(bp.bel);
         }
+        if (!matches.empty()) {
+            std::sort(matches.begin(), matches.end(),
+                      [this](BelId a, BelId b) {
+                          Loc la = ctx->getBelLocation(a);
+                          Loc lb = ctx->getBelLocation(b);
+                          if (la.y != lb.y) return la.y < lb.y;
+                          if (la.x != lb.x) return la.x < lb.x;
+                          return la.z < lb.z;
+                      });
+            return matches.front();
+        }
+        std::vector<WireId> next_frontier;
+        for (WireId w : frontier) {
+            for (auto pip : ctx->getPipsDownhill(w)) {
+                WireId dst = ctx->getPipDstWire(pip);
+                if (visited.count(dst))
+                    continue;
+                visited.insert(dst);
+                next_frontier.push_back(dst);
+            }
+        }
+        frontier.swap(next_frontier);
     }
     return BelId();
 }

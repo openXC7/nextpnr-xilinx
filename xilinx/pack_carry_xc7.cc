@@ -104,9 +104,228 @@ void XilinxPacker::split_carry4s()
     flush_cells();
 }
 
+// Atomic CARRY4 packer: keep each Vivado CARRY4 as a single nextpnr cell
+// (no split into MUXCY/XORCY pieces).  Each cell is constrained to a
+// SLICE/CARRY4 BEL; chains are linked head-to-tail via CO[3] -> CI.
+// Cell names are preserved verbatim from Vivado synth, which lets the
+// hybrid flow's json_to_loc_tcl pin every CARRY4 at the slice nextpnr
+// chose — eliminating the dominant chunk of the direct-vs-hybrid FASM
+// gap that was a placement-mismatch artifact rather than a real chipdb
+// shortfall.
+//
+// Set XC7_LEGACY_CARRY4_SPLIT=1 in the environment to fall back to the
+// historical split-and-repack path (kept for emergency comparison).
+void XC7Packer::pack_carries_atomic()
+{
+    log_info("Packing carries (atomic CARRY4)..\n");
+
+    static const std::unordered_set<IdString> lut_types{
+        ctx->id("LUT1"), ctx->id("LUT2"), ctx->id("LUT3"),
+        ctx->id("LUT4"), ctx->id("LUT5")};
+
+    // Find chain roots: a CARRY4 whose CI input is not driven by another
+    // CARRY4's CO[3] output.
+    std::vector<CellInfo *> roots;
+    for (auto cell : sorted(ctx->cells)) {
+        CellInfo *ci = cell.second;
+        if (ci->type != ctx->id("CARRY4"))
+            continue;
+        NetInfo *ci_net = get_net_or_empty(ci, ctx->id("CI"));
+        bool is_root = (ci_net == nullptr) ||
+                       (ci_net->driver.cell == nullptr) ||
+                       (ci_net->driver.cell->type != ctx->id("CARRY4"));
+        if (is_root)
+            roots.push_back(ci);
+    }
+
+    int chain_count = 0, cell_count = 0;
+    for (auto *root : roots) {
+        // Place root at absolute CARRY4 BEL position.
+        root->constr_abs_z = true;
+        root->constr_z = BEL_CARRY4;
+
+        CellInfo *prev = root;
+        int idx_in_chain = 0;
+        while (true) {
+            // Constrain LUTs driving this CARRY4's DI[i] / S[i] inputs
+            // into the adjacent BEL_5LUT / BEL_6LUT slots.  Insert feed-
+            // through LUTs if the input nets aren't LUT-driven.
+            int constr_y = -(idx_in_chain + idx_in_chain / 25);
+            for (int z = 0; z < 4; z++) {
+                std::string zs = std::to_string(z);
+                NetInfo *c4_s  = get_net_or_empty(prev, ctx->id("S["  + zs + "]"));
+                NetInfo *c4_di = get_net_or_empty(prev, ctx->id("DI[" + zs + "]"));
+
+                // Constant-driven inputs ($PACKER_GND_NET / $PACKER_VCC_NET)
+                // don't need a feed-through LUT: the CARRY4 BEL ties them
+                // internally.  The original split-and-repack code was
+                // similarly conservative; spurious feed-through LUTs were
+                // what hung the heap placer when we tried to constrain them.
+                auto is_const = [&](NetInfo *n) {
+                    return n && (n->name == ctx->id("$PACKER_GND_NET") ||
+                                 n->name == ctx->id("$PACKER_VCC_NET"));
+                };
+                if (is_const(c4_s))  c4_s  = nullptr;
+                if (is_const(c4_di)) c4_di = nullptr;
+
+                std::unordered_set<IdString> unique_lut_inputs;
+                int s_inputs = 0;
+                CellInfo *s_lut = nullptr, *di_lut = nullptr;
+
+                if (c4_s && c4_s->users.size() == 1 &&
+                    c4_s->driver.cell != nullptr &&
+                    lut_types.count(c4_s->driver.cell->type)) {
+                    s_lut = c4_s->driver.cell;
+                    for (int j = 0; j < 5; j++) {
+                        NetInfo *ix = get_net_or_empty(s_lut, ctx->id("I" + std::to_string(j)));
+                        if (ix) { unique_lut_inputs.insert(ix->name); s_inputs++; }
+                    }
+                }
+                if (c4_di && c4_di->users.size() == 1 &&
+                    c4_di->driver.cell != nullptr &&
+                    lut_types.count(c4_di->driver.cell->type)) {
+                    di_lut = c4_di->driver.cell;
+                    for (int j = 0; j < 5; j++) {
+                        NetInfo *ix = get_net_or_empty(di_lut, ctx->id("I" + std::to_string(j)));
+                        if (ix) unique_lut_inputs.insert(ix->name);
+                    }
+                }
+                int lut_inp_count = int(unique_lut_inputs.size());
+                if (!s_lut)  ++lut_inp_count;
+                if (!di_lut) ++lut_inp_count;
+                if (lut_inp_count > 5) {
+                    di_lut = nullptr;
+                    if (s_inputs > 4) s_lut = nullptr;
+                }
+                if (!s_lut && c4_s) {
+                    PortRef pr; pr.cell = prev;
+                    pr.port = ctx->id("S[" + zs + "]");
+                    auto s_feed = feed_through_lut(c4_s, {pr});
+                    s_lut = s_feed.get();
+                    new_cells.push_back(std::move(s_feed));
+                }
+                if (!di_lut && c4_di) {
+                    PortRef pr; pr.cell = prev;
+                    pr.port = ctx->id("DI[" + zs + "]");
+                    auto di_feed = feed_through_lut(c4_di, {pr});
+                    di_lut = di_feed.get();
+                    new_cells.push_back(std::move(di_feed));
+                }
+                if (s_lut) {
+                    root->constr_children.push_back(s_lut);
+                    s_lut->constr_parent = root;
+                    s_lut->constr_x = 0;
+                    s_lut->constr_y = constr_y;
+                    s_lut->constr_abs_z = true;
+                    s_lut->constr_z = (z << 4 | BEL_6LUT);
+                }
+                if (di_lut) {
+                    root->constr_children.push_back(di_lut);
+                    di_lut->constr_parent = root;
+                    di_lut->constr_x = 0;
+                    di_lut->constr_y = constr_y;
+                    di_lut->constr_abs_z = true;
+                    di_lut->constr_z = (z << 4 | BEL_5LUT);
+                }
+            }
+
+            // Walk to the next CARRY4 in the chain.  Vivado's CARRY4 spec
+            // says CO[3] is the chain output, but JSON bus-expansion in
+            // nextpnr places the chain output at CO[0] for an EDIF
+            // declared "output [3:0] CO" (because list index 0 maps to
+            // the FIRST declared bit, which is bit 3 / the MSB).  Be
+            // robust: scan CO[0..3] and pick whichever bit drives a
+            // CARRY4's CI input.
+            CellInfo *next = nullptr;
+            for (int co_bit = 0; co_bit < 4 && !next; co_bit++) {
+                NetInfo *co_n = get_net_or_empty(
+                    prev, ctx->id("CO[" + std::to_string(co_bit) + "]"));
+                if (!co_n) continue;
+                for (auto &u : co_n->users) {
+                    if (u.cell->type == ctx->id("CARRY4") &&
+                        u.port == ctx->id("CI")) {
+                        next = u.cell;
+                        break;
+                    }
+                }
+            }
+            if (!next) break;
+            ++idx_in_chain;
+            // Constrain next CARRY4 relative to the root.
+            next->constr_parent = root;
+            root->constr_children.push_back(next);
+            next->constr_x = 0;
+            // Skip every 25th tile (no CARRY4 BEL on tiles where
+            // grid_y is a multiple of 26 - HCLK rows etc.).
+            next->constr_y = -(idx_in_chain + idx_in_chain / 25);
+            next->constr_abs_z = true;
+            next->constr_z = BEL_CARRY4;
+            prev = next;
+        }
+        ++chain_count;
+        cell_count += idx_in_chain + 1;
+    }
+    log_info("   Packed %d CARRY4 cells into %d chains (atomic).\n",
+             cell_count, chain_count);
+
+    // feed_through_lut() pushes newly-created LUT cells into new_cells
+    // (not ctx->cells).  Flush them in now so pack_luts (which runs after
+    // pack_carries and iterates ctx->cells) sees and xforms them to
+    // SLICE_LUTX; otherwise they survive as unplaceable LUT1 cells and
+    // the placer either hangs (HeAP) or asserts (SA).
+    flush_cells();
+
+    // Bus-style ports DI[i]/S[i]/O[i]/CO[i] -> chipdb pin names DIi/Si/Oi/COi.
+    // Also CI -> CIN per the chipdb's BEL pin naming.
+    std::unordered_map<IdString, XFormRule> c4_rules;
+    c4_rules[ctx->id("CARRY4")].new_type = ctx->id("CARRY4");
+    c4_rules[ctx->id("CARRY4")].port_xform[ctx->id("CI")] = ctx->id("CIN");
+    for (int i = 0; i < 4; i++) {
+        std::string is = std::to_string(i);
+        c4_rules[ctx->id("CARRY4")].port_xform[ctx->id("DI[" + is + "]")] = ctx->id("DI" + is);
+        c4_rules[ctx->id("CARRY4")].port_xform[ctx->id("S["  + is + "]")] = ctx->id("S"  + is);
+        c4_rules[ctx->id("CARRY4")].port_xform[ctx->id("O["  + is + "]")] = ctx->id("O"  + is);
+        c4_rules[ctx->id("CARRY4")].port_xform[ctx->id("CO[" + is + "]")] = ctx->id("CO" + is);
+    }
+    for (auto cell : sorted(ctx->cells)) {
+        CellInfo *ci = cell.second;
+        if (ci->type != ctx->id("CARRY4"))
+            continue;
+        xform_cell(c4_rules, ci);
+    }
+
+    // Any leftover MUXCY/XORCY in RTL (not part of CARRY4 chains) -> soft logic.
+    int remaining_muxcy = 0, remaining_xorcy = 0;
+    for (auto &cell : ctx->cells) {
+        if (cell.second->type == ctx->id("MUXCY"))
+            ++remaining_muxcy;
+        else if (cell.second->type == ctx->id("XORCY"))
+            ++remaining_xorcy;
+    }
+    std::unordered_map<IdString, XFormRule> softlogic_rules;
+    softlogic_rules[ctx->id("MUXCY")].new_type = ctx->id("LUT3");
+    softlogic_rules[ctx->id("MUXCY")].port_xform[ctx->id("DI")] = ctx->id("I0");
+    softlogic_rules[ctx->id("MUXCY")].port_xform[ctx->id("CI")] = ctx->id("I1");
+    softlogic_rules[ctx->id("MUXCY")].port_xform[ctx->id("S")]  = ctx->id("I2");
+    softlogic_rules[ctx->id("MUXCY")].set_params.emplace_back(ctx->id("INIT"), Property(0xCA));
+    softlogic_rules[ctx->id("XORCY")].new_type = ctx->id("LUT2");
+    softlogic_rules[ctx->id("XORCY")].port_xform[ctx->id("CI")] = ctx->id("I0");
+    softlogic_rules[ctx->id("XORCY")].port_xform[ctx->id("LI")] = ctx->id("I1");
+    softlogic_rules[ctx->id("XORCY")].set_params.emplace_back(ctx->id("INIT"), Property(0x6));
+    generic_xform(softlogic_rules, false);
+    if (remaining_muxcy || remaining_xorcy)
+        log_info("   Blasted %d non-chain MUXCYs and %d non-chain XORCYs to soft logic\n",
+                 remaining_muxcy, remaining_xorcy);
+}
+
 void XC7Packer::pack_carries()
 {
-    log_info("Packing carries..\n");
+    const char *legacy = std::getenv("XC7_LEGACY_CARRY4_SPLIT");
+    if (legacy == nullptr || legacy[0] == '0') {
+        pack_carries_atomic();
+        return;
+    }
+    log_info("Packing carries (legacy split + repack)..\n");
     split_carry4s();
     std::vector<CellInfo *> root_muxcys;
     // Find MUXCYs

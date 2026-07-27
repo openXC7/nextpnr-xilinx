@@ -423,14 +423,44 @@ void XilinxPacker::pack_dram()
 
                 packed_cells.insert(ci->name);
             }
+        } else if (cs.memtype == ctx->id("RAM128X1S") || cs.memtype == ctx->id("RAM256X1S")) {
+            // Single-port RAM 128/256 x 1.  Mirror of the SPO half of the
+            // RAM128X1D / RAM256X1D path: 2/4 RAMS64E cells (low 6 addr
+            // bits direct) feeding a MUXF7/MUXF8 tree driven by the high
+            // address bits.  prjxray has all the bits we need (SLICEM
+            // ALUT.RAM / WA7USED / WA8USED + MUXF7/F8 mux config); upstream
+            // pack_dram.cc just hadn't wired up the single-port case.
+            bool m256 = cs.memtype == ctx->id("RAM256X1S");
+            for (CellInfo *ci : group.second) {
+                auto init = get_or_default(ci->params, ctx->id("INIT"), Property(0, m256 ? 256 : 128));
+                std::vector<NetInfo *> o_pre;
+                int z = (height - 1);
+                NetInfo *o = get_net_or_empty(ci, ctx->id("O"));
+                disconnect_port(ctx, ci, ctx->id("O"));
+                std::vector<NetInfo *> addressw_64(cs.wa.begin(),
+                        cs.wa.begin() + std::min<size_t>(cs.wa.size(), 6));
+                std::vector<NetInfo *> addressw_high(cs.wa.begin() +
+                        std::min<size_t>(cs.wa.size(), 6), cs.wa.end());
+                CellInfo *base = nullptr;
+                for (int i = 0; i < (m256 ? 4 : 2); i++) {
+                    NetInfo *o_i = create_internal_net(ci->name, "O_" + std::to_string(i), false);
+                    CellInfo *spr = create_dram_lut(ci->name.str(ctx) + "/ADDR" + std::to_string(i),
+                            base, cs, addressw_64, get_net_or_empty(ci, ctx->id("D")), o_i, z);
+                    if (base == nullptr) base = spr;
+                    o_pre.push_back(o_i);
+                    spr->params[ctx->id("INIT")] = init.extract(i * 64, 64);
+                    z--;
+                }
+                create_muxf_tree(base, "O", o_pre, addressw_high, o,
+                        m256 ? 4 : (ctx->xc7 ? 2 : 6));
+                packed_cells.insert(ci->name);
+            }
         } else if (cs.memtype == ctx->id("RAMS32")
                 || cs.memtype == ctx->id("RAMD32")
                 || cs.memtype == ctx->id("RAMS64E")
                 || cs.memtype == ctx->id("RAMD64E")
                 || cs.memtype == ctx->id("RAM32X1S")
-                || cs.memtype == ctx->id("RAM64X1S")
-                || cs.memtype == ctx->id("RAM128X1S")
-                || cs.memtype == ctx->id("RAM256X1S")) {
+                || cs.memtype == ctx->id("RAM64X1S")) {
             log_error("Cannot pack unsupported primitive: %s\n", cs.memtype.c_str(ctx));
         }
     }
