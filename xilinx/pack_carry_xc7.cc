@@ -449,21 +449,33 @@ void XC7Packer::pack_carries_atomic()
                              ctx->nameOf(prev), z,
                              prev->attrs.count(ctx->id("BEL")) ?
                                prev->attrs.at(ctx->id("BEL")).as_string().c_str() : "NONE");
+                // A BEL-pinned child (imported placement) already has its z
+                // fixed by its BEL attr; adding an ABSOLUTE constr_z assumes the
+                // standard carry-slice z base (BEL_CARRY4 = 0xF), but some
+                // columns (X43 on xc7vx485t) encode the whole slice at 0x40|z
+                // (carry = 0x4F), so the abs-z distance is non-zero and the
+                // legaliser aborts ("constraint satisfaction check failed").
+                // Leave a pinned child's z UNCONSTR (its BEL binds it); only
+                // impose abs-z on nextpnr-inserted (un-pinned) feed-throughs.
                 if (s_lut) {
                     anchor->constr_children.push_back(s_lut);
                     s_lut->constr_parent = anchor;
                     s_lut->constr_x = 0;
                     s_lut->constr_y = anchor_y;
-                    s_lut->constr_abs_z = true;
-                    s_lut->constr_z = (z << 4 | BEL_6LUT);
+                    if (!s_lut->attrs.count(ctx->id("BEL"))) {
+                        s_lut->constr_abs_z = true;
+                        s_lut->constr_z = (z << 4 | BEL_6LUT);
+                    }
                 }
                 if (di_lut) {
                     anchor->constr_children.push_back(di_lut);
                     di_lut->constr_parent = anchor;
                     di_lut->constr_x = 0;
                     di_lut->constr_y = anchor_y;
-                    di_lut->constr_abs_z = true;
-                    di_lut->constr_z = (z << 4 | BEL_5LUT);
+                    if (!di_lut->attrs.count(ctx->id("BEL"))) {
+                        di_lut->constr_abs_z = true;
+                        di_lut->constr_z = (z << 4 | BEL_5LUT);
+                    }
                 }
 
                 // Co-locate the sum FF into this carry slice (Vivado's pattern
