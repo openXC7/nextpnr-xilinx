@@ -464,6 +464,45 @@ void XilinxPacker::pack_dram()
             log_error("Cannot pack unsupported primitive: %s\n", cs.memtype.c_str(ctx));
         }
     }
+    // Raw distributed-RAM leaf primitives (RAMD64E / RAMD32 / RAMS32),
+    // e.g. from an imported Vivado netlist where the Unisim Transform
+    // already decomposed RAM32M/RAM64M.  Reuse the same xform rules the
+    // macro path applies via create_dram_lut/create_dram32_lut.  The
+    // 5LUT-vs-6LUT variant for 32-bit cells is taken from the absolute
+    // BEL attribute when present (imported placements pin them anyway).
+    for (auto cell : sorted(ctx->cells)) {
+        CellInfo *ci = cell.second;
+        if (packed_cells.count(ci->name))
+            continue;
+        if (ci->type == ctx->id("RAMD64E")) {
+            xform_cell(dram_rules, ci);
+        } else if (ci->type == ctx->id("RAMD32") || ci->type == ctx->id("RAMS32")) {
+            bool is5 = false;
+            auto bel = ci->attrs.find(ctx->id("BEL"));
+            if (bel != ci->attrs.end() &&
+                bel->second.as_string().find("5LUT") != std::string::npos)
+                is5 = true;
+            if (ci->type == ctx->id("RAMS32")) {
+                // single-port: the slice write address is the read
+                // address -- mirror the ADR nets onto WADR before the
+                // xform so the WA pins are modelled like the macro path
+                for (int i = 0; i < 5; i++) {
+                    IdString adr = ctx->id("ADR" + std::to_string(i));
+                    IdString wadr = ctx->id("WADR" + std::to_string(i));
+                    NetInfo *a = get_net_or_empty(ci, adr);
+                    rename_port(ctx, ci, adr, ctx->id("RADR" + std::to_string(i)));
+                    if (a != nullptr) {
+                        ci->ports[wadr].name = wadr;
+                        ci->ports[wadr].type = PORT_IN;
+                        connect_port(ctx, a, ci, wadr);
+                    }
+                }
+                ci->type = ctx->id("RAMD32");
+            }
+            xform_cell(is5 ? dram32_5_rules : dram32_6_rules, ci);
+        }
+    }
+
     // Whole-SLICE DRAM
     for (auto cell : sorted(ctx->cells)) {
         CellInfo *ci = cell.second;
@@ -479,6 +518,22 @@ void XilinxPacker::pack_dram()
             dcs.wclk_inv = bool_or_default(ci->params, ctx->id("IS_WCLK_INVERTED"));
             CellInfo *base = nullptr;
             int zoffset = ctx->xc7 ? 0 : 4;
+            // Imported placement: a BEL attr on the RAM32M/RAM64M parent
+            // ("SITE/A6LUT") was silently DROPPED when the macro split into
+            // DPR subcells -- HeAP then floated the whole DRAM anywhere (an
+            // SVS-stamped RAM32M landed on a slice holding BEL-pinned FFs of
+            // a DIFFERENT clock; every input arc of that slice unroutable).
+            // Pin each subcell absolutely at the stamped site (leaf from its
+            // slot letter + 5/6LUT), and skip the relative-constraint chain
+            // for pinned parents (pinned cells must not be chain-constrained,
+            // cf. the carry import).
+            std::string dram_site;
+            if (ci->attrs.count(ctx->id("BEL"))) {
+                std::string b = ci->attrs.at(ctx->id("BEL")).as_string();
+                auto sl = b.find('/');
+                dram_site = (sl == std::string::npos) ? b : b.substr(0, sl);
+            }
+            bool pinned = !dram_site.empty();
             for (int i = 0; i < 4; i++) {
                 std::vector<NetInfo *> address;
                 for (int j = 0; j < abits; j++) {
@@ -489,8 +544,12 @@ void XilinxPacker::pack_dram()
                     NetInfo *dout = get_net_or_empty(ci, ctx->id(stringf("DO%c", 'A' + i)));
                     disconnect_port(ctx, ci, ctx->id(stringf("DI%c", 'A' + i)));
                     disconnect_port(ctx, ci, ctx->id(stringf("DO%c", 'A' + i)));
-                    CellInfo *dram = create_dram_lut(stringf("%s/DPR%d", ctx->nameOf(ci), i), base, dcs, address, di,
+                    CellInfo *dram = create_dram_lut(stringf("%s/DPR%d", ctx->nameOf(ci), i),
+                                                     pinned ? nullptr : base, dcs, address, di,
                                                      dout, zoffset + i);
+                    if (pinned)
+                        dram->attrs[ctx->id("BEL")] =
+                                stringf("%s/%c6LUT", dram_site.c_str(), 'A' + i);
                     if (base == nullptr)
                         base = dram;
                     if (ci->params.count(ctx->id(stringf("INIT_%c", 'A' + i))))
@@ -501,8 +560,12 @@ void XilinxPacker::pack_dram()
                         NetInfo *dout = get_net_or_empty(ci, ctx->id(stringf("DO%c[%d]", 'A' + i, j)));
                         disconnect_port(ctx, ci, ctx->id(stringf("DI%c[%d]", 'A' + i, j)));
                         disconnect_port(ctx, ci, ctx->id(stringf("DO%c[%d]", 'A' + i, j)));
-                        CellInfo *dram = create_dram32_lut(stringf("%s/DPR%d_%d", ctx->nameOf(ci), i, j), base, dcs,
+                        CellInfo *dram = create_dram32_lut(stringf("%s/DPR%d_%d", ctx->nameOf(ci), i, j),
+                                                           pinned ? nullptr : base, dcs,
                                                            address, di, dout, (j == 0), zoffset + i);
+                        if (pinned)
+                            dram->attrs[ctx->id("BEL")] =
+                                    stringf("%s/%c%cLUT", dram_site.c_str(), 'A' + i, (j == 0) ? '5' : '6');
                         if (base == nullptr)
                             base = dram;
                         if (ci->params.count(ctx->id(stringf("INIT_%c", 'A' + i)))) {

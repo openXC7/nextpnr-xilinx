@@ -216,8 +216,15 @@ struct Router2
             NetInfo *bound = ctx->getBoundWireNet(wire);
             if (bound != nullptr) {
                 pwd.bound_nets[bound->udata] = std::make_pair(1, bound->wires.at(wire).pip);
-                if (bound->wires.at(wire).strength > STRENGTH_STRONG)
-                    pwd.unavailable = true;
+                if (bound->wires.at(wire).strength > STRENGTH_STRONG) {
+                    // Hard-macro contract: a LOCKED wire (frozen macro routing
+                    // or clock spine) is RESERVED to its own net -- a keepout
+                    // for every other net, but still available to its owner so
+                    // router2 can complete that net's last-mile (site-pin hops
+                    // Vivado's PIP list omits) itself, deterministically, using
+                    // a real maze route instead of an external BFS guess.
+                    pwd.reserved_net = bound->udata;
+                }
             }
 
             ArcBounds wire_loc = ctx->getRouteBoundingBox(wire, wire);
@@ -310,6 +317,15 @@ struct Router2
     void bind_pip_internal(NetInfo *net, size_t user, int wire, PipId pip)
     {
         auto &b = flat_wires.at(wire).bound_nets[net->udata];
+        if (b.first >= 1 && b.second != pip) {
+            // Frozen-macro / reserved-net contract: this wire already carries
+            // this net via its LOCKED driver pip (bound by applyFixedRoutes),
+            // and router2's last-mile maze re-approached it from the sink side
+            // with a different pip.  A wire has exactly one driver, so the
+            // pre-existing LOCKED pip is authoritative -- keep it and do NOT
+            // add a conflicting second driver (the historic NPNR_ASSERT).
+            return;
+        }
         ++b.first;
         if (b.first == 1) {
             b.second = pip;
@@ -338,6 +354,11 @@ struct Router2
             auto &wd = wire_data(cursor);
             PipId pip = wd.bound_nets.at(net->udata).second;
             unbind_pip_internal(net, user, cursor);
+            // Constant (GND/VCC) arcs are sourced from a per-tile pseudo wire, not the
+            // net's global src_wire, so the route ends at a PipId() source -- stop there
+            // rather than walking off the end (getPipSrcWire(PipId()) is invalid).
+            if (pip == PipId())
+                break;
             cursor = ctx->getPipSrcWire(pip);
         }
         ad.routed = false;
@@ -433,12 +454,18 @@ struct Router2
         WireId sink = ctx->getNetinfoSinkWire(net, net->users.at(i));
         if (sink == WireId())
             return false;
+        // an arc already completed by locked routing (fixed-routes) needs no
+        // reservation -- and walking its locked corridor here can oscillate
+        // reserved_net against other locked nets, hanging the outer fixpoint
+        if (ctx->getBoundWireNet(sink) == net)
+            return false;
         pool<WireId> rsv;
         WireId cursor = sink;
         bool done = false;
+        int hops = 0;
         if (ctx->debug)
             log("reserving wires for arc %d of net %s\n", int(i), ctx->nameOf(net));
-        while (!done) {
+        while (!done && hops++ < 100) {
             auto &wd = wire_data(cursor);
             if (ctx->debug)
                 log("      %s\n", ctx->nameOfWire(cursor));
@@ -466,8 +493,12 @@ struct Router2
 
     void find_all_reserved_wires()
     {
-        // Run iteratively, as reserving wires for one net might limit choices for another
+        // Run iteratively, as reserving wires for one net might limit choices
+        // for another.  Cap the fixpoint: overlapping single-path corridors
+        // (dense LOCKED routing) can flip reserved_net between two nets
+        // forever otherwise.
         bool did_something = false;
+        int iters = 0;
         do {
             did_something = false;
             for (auto net : nets_by_udata) {
@@ -477,7 +508,7 @@ struct Router2
                 for (size_t i = 0; i < net->users.size(); i++)
                     did_something |= reserve_wires_for_arc(net, i);
             }
-        } while (did_something);
+        } while (did_something && ++iters < 5);
     }
 
     void reset_wires(ThreadContext &t)
@@ -520,8 +551,21 @@ struct Router2
         else
             NPNR_ASSERT(net->name == ctx->id("$PACKER_GND_NET"));
 
-        for (int allowed_cong = 0; allowed_cong < 10; allowed_cong++) {
+        // Source the constant from the NEAREST pseudo-constant wire (cf. router1's
+        // route_const_arc).  The bounded passes are cheap (small per-pass budget)
+        // and try to find a path within increasing congestion limits; the FINAL
+        // pass allows ARBITRARY overuse so a path is ALWAYS found (the pseudo
+        // network is reachable ignoring congestion) -- any overuse is then resolved
+        // by the negotiated-congestion main loop, exactly like router1's ripup pass.
+        // Previously all 10 passes were allowed 5e6 backward steps, so a single
+        // hard sink on the high-fanout GND net scanned the whole chip ~10x and the
+        // router effectively hung.
+        const int kCongSteps = 3; // passes 0..2 bounded, pass 3 unbounded
+        for (int allowed_cong = 0; allowed_cong <= kCongSteps; allowed_cong++) {
+            bool unbounded = (allowed_cong == kCongSteps);
+            backwards_limit = unbounded ? 5000000 : 200000;
             backwards_iter = 0;
+            int found_src = -1; // wire index of the pseudo-constant source we bind from
             if (!t.backwards_queue.empty()) {
                 std::queue<int> new_queue;
                 t.backwards_queue.swap(new_queue);
@@ -539,7 +583,7 @@ struct Router2
                     int cursor2 = cursor;
                     bool bwd_merge_fail = false;
                     while (flat_wires.at(cursor2).bound_nets.count(net->udata)) {
-                        if (int(flat_wires.at(cursor2).bound_nets.size()) > (allowed_cong + 1)) {
+                        if (!unbounded && int(flat_wires.at(cursor2).bound_nets.size()) > (allowed_cong + 1)) {
                             bwd_merge_fail = true;
                             break;
                         }
@@ -566,31 +610,19 @@ struct Router2
                 log("   explore %s\n", ctx->nameOfWire(cwd.w));
 #endif
                 if (ctx->wireIntent(cwd.w) == (const_val ? ID_PSEUDO_VCC : ID_PSEUDO_GND)) {
-#if 0
-                    log("    Hit global network at %s\n", ctx->nameOfWire(cwd.w));
-#endif
-                    // We've hit the constant pseudo-network, continue from here
-                    int cursor2 = cursor;
-                    while (cursor2 != src_wire_idx) {
-                        auto &c2wd = flat_wires.at(cursor2);
-                        bool found = false;
-                        for (auto p : ctx->getPipsUphill(c2wd.w)) {
-                            if (!ctx->checkPipAvail(p) && ctx->getBoundPipNet(p) != net)
-                                continue;
-                            WireId src = ctx->getPipSrcWire(p);
-                            if (ctx->wireIntent(src) != (const_val ? ID_PSEUDO_VCC : ID_PSEUDO_GND))
-                                continue;
-                            if (is_wire_undriveable(src, net))
-                                continue;
-                            cursor2 = wire_to_idx.at(src);
-                            set_visited(t, cursor2, p, WireScore());
-                            found = true;
-                            break;
-                        }
-                        if (!found)
-                            log_error("Invalid global constant node '%s'\n", ctx->nameOfWire(c2wd.w));
-                    }
-
+                    // Hit the constant pseudo-network.  On xc7 the per-tile GND_WIRE /
+                    // VCC_WIRE pseudo wires are *leaf sources* (they have no uphill pips
+                    // to a single global driver), so this wire IS the route source -- bind
+                    // the arc from here, exactly as router1's route_const_arc does (and
+                    // whose FASM round-trips through fasm2frames).
+                    //
+                    // The old code instead walked the pseudo-network "up to src_wire_idx",
+                    // calling is_wire_undriveable() (which scans a pseudo wire's hundreds
+                    // of BEL pins) on every candidate; on the high-fanout GND net a single
+                    // sink never finished one walk step -> the router hung.  ripup_arc() is
+                    // adjusted to stop at a PipId() source so per-arc pseudo sources rip up
+                    // cleanly.
+                    found_src = cursor;
                     break;
                 }
 #if 0
@@ -604,7 +636,11 @@ struct Router2
                 bool did_something = false;
                 for (auto uh : ctx->getPipsUphill(flat_wires[cursor].w)) {
                     did_something = true;
-                    if (!ctx->checkPipAvail(uh) && ctx->getBoundPipNet(uh) != net)
+                    // Bounded passes only use available pips; the final unbounded pass may
+                    // traverse pips bound to other nets (like router1's ripup pass) so a
+                    // pseudo-constant source is always reachable -- the resulting overuse
+                    // is resolved by the negotiated-congestion main loop.
+                    if (!unbounded && !ctx->checkPipAvail(uh) && ctx->getBoundPipNet(uh) != net)
                         continue;
                     if (cpip != PipId() && cpip != uh)
                         continue; // don't allow multiple pips driving a wire with a net
@@ -614,11 +650,11 @@ struct Router2
                     auto &wd = flat_wires[next];
                     if (wd.unavailable)
                         continue;
-                    if (wd.reserved_net != -1 && wd.reserved_net != net->udata)
-                        continue;
-                    if (int(wd.bound_nets.size()) > (allowed_cong + 1) ||
-                        (allowed_cong == 0 && wd.bound_nets.size() == 1 && !wd.bound_nets.count(net->udata)))
-                        continue; // never allow congestion in backwards routing
+                    if (!unbounded && wd.reserved_net != -1 && wd.reserved_net != net->udata)
+                        continue; // final pass ignores reservations too (cf. router1 ripup)
+                    if (!unbounded && (int(wd.bound_nets.size()) > (allowed_cong + 1) ||
+                        (allowed_cong == 0 && wd.bound_nets.size() == 1 && !wd.bound_nets.count(net->udata))))
+                        continue; // bounded passes avoid congestion; final pass allows any
                     t.backwards_queue.push(next);
                     set_visited(t, next, uh, WireScore());
                 }
@@ -626,10 +662,13 @@ struct Router2
                     ++backwards_iter;
             }
             int dst_wire_idx = wire_to_idx.at(dst_wire);
-            if (was_visited(src_wire_idx)) {
+            // Bind from the pseudo-constant wire we hit (found_src); fall back to the net
+            // source for the rare case the backward search reached it directly.
+            int bind_src = (found_src >= 0) ? found_src : (was_visited(src_wire_idx) ? src_wire_idx : -1);
+            if (bind_src >= 0) {
                 ROUTE_LOG_DBG("   Routed (backwards): ");
-                int cursor_fwd = src_wire_idx;
-                bind_pip_internal(net, i, src_wire_idx, PipId());
+                int cursor_fwd = bind_src;
+                bind_pip_internal(net, i, bind_src, PipId());
                 while (was_visited(cursor_fwd)) {
                     auto &v = flat_wires.at(cursor_fwd).visit;
                     cursor_fwd = wire_to_idx.at(ctx->getPipDstWire(v.pip));
@@ -804,7 +843,19 @@ struct Router2
         // because there is not route, rather than just because the toexplore
         // heuristic is incorrect.
         bool must_drain_queue = !is_bb;
-        while (!t.queue.empty() && (must_drain_queue || iter < toexplore)) {
+        // NEXTPNR_ARC_MAX_VISIT: hard cap on wires explored PER ARC, applied even
+        // in no-BB (must_drain_queue) mode.  Without it, a genuinely-unroutable
+        // arc drains the whole device graph before failing -- with hundreds of
+        // failing arcs (e.g. a bad clock-buffer placement) a SKIP_FAILED_ARCS
+        // diagnostic route takes HOURS just to enumerate the failures.  Bounding
+        // it makes a failing arc give up in ms, so the full skip list appears in
+        // minutes.  0/unset = unbounded (old behaviour).
+        static const int arc_max_visit = []{
+            const char *v = getenv("NEXTPNR_ARC_MAX_VISIT");
+            return v ? atoi(v) : 0;
+        }();
+        while (!t.queue.empty() && (must_drain_queue || iter < toexplore)
+               && (arc_max_visit <= 0 || iter < arc_max_visit)) {
             auto curr = t.queue.top();
             auto &d = flat_wires.at(curr.wire);
             t.queue.pop();
@@ -946,10 +997,22 @@ struct Router2
                                   int(i), ctx->nameOf(net));
                     auto res2 = route_arc(t, net, i, is_mt, false);
                     // If this also fails, no choice but to give up
-                    if (res2 != ARC_SUCCESS)
-                        log_error("Failed to route arc %d of net '%s', from %s to %s.\n", int(i), ctx->nameOf(net),
-                                  ctx->nameOfWire(ctx->getNetinfoSourceWire(net)),
-                                  ctx->nameOfWire(ctx->getNetinfoSinkWire(net, net->users.at(i))));
+                    if (res2 != ARC_SUCCESS) {
+                        // NEXTPNR_SKIP_FAILED_ARCS: for DEBUG/visualisation only --
+                        // leave this arc unrouted and keep going, so we can --write a
+                        // partially-routed json and import it into Vivado (json2dcp)
+                        // to inspect the congestion instead of aborting the run.
+                        if (getenv("NEXTPNR_SKIP_FAILED_ARCS")) {
+                            log_warning("SKIP_FAILED_ARCS: failed to route arc %d of net '%s' (%s -> %s); leaving "
+                                        "unrouted.\n",
+                                        int(i), ctx->nameOf(net), ctx->nameOfWire(ctx->getNetinfoSourceWire(net)),
+                                        ctx->nameOfWire(ctx->getNetinfoSinkWire(net, net->users.at(i))));
+                            have_failures = true;
+                        } else
+                            log_error("Failed to route arc %d of net '%s', from %s to %s.\n", int(i),
+                                      ctx->nameOf(net), ctx->nameOfWire(ctx->getNetinfoSourceWire(net)),
+                                      ctx->nameOfWire(ctx->getNetinfoSinkWire(net, net->users.at(i))));
+                    }
                 }
             }
         }
@@ -1084,6 +1147,10 @@ struct Router2
             if (net->is_global)
                 continue;
 #endif
+            // Constant nets are deliberately left unrouted by router2 (routed by the
+            // final router1 route_const_arc pass), so there is nothing to bind here.
+            if (net->name == ctx->id("$PACKER_GND_NET") || net->name == ctx->id("$PACKER_VCC_NET"))
+                continue;
             // Ripup wires and pips used by the net in nextpnr's structures
             net_wires.clear();
             for (auto &w : net->wires) {
@@ -1337,8 +1404,34 @@ struct Router2
         ThreadContext st;
         int iter = 1;
 
-        for (size_t i = 0; i < nets_by_udata.size(); i++)
+        // Bounded termination: the negotiated-congestion loop otherwise spins forever
+        // when a placement is unroutable (overuse never reaches 0).  Give up loudly if
+        // overuse stops improving for too long, or a hard iteration cap is hit, instead
+        // of relying on an external wall-clock timeout.  Both are env-overridable.
+        int best_overuse = 1 << 30;
+        int stall_iters = 0;
+        int max_stall = 50;
+        int max_iter = 600;
+        if (const char *e = getenv("NEXTPNR_ROUTER2_MAX_STALL"))
+            max_stall = atoi(e);
+        if (const char *e = getenv("NEXTPNR_ROUTER2_MAX_ITER"))
+            max_iter = atoi(e);
+
+        // Hybrid GND/VCC strategy: do NOT route the constant nets in router2.  Their
+        // sinks (e.g. const-tied CARRY4 DI inputs) compete with high-fanout signal nets
+        // for the same scarce SLICE bypass wires, and because the pseudo-constant router
+        // does not negotiate congestion that contention never clears (router2 stalls a
+        // few overused wires short of done).  Instead let router2's negotiated-congestion
+        // loop route the *signal* nets to completion (they converge once GND is not
+        // stealing bypasses), then the final router1 pass lays GND/VCC down with its
+        // per-sink nearest-pseudo-source router (route_const_arc), which shares pseudo
+        // wires freely and routes around the finished signal network.
+        for (size_t i = 0; i < nets_by_udata.size(); i++) {
+            NetInfo *ni = nets_by_udata[i];
+            if (ni->name == ctx->id("$PACKER_GND_NET") || ni->name == ctx->id("$PACKER_VCC_NET"))
+                continue;
             route_queue.push_back(i);
+        }
 
         timing_driven = ctx->setting<bool>("timing_driven");
         log_info("Running main router loop...\n");
@@ -1395,6 +1488,35 @@ struct Router2
             ++iter;
             if (curr_cong_weight < 1e9)
                 curr_cong_weight += cfg.curr_cong_mult;
+            // Stall / cap detection (fail loud rather than loop forever)
+            if (overused_wires < best_overuse) {
+                best_overuse = overused_wires;
+                stall_iters = 0;
+            } else {
+                ++stall_iters;
+            }
+            if (!failed_nets.empty() && (iter > max_iter || stall_iters >= max_stall)) {
+                for (auto &wire : flat_wires) {
+                    if (int(wire.bound_nets.size()) <= 1)
+                        continue;
+                    log_info("overused wire %s (%d nets):\n", ctx->nameOfWire(wire.w),
+                             int(wire.bound_nets.size()));
+                    for (auto &bound : wire.bound_nets)
+                        log_info("    net %s\n", nets_by_udata.at(bound.first)->name.c_str(ctx));
+                }
+                // NEXTPNR_SKIP_FAILED_ARCS: accept the partial route (overuse + any
+                // unroutable arcs) and fall through to --write, for Vivado inspection.
+                if (getenv("NEXTPNR_SKIP_FAILED_ARCS")) {
+                    log_warning("router2: SKIP_FAILED_ARCS - accepting partial route with %d overused wire(s) after "
+                                "%d iterations; %d net(s) left with unrouted arcs.\n",
+                                overused_wires, iter - 1, int(failed_nets.size()));
+                    break;
+                }
+                log_error("router2: failed to converge - %d overused wire(s) after %d iterations "
+                          "(no improvement for %d); design is unroutable in this placement "
+                          "(try a different --seed or placement).\n",
+                          overused_wires, iter - 1, stall_iters);
+            }
         } while (!failed_nets.empty());
         if (cfg.perf_profile) {
             std::vector<std::pair<int, IdString>> nets_by_runtime;
@@ -1412,9 +1534,19 @@ struct Router2
         auto rend = std::chrono::high_resolution_clock::now();
         log_info("Router2 time %.02fs\n", std::chrono::duration<float>(rend - rstart).count());
 
-        log_info("Running router1 to check that route is legal...\n");
-
-        router1(ctx, Router1Cfg(ctx));
+        // router2 has converged to a legal route (the loop above exits only
+        // at overused==0 && archfail==0).  The historical "re-route with
+        // router1 to double-check" pass is both redundant AND destructive on
+        // a large imported-placement design: router1 rips up router2's result
+        // and re-routes from scratch with weaker congestion negotiation, then
+        // dies on a net router2 had already routed cleanly ("Failed to find a
+        // route for arc ... 3184 arcs still pending") -- aborting BEFORE the
+        // FASM is written, so the emitted bitstream is stale.  Skip it by
+        // default; set NPNR_ROUTER1_RECHECK to opt back in.
+        if (getenv("NPNR_ROUTER1_RECHECK")) {
+            log_info("Running router1 to check that route is legal...\n");
+            router1(ctx, Router1Cfg(ctx));
+        }
     }
 };
 } // namespace

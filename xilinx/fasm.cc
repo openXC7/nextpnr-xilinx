@@ -158,7 +158,14 @@ struct FasmBackend
                                };
                     pp_config[{ ctx->id(s + "IOI3" + s2),
                                 ctx->id("IOI_ILOGIC" + i + "_O"), ctx->id(s + "IOI_ILOGIC" + i + "_D") }] = {
+                                     // full ILOGIC pass-through config (golden):
+                                     // IDELMUXE3.P1 selects the direct D path;
+                                     // without it the routethru never propagates
                                      "IDELAY_Y" + i + ".IDELAY_TYPE_FIXED",
+                                     "ILOGIC_Y" + i + ".IDELMUXE3.P1",
+                                     "ILOGIC_Y" + i + ".IFF.SRTYPE.ASYNC",
+                                     "ILOGIC_Y" + i + ".ISERDES.MODE.MASTER",
+                                     "ILOGIC_Y" + i + ".ISERDES.NUM_CE.N1",
                                      "ILOGIC_Y" + i + ".ZINV_D"
                                 };
                     pp_config[{ ctx->id(s + "IOI3" + s2),
@@ -200,6 +207,14 @@ struct FasmBackend
                             };
                 pp_config[{ ctx->id("RIOI" + s2),
                             ctx->id("IOI_ILOGIC" + i + "_O"), ctx->id("RIOI_ILOGIC" + i + "_D") }] = {
+                                // full ILOGIC pass-through config (golden, HW-
+                                // proven on the VC707 sysclk clock-capable
+                                // input): IDELMUXE3.P1 = direct D path
+                                "IDELAY_Y" + i + ".IDELAY_TYPE_FIXED",
+                                "ILOGIC_Y" + i + ".IDELMUXE3.P1",
+                                "ILOGIC_Y" + i + ".IFF.SRTYPE.ASYNC",
+                                "ILOGIC_Y" + i + ".ISERDES.MODE.MASTER",
+                                "ILOGIC_Y" + i + ".ISERDES.NUM_CE.N1",
                                 "ILOGIC_Y" + i + ".ZINV_D"
                             };
                 pp_config[{ ctx->id("RIOI" + s2),
@@ -221,6 +236,56 @@ struct FasmBackend
                     pp_config[{ctx->id("RIOB18" + s2), ctx->id("IOB_T_IN1"),     ctx->id("IOB_T_OUT0")}]  = {};
                     pp_config[{ctx->id("RIOB18" + s2), ctx->id("IOB_T_OUT0"),    ctx->id("IOB_T0")}]      = {};
                     pp_config[{ctx->id("RIOB18" + s2), ctx->id("IOB_DIFFI_IN0"), ctx->id("IOB_PADOUT1")}] = {};
+                }
+        }
+
+        // === #102 LIOI mirror — left-side IOI tiles (LIOI, LIOI_SING,
+        // LIOI_TBYTESRC, LIOI_TBYTETERM) carry the same OLOGIC / ILOGIC
+        // pass-through PIP set as RIOI; without these entries nextpnr
+        // emits "Unprocessed route-thru" warnings and the OBUFs on the
+        // VC707 LED bank end up with stuck-high outputs because the
+        // OLOGIC OQ register sits at its default state.  prjxray's
+        // segbits_lioi.db has full OLOGIC coverage (word_bit addresses
+        // match RIOI 1:1) so re-using the same FASM feature names
+        // assembles correctly.
+        for (std::string s2 : {"", "_TBYTESRC", "_TBYTETERM", "_SING"})
+            for (std::string i :
+                 (s2 == "_SING") ? std::vector<std::string>{"0"     }
+                                 : std::vector<std::string>{"0", "1"}) {
+                pp_config[{ ctx->id("LIOI" + s2),
+                            ctx->id("LIOI_OLOGIC" + i + "_OQ"), ctx->id("IOI_OLOGIC" + i + "_D1") }] = {
+                                "OLOGIC_Y" + i + ".OMUX.D1",
+                                "OLOGIC_Y" + i + ".OQUSED",
+                                "OLOGIC_Y" + i + ".OSERDES.DATA_RATE_TQ.BUF"
+                            };
+                pp_config[{ ctx->id("LIOI" + s2),
+                            ctx->id("LIOI_OLOGIC" + i + "_OFB"), ctx->id("LIOI_OLOGIC" + i + "_OQ") }] = { };
+                pp_config[{ ctx->id("LIOI" + s2),
+                            ctx->id("LIOI_O" + i), ctx->id("LIOI_ODELAY" + i + "_DATAOUT") }] = { };
+                pp_config[{ ctx->id("LIOI" + s2),
+                            ctx->id("LIOI_OLOGIC" + i + "_OFB"), ctx->id("IOI_OLOGIC" + i + "_D1") }] = {
+                                "OLOGIC_Y" + i + ".OMUX.D1",
+                                "OLOGIC_Y" + i + ".OSERDES.DATA_RATE_TQ.BUF"
+                            };
+                pp_config[{ ctx->id("LIOI" + s2),
+                            ctx->id("IOI_ILOGIC" + i + "_O"), ctx->id("LIOI_ILOGIC" + i + "_D") }] = {
+                                "ILOGIC_Y" + i + ".ZINV_D"
+                            };
+                pp_config[{ ctx->id("LIOI" + s2),
+                            ctx->id("IOI_ILOGIC" + i + "_O"), ctx->id("LIOI_ILOGIC" + i + "_DDLY") }] = {
+                                "ILOGIC_Y" + i + ".IDELMUXE3.P0",
+                                "ILOGIC_Y" + i + ".ZINV_D"
+                            };
+                pp_config[{ ctx->id("LIOI" + s2),
+                            ctx->id("LIOI_OLOGIC" + i + "_TQ"), ctx->id("IOI_OLOGIC" + i + "_T1") }] = {
+                                "OLOGIC_Y" + i + ".ZINV_T1"
+                            };
+                if (i == "0") {
+                    pp_config[{ctx->id("LIOB18" + s2), ctx->id("IOB_O_IN1"),     ctx->id("IOB_O_OUT0")}]  = {};
+                    pp_config[{ctx->id("LIOB18" + s2), ctx->id("IOB_O_OUT0"),    ctx->id("IOB_O0")}]      = {};
+                    pp_config[{ctx->id("LIOB18" + s2), ctx->id("IOB_T_IN1"),     ctx->id("IOB_T_OUT0")}]  = {};
+                    pp_config[{ctx->id("LIOB18" + s2), ctx->id("IOB_T_OUT0"),    ctx->id("IOB_T0")}]      = {};
+                    pp_config[{ctx->id("LIOB18" + s2), ctx->id("IOB_DIFFI_IN0"), ctx->id("IOB_PADOUT1")}] = {};
                 }
         }
 
@@ -587,11 +652,19 @@ struct FasmBackend
         bool is_srused  = false;
         bool is_ceused  = false;
 
+// Name the offender instead of dying with a bare assert: a half-slice where
+// two FFs disagree on a shared control-set setting (CE/SR/CLKINV/latch/sync)
+// is a placement control-set violation, and the cell/bel/tile names are what
+// you need to trace it back to the placer or an imported stamp.
 #define SET_CHECK(dst, src)                                                                                            \
     do {                                                                                                               \
-        if (found_ff)                                                                                                  \
-            NPNR_ASSERT(dst == (src));                                                                                 \
-        else                                                                                                           \
+        if (found_ff) {                                                                                                \
+            if (dst != (src))                                                                                          \
+                log_error("FASM: FF '%s' (type %s) at bel %s disagrees with its half-slice on '%s' "                   \
+                          "(tile %s) -- control-set contention in the placement\n",                                    \
+                          ff->name.c_str(ctx), type.c_str(), ctx->getBelName(ff->bel).c_str(ctx), #dst,                \
+                          tname.c_str());                                                                              \
+        } else                                                                                                         \
             dst = (src);                                                                                               \
     } while (0)
 
@@ -613,9 +686,17 @@ struct FasmBackend
                     continue;
                 push(get_bel_name(ff->bel));
                 bool zrst = false, zinit = false;
-                zinit = (int_or_default(ff->params, ctx->id("INIT"), 0) != 1);
                 IdString srsig;
                 std::string type = str_or_default(ff->attrs, ctx->id("X_ORIG_TYPE"), "");
+                // Vivado write_verilog omits parameters at their primitive
+                // default, so a bare FDSE/FDPE arrives with NO INIT param --
+                // and their primitive default is INIT=1 (FDRE/FDCE default 0).
+                // A hardcoded 0 default set ZINI (init=0) on every set/preset
+                // FF, breaking reset synchronizers and INIT=1 startup FSMs
+                // (PCS/PMA gmii_rst_sync, GT TX startup) at configuration.
+                int def_init = (type == "FDSE" || type == "FDSE_1" ||
+                                type == "FDPE" || type == "FDPE_1") ? 1 : 0;
+                zinit = (int_or_default(ff->params, ctx->id("INIT"), def_init) != 1);
                 if (type == "FDRE") {
                     zrst = true;
                     SET_CHECK(negedge_ff, false);
@@ -779,7 +860,38 @@ struct FasmBackend
                 write_bit("SRL", is_srl);
                 pop();
             }
-            write_routing_bel(get_site_wire(bel_in_half, std::string("") + ("ABCD"[i]) + std::string("MUX")));
+            WireId xmux = get_site_wire(bel_in_half, std::string("") + ("ABCD"[i]) + std::string("MUX"));
+            write_routing_bel(xmux);
+            // Slice combinational output mux (xOUTMUX).  write_routing_bel emits
+            // it when the O6/O5->xMUX selection is a bound pip — but when the
+            // same LUT O6 also drives the local FF, the FFMUX binding from that
+            // O6 shadows the OUTMUX site-pip, so nothing is emitted and the
+            // fabric fanout (e.g. a clock-enable network) is left unconfigured.
+            // Emit the selection explicitly when the xMUX wire carries a LUT
+            // output but no uphill pip was emitted above.
+            if (xmux != WireId()) {
+                NetInfo *xnet = ctx->getBoundWireNet(xmux);
+                if (xnet != nullptr) {
+                    bool pip_emitted = false;
+                    for (auto pip : ctx->getPipsUphill(xmux))
+                        if (ctx->getBoundPipNet(pip) != nullptr) {
+                            pip_emitted = true;
+                            break;
+                        }
+                    if (!pip_emitted) {
+                        const char *sel = nullptr;
+                        if (lut6 != nullptr && lut6->lutInfo.output_sigs[0] == xnet)
+                            sel = "O6";
+                        else if (lut6 != nullptr && lut6->lutInfo.output_count == 2 &&
+                                 lut6->lutInfo.output_sigs[1] == xnet)
+                            sel = "O5";
+                        else if (lut5 != nullptr && lut5->lutInfo.output_sigs[0] == xnet)
+                            sel = "O5";
+                        if (sel != nullptr)
+                            write_bit(std::string("") + ("ABCD"[i]) + "OUTMUX." + sel);
+                    }
+                }
+            }
         }
         write_bit("WA7USED", wa7_used);
         write_bit("WA8USED", wa8_used);
@@ -805,9 +917,52 @@ struct FasmBackend
         push(tname);
         push(get_half_name(half, is_mtile));
 
-        write_routing_bel(get_site_wire(carry->bel, "PRECYINIT_OUT"));
-        if (get_net_or_empty(carry, ctx->id("CIN")) != nullptr)
-            write_bit("PRECYINIT.CIN");
+        // Select the CARRY4 carry-in source.  PRECYINIT.CIN takes the carry
+        // chain input (the slice below's CO), which only makes sense mid-chain
+        // and requires that wire to be physically driven.  At a chain ROOT the
+        // carry-in is a constant: nextpnr ties both CIN and CYINIT to
+        // $PACKER_GND_NET / $PACKER_VCC_NET.  Emitting PRECYINIT.CIN there made
+        // the carry-in depend on routing the GND/VCC pseudo-net into the slice
+        // (the "arc 38 of $PACKER_GND_NET" gap) — when that route fails the
+        // carry-in floats and the whole adder/incrementer is dead.  Vivado
+        // instead generates the constant locally via PRECYINIT.C0/.C1.  Do the
+        // same: only a real (non-constant) CIN net selects .CIN.
+        {
+            NetInfo *cin    = get_net_or_empty(carry, ctx->id("CIN"));
+            NetInfo *cyinit = get_net_or_empty(carry, ctx->id("CYINIT"));
+            IdString gnd = ctx->id("$PACKER_GND_NET");
+            IdString vcc = ctx->id("$PACKER_VCC_NET");
+            bool cin_is_chain  = cin    != nullptr && cin->name    != gnd && cin->name != vcc;
+            bool cyinit_is_dyn = cyinit != nullptr && cyinit->name != gnd && cyinit->name != vcc;
+            // The carry packer disconnects a constant carry-in and records its
+            // value here, so router2 needn't route GND/VCC into CIN/CYINIT.
+            int precyinit_const = int_or_default(carry->params, ctx->id("PRECYINIT_CONST"), -1);
+            if (precyinit_const >= 0) {
+                write_bit(precyinit_const ? "PRECYINIT.C1" : "PRECYINIT.C0");
+            } else if (cin_is_chain) {
+                // Mid-chain CARRY4: carry-in is the slice-below CO via the CIN
+                // cascade.  Select it explicitly; do NOT emit the PRECYINIT_OUT
+                // routing bel — when nextpnr has also routed the (unused) CYINIT
+                // via the AX path, that routing bel emits a PRECYINIT.AX bit
+                // whose segbits conflict with PRECYINIT.CIN (FasmInconsistentBits).
+                write_bit("PRECYINIT.CIN");
+            } else if (cyinit_is_dyn) {
+                // Chain root with a *dynamic* carry-in: CYINIT is driven by a
+                // real net, routed in via the AX pin.  Emit the PRECYINIT_OUT
+                // routing bel, which selects PRECYINIT.AX.  (Forcing C0/C1 here
+                // would tie the carry-in to a constant and break the adder.)
+                write_routing_bel(get_site_wire(carry->bel, "PRECYINIT_OUT"));
+            } else {
+                // Constant carry-in: the PRECYINIT mux selects C0/C1 directly
+                // (no routing bel -> no conflicting AX bit).  Take the value
+                // from CYINIT (preferred) or a constant CIN: VCC -> C1, else C0.
+                NetInfo *konst = cyinit != nullptr ? cyinit : cin;
+                if (konst != nullptr && konst->name == vcc)
+                    write_bit("PRECYINIT.C1");
+                else
+                    write_bit("PRECYINIT.C0");
+            }
+        }
         push("CARRY4");
         for (char c : {'A', 'B', 'C', 'D'})
             write_routing_bel(get_site_wire(carry->bel, std::string("") + c + std::string("CY0_OUT")));
@@ -856,6 +1011,43 @@ struct FasmBackend
 
     std::unordered_map<int, BankIoConfig> ioconfig_by_hclk;
 
+    // tile -> the PAD cell at each in-tile IOB site row (index 0/1 = getSiteLocInTile.y)
+    std::unordered_map<int, std::array<CellInfo *, 2>> pads_by_tile_;
+    bool pads_map_built_ = false;
+    void build_pads_map()
+    {
+        for (auto &cell : ctx->cells) {
+            CellInfo *ci = cell.second.get();
+            if (ci->type == ctx->id("PAD") && ci->bel != BelId()) {
+                Loc l = ctx->getSiteLocInTile(ci->bel);
+                if (l.y == 0 || l.y == 1)
+                    pads_by_tile_[ci->bel.tile][l.y] = ci;
+            }
+        }
+        pads_map_built_ = true;
+    }
+    // Is the PARTNER IOB in this pad's tile (the other in-tile site) an active
+    // OUTPUT?  A single-ended LEFT-HP input on the slave site normally receives
+    // through the MASTER half's differential amplifier (partner LVDS.IN bits);
+    // if the master is driving an output that amplifier is unavailable and the
+    // partner LVDS.IN + PULLDOWN collide with the output's DRIVE bits
+    // (FasmInconsistentBits at fasm2frames).  In that case use a plain LVCMOS
+    // input instead and emit nothing on the partner.
+    bool partner_is_output(CellInfo *pad)
+    {
+        if (!pads_map_built_)
+            build_pads_map();
+        Loc l = ctx->getSiteLocInTile(pad->bel);
+        auto it = pads_by_tile_.find(pad->bel.tile);
+        if (it == pads_by_tile_.end())
+            return false;
+        CellInfo *partner = it->second[1 - l.y];
+        if (partner == nullptr)
+            return false;
+        NetInfo *pn = get_net_or_empty(partner, ctx->id("PAD"));
+        return pn != nullptr && pn->driver.cell != nullptr;
+    }
+
     void write_io_config(CellInfo *pad)
     {
         NetInfo *pad_net = get_net_or_empty(pad, ctx->id("PAD"));
@@ -896,8 +1088,13 @@ struct FasmBackend
         bool is_tmds33 = iostandard == "TMDS_33";
         bool is_lvds25 = iostandard == "LVDS_25";
         bool is_lvds = boost::starts_with(iostandard, "LVDS");
-        bool only_diff = is_tmds33 || is_lvds;
-        bool is_diff = only_diff || has_diff_prefix;
+        // ONLY_DIFF_IN_USE is an HR-bank (IOB33) row bit for LVDS_25 /
+        // TMDS_33; golden does NOT set it for true LVDS on an HP bank
+        // (RIOB18 sysclk) -- 3 real bits in the IOB's own HCLK row.
+        bool only_diff = is_tmds33 || is_lvds25;
+        // NB: is_diff must still cover true LVDS (HP banks) -- only the
+        // ONLY_DIFF_IN_USE row bit is HR-specific
+        bool is_diff = is_tmds33 || is_lvds || has_diff_prefix;
         if (has_diff_prefix)
             iostandard.erase(0, 5);
         bool is_sstl = iostandard == "SSTL12" || iostandard == "SSTL135" || iostandard == "SSTL15";
@@ -1017,22 +1214,78 @@ struct FasmBackend
             // HP-bank IBUF glue — fires per active input site (parallel to
             // OBUF_HP_BANK_GLUE).  For differential inputs Vivado uses a
             // different "IBUFDS_BANK_GLUE" bit on Y0 only.
+            // LEFT HP bank (LIOB18) single-ended input on the SLAVE site (IOB_Y1,
+            // e.g. the N pin of a diff pair) is a special case: it has no input
+            // amplifier of its own, so Vivado receives it through the MASTER half's
+            // (IOB_Y0) differential amplifier -- partner-half LVDS glue emitted below
+            // -- and does NOT set IBUF_HP_BANK_GLUE nor the standalone
+            // LVCMOS12_LVCMOS15.IN, and its narrow IN_ONLY group INCLUDES LVCMOS18.
+            // Setting IBUF_HP_BANK_GLUE alongside the partner LVDS receiver selects a
+            // conflicting receiver and the pin stays dead (HW-confirmed on UART rx,
+            // AU33 = L9N = IOB_Y1).  An input on the MASTER site (IOB_Y0, e.g. rst on
+            // AV40 = L13P) uses its OWN buffer (IBUF_HP_BANK_GLUE) and must NOT get
+            // partner glue -- so gate on yLoc==1.
+            // EXPERIMENT (NEXTPNR_RX_PLAIN_LVCMOS): treat a left-HP slave-site
+            // single-ended input as a PLAIN LVCMOS18 input (IBUF_HP_BANK_GLUE, no
+            // partner differential-amplifier) instead of borrowing the master diff
+            // amp.  The diff-amp reference is the prime suspect for the open-flow rx
+            // long-run/AC-coupling-like distortion.  Default off (matches golden);
+            // set the env to try plain.
+            // If the partner (master) IOB drives an output, its differential
+            // amplifier is unavailable to borrow -- fall back to a plain LVCMOS
+            // input, and skip the partner-half writes (which would collide with
+            // the output's DRIVE bits -> FasmInconsistentBits).
+            bool partner_out = partner_is_output(pad);
+            bool is_lefthp_se_in = is_hp_bank && !is_riob18 && !is_output && !is_diff && yLoc == 1
+                                   && (getenv("NEXTPNR_RX_PLAIN_LVCMOS") == nullptr)
+                                   && !partner_out;
             if (is_hp_bank && !is_output) {
                 if (is_diff) {
+                    // RIGHT HP bank uses IBUFDS_BANK_GLUE; LEFT HP bank (LIOB18) uses
+                    // IBUF_HP_BANK_GLUE for a differential input (per Vivado).
                     if (yLoc == 0)
-                        write_bit("IBUFDS_BANK_GLUE");
-                } else {
+                        write_bit(is_riob18 ? "IBUFDS_BANK_GLUE" : "IBUF_HP_BANK_GLUE");
+                } else if (!is_lefthp_se_in) {
                     write_bit("IBUF_HP_BANK_GLUE");
                 }
             }
-            // Additional low-volt LVCMOS input bit on HP banks.
-            if (is_hp_bank && !is_diff && is_low_volt_lvcmos)
+            // Additional low-volt LVCMOS input bit on HP banks (not for a left-HP
+            // single-ended LVCMOS18 input, which uses the combined .IN below).
+            if (is_hp_bank && !is_diff && is_low_volt_lvcmos &&
+                !(is_lefthp_se_in && iostandard == "LVCMOS18"))
                 write_bit("LVCMOS12_LVCMOS15.IN");
             // HP-bank IN_ONLY input-only variant (parallel to the wider one
             // emitted in the is_riob18 branch below).  Vivado emits both
-            // for HP-bank input-only sites.
-            if (is_hp_bank && !is_output && !is_diff)
-                write_bit("LVCMOS12_LVCMOS15_SSTL12_SSTL135_SSTL15.IN_ONLY");
+            // for HP-bank input-only sites; the left-HP LVCMOS18 group includes
+            // LVCMOS18.
+            if (is_hp_bank && !is_output && !is_diff) {
+                if (is_lefthp_se_in && iostandard == "LVCMOS18")
+                    write_bit("LVCMOS12_LVCMOS15_LVCMOS18_SSTL12_SSTL135_SSTL15.IN_ONLY");
+                else
+                    write_bit("LVCMOS12_LVCMOS15_SSTL12_SSTL135_SSTL15.IN_ONLY");
+            }
+            // LEFT HP bank (LIOB18) single-ended input: Vivado receives it through
+            // the differential input amplifier, enabling the receiver via the
+            // PARTNER half (IOB_Y<other>): LVDS.IN_DIFF + IN_USE + IN_ONLY (+ a
+            // PULLDOWN).  Without this the input buffer never senses the line and
+            // the pin is dead -- HW-confirmed: the open-flow UART 'rx' on AU33
+            // (LIOB18_X81Y33) was silent while the Vivado build (which sets these
+            // partner bits) works.  The differential (clock) input case is handled
+            // separately below; this covers the single-ended LVCMOS path.  Emit on
+            // the partner half via a fasm-context swap.
+            if (is_hp_bank && !is_riob18 && !is_output && !is_diff && !partner_out) {
+                std::string saved = fasm_ctx.back();          // "IOB_Y<yLoc>"
+                fasm_ctx.back() = "IOB_Y" + std::to_string(1 - yLoc);
+                if (is_lefthp_se_in) {
+                    // slave-site (Y1) input borrows the master half's diff amplifier
+                    write_bit("LVDS.IN_DIFF");
+                    write_bit("LVDS.IN_USE");
+                    write_bit("LVDS.IN_ONLY");
+                }
+                // unused partner pin is pulled down in both cases (Vivado default)
+                write_bit("PULLTYPE.PULLDOWN");
+                fasm_ctx.back() = saved;
+            }
             if (!is_diff) {
                 if (iostandard == "LVCMOS33" || iostandard == "LVTTL" || iostandard == "LVCMOS25") {
                     if (!is_riob18)
@@ -1059,12 +1312,30 @@ struct FasmBackend
                 }
             } else /* is_diff */ {
                 if (is_riob18) {
-                    // vivado generates these bits only for Y0 of a diff pair
+                    // Golden RIOB18 LVDS input (e.g. VC707 sysclk E19/E18):
+                    // master half (Y0) carries both diff groups, BOTH halves
+                    // get the narrow LVCMOS SLEW.SLOW, and the tile gets
+                    // DIFF.ZIBUF_LOW_PWR (high-performance input buffer).
+                    // No LVDS.IN_USE / LVDS.IN_ONLY -- proven against the
+                    // ethsoc golden bitstream.
                     if (yLoc == 0) {
                         write_bit("LVDS_SSTL12_SSTL135_SSTL15.IN_DIFF");
-                        if (iostandard == "LVDS")
-                            write_bit("LVDS.IN_USE");
+                        write_bit("SSTL12_SSTL135_SSTL15.IN_DIFF");
+                        std::string saved = fasm_ctx.back();
+                        fasm_ctx.back() = "DIFF";
+                        write_bit("ZIBUF_LOW_PWR");
+                        fasm_ctx.back() = saved;
                     }
+                    write_bit("LVCMOS12_LVCMOS15_LVCMOS18.SLEW.SLOW");
+                } else if (is_hp_bank) {
+                    // LEFT HP bank (LIOB18): an LVDS input on a High-Performance bank
+                    // uses the SSTL differential-input group (Y0 only), NOT the
+                    // High-Range LVDS_25 group.  The old code only special-cased
+                    // is_riob18 (the RIGHT HP bank), so a LEFT-bank diff clock input
+                    // (e.g. USER_CLOCK on AK34 = LIOB18) was mis-encoded as LVDS_25 and
+                    // the differential receiver never delivered a clock -> dead design.
+                    if (yLoc == 0)
+                        write_bit("SSTL12_SSTL135_SSTL15.IN_DIFF");
                 } else {
                     if (iostandard == "TDMS_33")
                         write_bit("TDMS_33.IN_DIFF");
@@ -1079,13 +1350,37 @@ struct FasmBackend
             // IN_ONLY
             if (!is_output) {
                 if (is_riob18) {
-                    // vivado also sets this bit for DIFF_SSTL
-                    if (is_diff && (yLoc == 0))
-                        write_bit("LVDS.IN_ONLY");
-                    else
+                    if (is_diff && (yLoc == 0)) {
+                        // golden: master half of a diff input gets BOTH
+                        // LVCMOS IN_ONLY groups (wide + narrow)
+                        write_bit("LVCMOS12_LVCMOS15_LVCMOS18_SSTL12_SSTL135_SSTL15.IN_ONLY");
+                        write_bit("LVCMOS12_LVCMOS15_SSTL12_SSTL135_SSTL15.IN_ONLY");
+                    } else
                         write_bit("LVCMOS12_LVCMOS15_LVCMOS18_SSTL12_SSTL135_SSTL15.IN_ONLY");
                 } else
                     write_bit("LVCMOS12_LVCMOS15_LVCMOS18_LVCMOS25_LVCMOS33_LVDS_25_LVTTL_SSTL135_SSTL15_TMDS_33.IN_ONLY");
+            }
+            // LEFT HP-bank DIFFERENTIAL input (e.g. user_clock LVDS on AK34/AL34):
+            // Vivado emits SLEW.SLOW (wide+narrow) + STEPDOWN + a narrow IN_ONLY on
+            // BOTH halves, plus a tile-level DIFF.ZIBUF_LOW_PWR (= IBUF_LOW_PWR FALSE,
+            // the HIGH-PERFORMANCE input buffer).  The open flow omitted all of these
+            // (the SLEW/STEPDOWN paths are gated !is_diff, and ZIBUF_LOW_PWR was never
+            // emitted), so the clock came in through the LOW-POWER buffer with degraded
+            // duty-cycle/jitter -> deterministic rx-sample skew (HW: bit-echo distorts
+            // varying bytes while Vivado is clean).  Emit to match golden.
+            if (is_diff && is_hp_bank && !is_riob18 && !is_output) {
+                write_bit("LVCMOS12_LVCMOS15_LVCMOS18_LVCMOS25_LVCMOS33_LVTTL_SSTL135_SSTL15.SLEW.SLOW");
+                write_bit("LVCMOS12_LVCMOS15_LVCMOS18.SLEW.SLOW");
+                write_bit("LVCMOS12_LVCMOS15_LVCMOS18_SSTL135_SSTL15.STEPDOWN");
+                if (yLoc == 0)
+                    write_bit("LVCMOS12_LVCMOS15_SSTL12_SSTL135_SSTL15.IN_ONLY");           // P half (no LVCMOS18)
+                else
+                    write_bit("LVCMOS12_LVCMOS15_LVCMOS18_SSTL12_SSTL135_SSTL15.IN_ONLY");  // N half (with LVCMOS18)
+                if (yLoc == 0) {   // tile-level, emit once: high-performance input buffer
+                    std::string saved = fasm_ctx.back(); fasm_ctx.pop_back();
+                    write_bit("DIFF.ZIBUF_LOW_PWR");
+                    fasm_ctx.push_back(saved);
+                }
             }
         }
 
@@ -1571,6 +1866,56 @@ struct FasmBackend
             blank();
         }
 
+        // The vertical GCLK spine must be marked ACTIVE in EVERY CLK_HROW
+        // row it traverses between the BUFG injection point (the central
+        // CLK_BUFG tiles) and each row that taps it -- Vivado's golden
+        // bitstreams show the full traversal footprint, and a row left
+        // inactive severs the spine there (proven on HW: ethsoc cpu_clk
+        // MMCM locked but the 50MHz never reached the fabric; resetn
+        // never released).  Pre-pass: collect per-lane tap rows and the
+        // BUFG injection rows, then emit ACTIVE over the whole extent.
+        auto name_y = [](const std::string &n) {
+            auto pos = n.rfind('Y');
+            return (pos == std::string::npos) ? -1 : std::stoi(n.substr(pos + 1));
+        };
+        int bufg_bot_y = -1, bufg_top_y = -1;
+        std::map<std::string, std::pair<int, int>> gclk_extent; // lane -> minY,maxY of taps
+        std::vector<std::pair<int, int>> hrow_tiles;            // tile idx, nameY
+        for (int tile = 0; tile < int(tt.size()); tile++) {
+            std::tie(name, type) = tt.at(tile);
+            if (type == "CLK_BUFG_BOT_R")
+                bufg_bot_y = name_y(name);
+            else if (type == "CLK_BUFG_TOP_R")
+                bufg_top_y = name_y(name);
+            else if (boost::starts_with(type, "CLK_HROW")) {
+                int y = name_y(name);
+                hrow_tiles.emplace_back(tile, y);
+                for (auto &s : used_wires_starting_with(tile, "CLK_HROW_R_CK_GCLK", true)) {
+                    std::string lane = s.substr(s.find("GCLK"));
+                    auto it = gclk_extent.find(lane);
+                    if (it == gclk_extent.end())
+                        gclk_extent[lane] = {y, y};
+                    else {
+                        it->second.first = std::min(it->second.first, y);
+                        it->second.second = std::max(it->second.second, y);
+                    }
+                }
+            }
+        }
+        std::unordered_map<int, std::set<std::string>> hrow_traversal; // tile idx -> lanes
+        for (auto &kv : gclk_extent) {
+            int lane_num = std::stoi(kv.first.substr(4));
+            int inj = (lane_num < 16) ? bufg_bot_y : bufg_top_y;
+            int lo = kv.second.first, hi = kv.second.second;
+            if (inj >= 0) {
+                lo = std::min(lo, inj);
+                hi = std::max(hi, inj);
+            }
+            for (auto &ht : hrow_tiles)
+                if (ht.second >= lo && ht.second <= hi)
+                    hrow_traversal[ht.first].insert(kv.first);
+        }
+
         for (int tile = 0; tile < int(tt.size()); tile++) {
             std::tie(name, type) = tt.at(tile);
             push(name);
@@ -1587,9 +1932,16 @@ struct FasmBackend
             } else if (boost::starts_with(type, "CLK_HROW")) {
                 auto used_gclk = used_wires_starting_with(tile, "CLK_HROW_R_CK_GCLK", true);
                 auto used_ck_in = used_wires_starting_with(tile, "CLK_HROW_CK_IN", true);
-                for (auto s : used_gclk) {
-                    write_bit(s + "_ACTIVE");
-                    all_gclk.insert(s.substr(s.find("GCLK")));
+                std::set<std::string> active_lanes;
+                for (auto s : used_gclk)
+                    active_lanes.insert(s.substr(s.find("GCLK")));
+                auto trav = hrow_traversal.find(tile);
+                if (trav != hrow_traversal.end())
+                    for (auto &lane : trav->second)
+                        active_lanes.insert(lane);
+                for (auto &lane : active_lanes) {
+                    write_bit("CLK_HROW_R_CK_" + lane + "_ACTIVE");
+                    all_gclk.insert(lane);
                 }
                 for (auto s : used_ck_in) {
                     if (boost::contains(s, "HROW_CK_INT"))
@@ -1658,7 +2010,7 @@ struct FasmBackend
     {
         int width = int_or_default(ci->params, ctx->id(name), 0);
         if (width == 0)
-            return;
+            width = 1; // golden encodes unused ports as width 1
         int actual_width = width;
         if (is_36) {
             if (width == 1)
@@ -1732,9 +2084,26 @@ struct FasmBackend
             write_bram_width(ci, "WRITE_WIDTH_B", is_36, half == 1);
             write_bit("DOA_REG", bool_or_default(ci->params, ctx->id("DOA_REG"), false));
             write_bit("DOB_REG", bool_or_default(ci->params, ctx->id("DOB_REG"), false));
-            for (auto &invpin : invertible_pins[ctx->id(ci->attrs[ctx->id("X_ORIG_TYPE")].as_string())])
-                write_bit("ZINV_" + invpin.str(ctx),
-                          !bool_or_default(ci->params, ctx->id("IS_" + invpin.str(ctx) + "_INVERTED"), false));
+            for (auto &invpin : invertible_pins[ctx->id(ci->attrs[ctx->id("X_ORIG_TYPE")].as_string())]) {
+                std::string pn = invpin.str(ctx);
+                // golden gates the output-register clock/reset ZINVs on the
+                // register actually existing (proven by the dcp2fasm
+                // bit-equivalence campaign)
+                if ((pn == "RSTREGARSTREG" || pn == "REGCLKARDRCLK") &&
+                    !bool_or_default(ci->params, ctx->id("DOA_REG"), false))
+                    continue;
+                if ((pn == "RSTREGB" || pn == "REGCLKB") &&
+                    !bool_or_default(ci->params, ctx->id("DOB_REG"), false))
+                    continue;
+                write_bit("ZINV_" + pn,
+                          !bool_or_default(ci->params, ctx->id("IS_" + pn + "_INVERTED"), false));
+            }
+            // golden per-half defaults (dcp2fasm campaign):
+            if (str_or_default(ci->params, ctx->id("RDADDR_COLLISION_HWCONFIG"), "DELAYED_WRITE") == "PERFORMANCE")
+                write_bit("RDADDR_COLLISION_HWCONFIG_PERFORMANCE");
+            for (std::string ab : {"A", "B"})
+                write_bit("RSTREG_PRIORITY_" + ab + "_" +
+                          str_or_default(ci->params, ctx->id("RSTREG_PRIORITY_" + ab), "RSTREG"));
             for (auto wrmode : {"WRITE_MODE_A", "WRITE_MODE_B"}) {
                 std::string mode = str_or_default(ci->params, ctx->id(wrmode), "WRITE_FIRST");
                 if (mode != "WRITE_FIRST")
@@ -1768,6 +2137,27 @@ struct FasmBackend
             auto used_wraddrcasc = used_wires_starting_with(tile, "BRAM_CASCOUT_ADDRBWRADDR", false);
             write_bit("CASCOUT_ARD_ACTIVE", !used_rdaddrcasc.empty());
             write_bit("CASCOUT_BWR_ACTIVE", !used_wraddrcasc.empty());
+        }
+        if (half == 0 && ci != nullptr) {
+            // golden tile-level defaults on every used BRAM tile
+            // (proven by the dcp2fasm bit-equivalence campaign)
+            write_vector("ZALMOST_EMPTY_OFFSET[12:0]", std::vector<bool>(13, true));
+            write_vector("ZALMOST_FULL_OFFSET[12:0]", std::vector<bool>(13, true));
+            push("RAMB36");
+            // BRAM36_*_WIDTH_X_1 are RAMB36-mode (tile-level) width bits.  Set
+            // them ONLY for an actual RAMB36E1 whose port X width is 1 -- NOT for
+            // a RAMB18E1 (its width lives in RAMB18_Y0/Y1.*_WIDTH, where width-1
+            // is the no-bit default) and NOT for a RAMB36 port wider than 1.  The
+            // previous code wrote the A-port bits UNCONDITIONALLY on every used
+            // BRAM tile, setting bits 27_184/27_180 that golden never sets for a
+            // width-1 RAMB18 or a width-18 RAMB36 -- silently corrupting every
+            // RAMB18 and every width>1 RAMB36 (isolated on a single-RAMB JTAG
+            // tester: dropping just those two bits restored read/write).
+            if (ci->type == id_RAMB36E1_RAMB36E1)
+                for (std::string rw : {"READ_WIDTH_A", "WRITE_WIDTH_A", "READ_WIDTH_B", "WRITE_WIDTH_B"})
+                    if (int_or_default(ci->params, ctx->id(rw), 0) == 1)
+                        write_bit("BRAM36_" + rw + "_1");
+            pop();
         }
         pop();
     }
@@ -1883,11 +2273,34 @@ struct FasmBackend
         }
         pop();
 
-        // FIXME: should these be calculated somehow?
+        // PLL loop-filter / lock lookup.  These MUST be computed from CLKFBOUT_MULT
+        // (same lock table as the MMCM); the old hardcoded LKTABLE/TABLE were wrong for
+        // most MULT values, giving a PLL with the wrong loop filter -> a clock clean
+        // enough for a free-running counter but too jittery for synchronous logic (the
+        // open-flow USER_CLOCK/PLL designs were silent on HW while Vivado's worked).
+        // lk_table[] is the same per-MULT table write_mmcm() uses (verified: lk_table[3]
+        // == Vivado's LKTABLE for MULT=4).
+        static const int64_t lk_table[64] = {
+            0x31BE8FA401LL, 0x31BE8FA401LL, 0x423E8FA401LL, 0x5AFE8FA401LL, 0x73BE8FA401LL,
+            0x8C7E8FA401LL, 0x9CFE8FA401LL, 0xB5BE8FA401LL, 0xCE7E8FA401LL, 0xE73E8FA401LL,
+            0xFF7E8FA401LL, 0xFF7E8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL,
+            0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL,
+            0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL,
+            0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL,
+            0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL,
+            0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL,
+            0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL,
+            0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL,
+            0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL,
+            0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL,
+            0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL, 0xFFFE8FA401LL};
+        int pll_mult = (int)float_or_default(ci, "CLKFBOUT_MULT", 1);
+        if (pll_mult < 1) pll_mult = 1;
+        if (pll_mult > 64) pll_mult = 64;
         write_int_vector("FILTREG1_RESERVED[11:0]", 0x8, 12);
-        write_int_vector("LKTABLE[39:0]", 0xB5BE8FA401ULL, 40);
+        write_int_vector("LKTABLE[39:0]", lk_table[pll_mult - 1], 40);
         write_bit("LOCKREG3_RESERVED[0]");
-        write_int_vector("TABLE[9:0]", 0x3B4, 10);
+        write_int_vector("TABLE[9:0]", 0x1FC, 10);
         pop(2);
     }
 
@@ -1963,6 +2376,15 @@ struct FasmBackend
                 write_bit(name + "_CLKOUT2_FRAC_WF_R[0]", 1);
                 write_int_vector(name + "_CLKOUT2_FRAC[2:0]", frac, 3);
             }
+        } else {
+            // Unused counter: Vivado always programs divide-by-1 with
+            // NO_COUNT set (HIGH_TIME=1, LOW_TIME=1); leaving the counter
+            // registers all-zero does not match any golden bitstream.
+            auto is_clkout_5_or_6 = name == "CLKOUT5" || name == "CLKOUT6";
+            write_int_vector(name + "_CLKOUT1_HIGH_TIME[5:0]", 1, 6);
+            write_int_vector(name + "_CLKOUT1_LOW_TIME[5:0]", 1, 6);
+            auto no_count_feature = name + (is_clkout_5_or_6 ? "_CLKOUT2_FRACTIONAL_NO_COUNT[0]" : "_CLKOUT2_NO_COUNT[0]");
+            write_bit(no_count_feature, true);
         }
     }
 
@@ -1989,9 +2411,19 @@ struct FasmBackend
 
         std::string comp = str_or_default(ci->params, id_COMPENSATION, "INTERNAL");
         push("COMP");
-        if (comp == "INTERNAL" || comp == "ZHOLD") {
-            // does not seem to make a difference in vivado
-            // both modes set this bit
+        if (comp == "ZHOLD" || comp == "INTERNAL") {
+            // Under the re-fuzzed prjxray 031-cmt-mmcm DB, BOTH supported
+            // compensation modes set COMP.Z_ZHOLD (bits 28_1020 28_979) -- the
+            // "compensation enabled" bit for internal feedback.  Verified on a
+            // VC707 against two goldens:
+            //   * Vivado MMCME2_ADV (counter32m): netlist COMPENSATION=INTERNAL,
+            //     bitstream sets COMP.Z_ZHOLD.
+            //   * yosys MMCME2_ADV (johnson_mmcm): COMPENSATION=ZHOLD; emitting
+            //     COMP.ZHOLD left the MMCM unlocked / output clock DEAD (counter
+            //     frozen after one startup edge), COMP.Z_ZHOLD makes it run.
+            // The bare COMP.ZHOLD feature (28_1019 29_982) is NOT produced by
+            // either mode; the earlier clk_wiz-golden mapping (ZHOLD->COMP.ZHOLD,
+            // INTERNAL->COMP.Z_ZHOLD) was invalidated by the DB re-fuzz.
             write_bit("Z_ZHOLD");
         } else {
             log_error("unsupported COMPENSATION type '%s' for MMCM (supported compensation types: INTERNAL, ZHOLD)\n", comp.c_str());
@@ -2349,15 +2781,37 @@ struct FasmBackend
             filter_lookup = filter_lookup_high;
         else
             filter_lookup = filter_lookup_optimized;
-        write_int_vector("FILTREG1_RESERVED[11:0]", filter_lookup[clkfbout_mult - 1], 12);
+        // The XAPP888 filter value belongs in TABLE[9:0]; FILTREG1_RESERVED is
+        // a constant.  (Previously these were swapped, with TABLE hardcoded to
+        // 0x3d4 - proven against a Vivado golden of the same MMCM config,
+        // which wants FILTREG1=0x8 and TABLE=filter_lookup[mult-1].)
+        write_int_vector("FILTREG1_RESERVED[11:0]", 0x8, 12);
 
-        // 0x9900 enables fractional counters
-        // only int counters would be 0x1 << 8
-        // 0xffff enables everything, I suppose, this is what is used in xap888
-        write_int_vector("POWER_REG_POWER_REG_POWER_REG[15:0]", 0xffff, 16);
+        // Vivado uses 0x100 (integer counters) for non-fractional configs;
+        // golden bitstreams confirm.  0xffff (the old value) is the XAPP888
+        // "enable everything" setting and does not match Vivado output.
+        write_int_vector("POWER_REG_POWER_REG_POWER_REG[15:0]", 0x100, 16);
         write_bit("LOCKREG3_RESERVED[0]");
-        write_int_vector("TABLE[9:0]", 0x3d4, 10);
+        write_int_vector("TABLE[9:0]", filter_lookup[clkfbout_mult - 1], 10);
         pop(2);
+    }
+
+    // bool param that may arrive as 1/0, "TRUE"/"FALSE" (netlist style), or
+    // a bit vector - bool_or_default chokes on the string forms via stoi
+    bool bool_param_or_default(CellInfo *ci, const std::string &name, bool def)
+    {
+        IdString p = ctx->id(name);
+        auto fnd = ci->params.find(p);
+        if (fnd == ci->params.end())
+            return def;
+        if (fnd->second.is_string) {
+            const std::string &s = fnd->second.as_string();
+            if (s == "TRUE" || s == "YES" || s == "1")
+                return true;
+            if (s == "FALSE" || s == "NO" || s == "0")
+                return false;
+        }
+        return fnd->second.as_bool();
     }
 
     void write_ibufds_gte2(CellInfo * ci)
@@ -2366,11 +2820,11 @@ struct FasmBackend
         Loc siteLoc = ctx->getSiteLocInTile(ci->bel);
         push("IBUFDS_GTE2_Y" + std::to_string(siteLoc.y));
         write_bit("IN_USE");
-        auto clkcm_cfg = bool_or_default(ci->params, ctx->id("CLKCM_CFG"), true);
+        auto clkcm_cfg = bool_param_or_default(ci, "CLKCM_CFG", true);
         if (!clkcm_cfg) log_warning("%s/%s: According to ug482, CLKCM_CFG should always be on\n",
                                     ci->hierpath.c_str(ctx), ci->name.c_str(ctx));
         write_bit("CLKCM_CFG", clkcm_cfg);
-        auto clkrcv_trst = bool_or_default(ci->params, ctx->id("CLKRCV_TRST"), true);
+        auto clkrcv_trst = bool_param_or_default(ci, "CLKRCV_TRST", true);
         if (!clkrcv_trst) log_warning("%s/%s: According to ug482, CLKRCV_TRST should always be on\n",
                                        ci->hierpath.c_str(ctx), ci->name.c_str(ctx));
         write_bit("CLKRCV_TRST", clkrcv_trst);
@@ -4313,13 +4767,27 @@ void write_gtx_channel(CellInfo *ci)
             }
         };
 
+        // Tolerant parameter read: SVS/yosys store all-binary parameter values
+        // (e.g. USE_DPORT="0", PATTERN, MASK -- and even a "FALSE" that the
+        // front-end normalised to "0") as *numeric* Properties, on which
+        // str_or_default()/as_string() assert (is_string == false). Property::str
+        // holds the literal for string params AND the [01xz] bit-string for
+        // numeric ones (exactly what as_string() would have returned), so reading
+        // it directly is bit-for-bit equivalent but never aborts.
+        auto dsp_str = [&](const char *pname, std::string def) -> std::string {
+            auto it = ci->params.find(ctx->id(pname));
+            if (it == ci->params.end())
+                return def;
+            return it->second.str;
+        };
+
         // value 1 is equivalent to 2, according to UG479
         // but in real life, Vivado sets AREG_0 is 0,
         // no bit is 1, and AREG_2 is 2
         auto areg = int_or_default(ci->params, ctx->id("AREG"), 1);
         if (areg == 0 || areg == 2) write_bit("AREG_" + std::to_string(areg));
 
-        auto ainput = str_or_default(ci->params, ctx->id("A_INPUT"), "DIRECT");
+        auto ainput = dsp_str("A_INPUT", "DIRECT");
         if (ainput == "CASCADE") write_bit("A_INPUT[0]");
 
         // value 1 is equivalent to 2, according to UG479
@@ -4328,18 +4796,20 @@ void write_gtx_channel(CellInfo *ci)
         auto breg = int_or_default(ci->params, ctx->id("BREG"), 1);
         if (breg == 0 || breg == 2) write_bit("BREG_" + std::to_string(breg));
 
-        auto binput = str_or_default(ci->params, ctx->id("B_INPUT"), "DIRECT");
+        auto binput = dsp_str("B_INPUT", "DIRECT");
         if (binput == "CASCADE") write_bit("B_INPUT[0]");
 
-        auto use_dport = str_or_default(ci->params, ctx->id("USE_DPORT"), "FALSE");
-        if (use_dport == "TRUE") write_bit("USE_DPORT[0]");
+        // USE_DPORT may arrive as the string "TRUE"/"FALSE" (Vivado/RapidWright)
+        // or as a 1-bit numeric "1"/"0" (SVS normalises the boolean), so accept both.
+        auto use_dport = dsp_str("USE_DPORT", "FALSE");
+        if (use_dport == "TRUE" || use_dport == "1") write_bit("USE_DPORT[0]");
 
-        auto use_simd = str_or_default(ci->params, ctx->id("USE_SIMD"), "ONE48");
+        auto use_simd = dsp_str("USE_SIMD", "ONE48");
         if (use_simd == "TWO24")  write_bit("USE_SIMD_FOUR12_TWO24");
         if (use_simd == "FOUR12") write_bit("USE_SIMD_FOUR12");
 
         // PATTERN
-        auto pattern_str = str_or_default(ci->params, ctx->id("PATTERN"), "");
+        auto pattern_str = dsp_str("PATTERN", "");
         if (!boost::empty(pattern_str)) {
             const size_t pattern_size = 48;
             std::vector<bool> pattern_vector(pattern_size, true);
@@ -4350,12 +4820,12 @@ void write_gtx_channel(CellInfo *ci)
             write_vector("PATTERN[47:0]", pattern_vector);
         }
 
-        auto autoreset_patdet = str_or_default(ci->params, ctx->id("AUTORESET_PATDET"), "NO_RESET");
+        auto autoreset_patdet = dsp_str("AUTORESET_PATDET", "NO_RESET");
         if (autoreset_patdet == "RESET_MATCH")     write_bit("AUTORESET_PATDET_RESET");
         if (autoreset_patdet == "RESET_NOT_MATCH") write_bit("AUTORESET_PATDET_RESET_NOT_MATCH");
 
         // MASK
-        auto mask_str = str_or_default(ci->params, ctx->id("MASK"), "001111111111111111111111111111111111111111111111");
+        auto mask_str = dsp_str("MASK", "001111111111111111111111111111111111111111111111");
         // Yosys gives us 48 bit, but prjxray only recognizes 46 bits
         // The most significant two bits seem to be zero, so let us just truncate them
         const size_t mask_size = 46;
@@ -4366,7 +4836,7 @@ void write_gtx_channel(CellInfo *ci)
         }
         write_vector("MASK[45:0]", mask_vector);
 
-        auto sel_mask = str_or_default(ci->params, ctx->id("SEL_MASK"), "MASK");
+        auto sel_mask = dsp_str("SEL_MASK", "MASK");
         if (sel_mask == "C")              write_bit("SEL_MASK_C");
         if (sel_mask == "ROUNDING_MODE1") write_bit("SEL_MASK_ROUNDING_MODE1");
         if (sel_mask == "ROUNDING_MODE2") write_bit("SEL_MASK_ROUNDING_MODE2");
@@ -4386,7 +4856,7 @@ void write_gtx_channel(CellInfo *ci)
         write_bit("ZMREG[0]", !bool_or_default(ci->params, ctx->id("MREG")));
         write_bit("ZOPMODEREG[0]", !bool_or_default(ci->params, ctx->id("OPMODEREG")));
         write_bit("ZPREG[0]", !bool_or_default(ci->params, ctx->id("PREG")));
-        write_bit("USE_DPORT[0]", str_or_default(ci->params, ctx->id("USE_DPORT"), "FALSE") == "TRUE");
+        write_bit("USE_DPORT[0]", (use_dport == "TRUE" || use_dport == "1"));
         write_bit("ZIS_CLK_INVERTED", !bool_or_default(ci->params, ctx->id("IS_CLK_INVERTED")));
         write_bit("ZIS_CARRYIN_INVERTED", !bool_or_default(ci->params, ctx->id("IS_CARRYIN_INVERTED")));
         pop(2);

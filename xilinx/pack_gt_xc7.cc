@@ -174,6 +174,11 @@ void XC7Packer::pack_gt()
                 } else if (boost::starts_with(port_name, "GTREFCLK")) {
                     CellInfo *driver = port_net->driver.cell;
                     if (driver == nullptr) log_error("Port %s connected to net %s has no driver!", port_name.c_str(), port_net->name.c_str(ctx));
+                    if (!used || driver->type == ctx->id("PSEUDO_GND") || driver->type == ctx->id("PSEUDO_VCC")) {
+                        // refclk input tied to a constant: unused, not a clock
+                        disconnect_port(ctx, ci, port.first);
+                        continue;
+                    }
                     if (driver->type != id_IBUFDS_GTE2) {
                         log_warning("Driver %s of net %s connected to a %sE2_COMMON PLL is not an IBUFDS_GTE2 block, but %s\n",
                             driver->name.c_str(ctx), port_net->name.c_str(ctx), gt_type.c_str(), driver->type.c_str(ctx));
@@ -328,6 +333,12 @@ void XC7Packer::pack_gt()
                             continue;
                         }
                         auto driver = net->driver.cell;
+                        if (driver == nullptr || driver->type == ctx->id("PSEUDO_GND") ||
+                            driver->type == ctx->id("PSEUDO_VCC")) {
+                            // clock input tied to a constant: unused
+                            disconnect_port(ctx, ci, port.first);
+                            continue;
+                        }
                         // GTX CPLL mode is possible: GTXE2_CHANNEL.GTREFCLK* driven directly by IBUFDS_GTE2
                         // (no GTXE2_COMMON required in the design)
                         if (driver->type != id_GTXE2_COMMON && driver->type !=id_IBUFDS_GTE2)

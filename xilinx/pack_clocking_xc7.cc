@@ -160,12 +160,70 @@ void XC7Packer::pack_plls()
             }
             set_default(ci, ctx->id("COMPENSATION"), Property("INTERNAL"));
 
-            // Fixup routing
-            if (str_or_default(ci->params, ctx->id("COMPENSATION"), "INTERNAL") == "INTERNAL") {
-                disconnect_port(ctx, ci, ctx->id("CLKFBIN"));
-                connect_port(ctx, ctx->nets[ctx->id("$PACKER_VCC_NET")].get(), ci, ctx->id("CLKFBIN"));
+            // Fixup routing.  An MMCM with a REAL CLKFBOUT->CLKFBIN loop in
+            // the netlist must keep it: golden bitstreams realise INTERNAL
+            // compensation via the dedicated CLKFBOUT2IN pip (same-tile,
+            // always routable), and a VCC-tied CLKFBIN never locks on
+            // hardware.  The old guard kept the loop only for BEL-pinned
+            // (imported-placement) MMCMs; a FREE MMCM (SVS-placed flow) got
+            // its feedback tied to VCC -> never locks -> totally dead design
+            // (VC707 eth-arp: no LEDs until the fasm was hand-patched back
+            // to CLKFBOUT2IN).  Tie only when CLKFBIN is genuinely undriven.
+            if (str_or_default(ci->params, ctx->id("COMPENSATION"), "INTERNAL") == "INTERNAL" &&
+                !ci->attrs.count(ctx->id("BEL"))) {
+                NetInfo *fb = get_net_or_empty(ci, ctx->id("CLKFBIN"));
+                bool has_real_fb = fb != nullptr && fb->driver.cell != nullptr;
+                if (!has_real_fb) {
+                    disconnect_port(ctx, ci, ctx->id("CLKFBIN"));
+                    connect_port(ctx, ctx->nets[ctx->id("$PACKER_VCC_NET")].get(), ci, ctx->id("CLKFBIN"));
+                }
             }
         }
+    }
+
+    // Vivado leaves the PLLE2 DRP / static-control pins UNROUTED (the DRP port defaults
+    // to inactive); the open flow instead routes each const-tied pin from a fabric IMUX,
+    // and DCLK lands on a clock net -- a spuriously-clocked DRP can corrupt the PLL's
+    // config at runtime, yielding a clock clean enough for a free counter but too
+    // jittery for synchronous logic (open-flow PLL designs were silent on HW while
+    // Vivado's worked).  Disconnect the const-tied DRP/control pins to match Vivado.
+    // RST / CLKIN* / CLKFB* are real signals and are left intact.  Runs after the final
+    // pack_constants, so the ties are not reapplied.
+    {
+        IdString gnd = ctx->id("$PACKER_GND_NET"), vcc = ctx->id("$PACKER_VCC_NET");
+        std::vector<std::string> drp = {"DEN", "DWE", "DCLK", "PWRDWN", "CLKINSEL",
+                                        "DADDR0", "DADDR1", "DADDR2", "DADDR3", "DADDR4", "DADDR5", "DADDR6"};
+        for (int i = 0; i < 16; i++)
+            drp.push_back("DI" + std::to_string(i));
+        // MMCME2 additionally has the phase-shift port; a fabric-routed
+        // PSCLK/PSEN with random IMUX levels walks the output phase away.
+        std::vector<std::string> mmcm_extra = {"PSCLK", "PSEN", "PSINCDEC", "RST"};
+        int n = 0;
+        for (auto cell : sorted(ctx->cells)) {
+            CellInfo *ci = cell.second;
+            bool is_pll = ci->type == ctx->id("PLLE2_ADV_PLLE2_ADV");
+            bool is_mmcm = ci->type == ctx->id("MMCME2_ADV_MMCME2_ADV");
+            if (!is_pll && !is_mmcm)
+                continue;
+            for (auto &p : drp) {
+                NetInfo *nn = get_net_or_empty(ci, ctx->id(p));
+                if (nn != nullptr && (nn->name == gnd || nn->name == vcc)) {
+                    disconnect_port(ctx, ci, ctx->id(p));
+                    ++n;
+                }
+            }
+            if (is_mmcm) {
+                for (auto &p : mmcm_extra) {
+                    NetInfo *nn = get_net_or_empty(ci, ctx->id(p));
+                    if (nn != nullptr && (nn->name == gnd || nn->name == vcc)) {
+                        disconnect_port(ctx, ci, ctx->id(p));
+                        ++n;
+                    }
+                }
+            }
+        }
+        if (n)
+            log_info("    PLL/MMCM: disconnected %d const DRP/control pins (Vivado leaves them unrouted)\n", n);
     }
 }
 
@@ -191,6 +249,33 @@ void XC7Packer::pack_gbs()
             try_preplace(ci, id_I);
         if (ci->type == id_BUFHCE_BUFHCE)
             try_preplace(ci, id_I);
+    }
+
+    // pack_gbs() runs in the XC7 pack() sequence AFTER the final pack_constants, so
+    // disconnect const-tied BUFGCTRL control pins here (doing it earlier just gets
+    // undone when pack_constants re-applies the get_tied_pins/invertible_pins ties).
+    // CE0/CE1/S0/S1/IGNORE0/IGNORE1 are realised by the BUFGCTRL config bits
+    // (ZINV_CE0/ZINV_S0/IS_IGNORE1_INVERTED, emitted by fasm.cc when the BUFG's I0/I1
+    // output pip is used) and must NOT also be routed: ZINV_CE0 inverts CE0, so a
+    // routed CE0=VCC becomes CE=0 and DISABLES the buffer -> no clock on HW (this is
+    // why the open-flow USER_CLOCK build was silent).  A real control signal (e.g. a
+    // BUFGMUX select) is on a non-const net and is left untouched.
+    if (getenv("NEXTPNR_BUFG_CONST_DISCONNECT")) {
+        IdString gnd = ctx->id("$PACKER_GND_NET"), vcc = ctx->id("$PACKER_VCC_NET");
+        int n = 0;
+        for (auto cell : sorted(ctx->cells)) {
+            CellInfo *ci = cell.second;
+            if (ci->type != id_BUFGCTRL)
+                continue;
+            for (auto p : {"CE0", "CE1", "S0", "S1", "IGNORE0", "IGNORE1"}) {
+                NetInfo *nn = get_net_or_empty(ci, ctx->id(p));
+                if (nn != nullptr && (nn->name == gnd || nn->name == vcc)) {
+                    disconnect_port(ctx, ci, ctx->id(p));
+                    ++n;
+                }
+            }
+        }
+        log_info("    BUFGCTRL: disconnected %d const control pins (config-tied, not routed)\n", n);
     }
 }
 

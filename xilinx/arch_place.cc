@@ -35,10 +35,16 @@ inline NetInfo *port_or_nullptr(const CellInfo *cell, IdString name)
 }
 
 //#define DEBUG_VALIDITY
+bool dbg_validity_runtime = false;
+#define DBG_RT()                                                                                                       \
+    do {                                                                                                               \
+        if (dbg_validity_runtime)                                                                                      \
+            log_info("invalid-arm: line %d\n", __LINE__);                                                             \
+    } while (0)
 #ifdef DEBUG_VALIDITY
 #define DBG() log_info("invalid: %s %d\n", __FILE__, __LINE__)
 #else
-#define DBG()
+#define DBG() DBG_RT()
 #endif
 
 bool Arch::xcu_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
@@ -83,8 +89,23 @@ bool Arch::xcu_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
                             }
                         }
                         if (shared < need_shared) {
-                            DBG();
-                            return false;
+                            // Imported (Vivado/golden) CARRY4 slot: the operand LUT
+                            // (O6->S) and the DI feed-through (O5->DI) are ONE
+                            // dual-output LUT on real hardware -- O5 and O6 of the
+                            // same 5-input LUT -- so they share all physical inputs
+                            // by construction.  SVS/pack represents that as two cells
+                            // whose lone feed-through input is a renamed net copy, so
+                            // input_sigs no longer match by identity (shared=0 here)
+                            // even though the placement is physically legal (golden
+                            // uses it and runs).  When the slot's 6LUT is BEL-pinned
+                            // (imported) and the 5LUT only drives the carry, trust the
+                            // import instead of rejecting a valid slot.
+                            bool imported_carry_feedthrough =
+                                lut6->attrs.count(id_BEL) && lut5->lutInfo.only_drives_carry;
+                            if (!imported_carry_feedthrough) {
+                                DBG();
+                                return false;
+                            }
                         }
                     }
                 }
@@ -299,7 +320,81 @@ bool Arch::xcu_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
 
 bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
 {
+    // Fully-frozen tile fast-path: if every occupied BEL holds a cell that is
+    // still BEL-pinned (imported from a proven Vivado placement), the tile is
+    // legal by construction -- Vivado already validated it on silicon.  The
+    // downstream heuristics (LUT input/output packing, X-input usage, control
+    // sets) model nextpnr's OWN packer and cannot see Vivado's input-pin
+    // permutation / shared-IMUX packing, so they reject legal frozen tiles.
+    // The bbox exclusion keeps user (non-imported) cells out of macro tiles,
+    // so a tile is either all-imported (trust) or contains user logic (full
+    // checks).  Any cell WITHOUT a BEL attr forces the full validation.
+    {
+        bool any = false, all_frozen = true;
+        for (int z = 0; z < 128; z++) {
+            CellInfo *c = lts.cells[z];
+            if (c == nullptr)
+                continue;
+            any = true;
+            // frozen == stamped: bound STRENGTH_USER by the BEL-attr placer.
+            // (A BEL *attribute* is NOT a reliable marker -- place_initial
+            //  back-annotates one onto every nextpnr-placed user cell too.)
+            if (c->belStrength < STRENGTH_STRONG) {
+                all_frozen = false;
+                break;
+            }
+        }
+        if (any && all_frozen)
+            return true;
+    }
     bool is_slicem = (tileType == id_CLBLM_L) || (tileType == id_CLBLM_R);
+    // SLICEM-only guard, run UNCONDITIONALLY (not behind the per-eight dirty
+    // cache in the loop below).  A distributed-RAM / SRL LUT (is_memory /
+    // is_srl) is legal only in a SLICEM.  The dirty-gated loop leaves this
+    // unchecked whenever a tile is validated while clean, so SA / legalisation
+    // can strand a memory/SRL LUT in a SLICEL -- surfacing much later as an
+    // unroutable "Pin 'DI1'/'WE' of bel ... has no associated wire".  A cheap
+    // O(16) scan here closes that hole for both the 6LUT and 5LUT bels.
+    if (!is_slicem) {
+        for (int i = 0; i < 8; i++) {
+            CellInfo *l6 = lts.cells[(i << 4) | BEL_6LUT];
+            CellInfo *l5 = lts.cells[(i << 4) | BEL_5LUT];
+            if ((l6 != nullptr && (l6->lutInfo.is_memory || l6->lutInfo.is_srl)) ||
+                (l5 != nullptr && (l5->lutInfo.is_memory || l5->lutInfo.is_srl)))
+                return false;
+        }
+    }
+    // A 5LUT bel has neither an A6 input nor an O6 output wire; a cell there
+    // must not use either.  Enforce UNCONDITIONALLY -- the dirty-gated loop
+    // below caches past this, letting legalisation strand a 6-input LUT on a
+    // 5LUT ("No wire found for port A6/O6").  CRUCIAL: at placement time an
+    // ABC-mapped LUT still carries LOGICAL pin names (I0..I5), so neither a
+    // physical id_A6 lookup nor lutInfo.input_count (which scans A1..A6) sees
+    // its 6th input -- we must COUNT connected input ports, exactly as
+    // isValidBelForCell does.
+    for (int i = 0; i < 8; i++) {
+        CellInfo *l5 = lts.cells[(i << 4) | BEL_5LUT];
+        if (l5 == nullptr)
+            continue;
+        // Memory/SRL LUTs legitimately draw many ports (address + DI + WE) and
+        // are packed to specific 5LUT bels -- the SLICEM guard above already
+        // constrains them, so the plain-LUT input-count rule must not apply.
+        if (l5->lutInfo.is_memory || l5->lutInfo.is_srl)
+            continue;
+        int in_used = 0;
+        bool drives_o6 = false;
+        for (auto &port : l5->ports) {
+            if (port.second.net == nullptr)
+                continue;
+            if (port.second.type == PORT_IN)
+                ++in_used;
+            else if (port.first == id_O6)
+                drives_o6 = true;
+        }
+        if (in_used > 5 || drives_o6 || l5->lutInfo.output_count == 2 ||
+            get_net_or_empty(l5, id_A6) != nullptr || get_net_or_empty(l5, id_O6) != nullptr)
+            return false;
+    }
     bool tile_is_memory = false;
     if (lts.cells[(3 << 4) | BEL_6LUT] != nullptr && lts.cells[(3 << 4) | BEL_6LUT]->lutInfo.is_memory)
         tile_is_memory = true;
@@ -318,10 +413,14 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
 
             // Check 6LUT
             if (lut6 != nullptr) {
-                if (!is_slicem && (lut6->lutInfo.is_memory || lut6->lutInfo.is_srl))
+                if (!is_slicem && (lut6->lutInfo.is_memory || lut6->lutInfo.is_srl)) {
+                    DBG_RT();
                     return false; // Memory and SRLs only valid in SLICEMs
-                if (lut6->lutInfo.is_srl && (i >= 4))
+                }
+                if (lut6->lutInfo.is_srl && (i >= 4)) {
+                    DBG_RT();
                     return false;
+                }
                 if (lut6->lutInfo.is_memory || lut6->lutInfo.is_srl) {
                     if (wclk == nullptr)
                         wclk = lut6->lutInfo.wclk;
@@ -337,13 +436,44 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
                         DBG();
                         return false;
                     }
-                    // If all 6 inputs or 2 outputs are used, 5LUT can't also be present
-                    if (lut6->lutInfo.input_count == 6 || lut6->lutInfo.output_count == 2) {
+                    bool srl_pair = lut6->lutInfo.is_srl && lut5->lutInfo.is_srl;
+                    // Imported (Vivado/golden) CARRY4 slot: a full 6-input
+                    // operand LUT (O6->S) coexisting with a DI feed-through LUT
+                    // (O5->DI, only_drives_carry) is physically legal on silicon
+                    // -- golden uses it and runs.  Trust a BEL-pinned (imported)
+                    // 6LUT whose companion 5LUT only drives the carry, for BOTH
+                    // the all-inputs/two-outputs check here and the shared-inputs
+                    // check below (the operand often uses all 6 inputs, so the
+                    // input_count==6 arm fires first and must honour the same
+                    // exemption).
+                    bool imported_carry_feedthrough =
+                            lut6->attrs.count(id_BEL) && lut5->lutInfo.only_drives_carry;
+                    // General imported-slot trust: BOTH LUTs BEL-pinned means a
+                    // frozen Vivado placement that already runs on silicon.
+                    // The LUT-pack heuristics below (6-input coexistence,
+                    // shared-input count) cannot see Vivado's input-pin
+                    // permutation / shared-IMUX packing and would reject legal
+                    // slots.  Trust the import; only user (non-BEL) cells get
+                    // the full checks.  (Frozen macros come from a proven bit,
+                    // so no illegal slot can enter this way.)
+                    bool imported_slot =
+                            lut6->attrs.count(id_BEL) && lut5->attrs.count(id_BEL);
+                    // If all 6 inputs or 2 outputs are used, 5LUT can't also be
+                    // present.  SRL16E pairs are exempt: their address pins are
+                    // constant-tied and shared by construction (Vivado packs
+                    // two SRL16Es per slot routinely).
+                    if (!srl_pair && !imported_carry_feedthrough && !imported_slot &&
+                        (lut6->lutInfo.input_count == 6 || lut6->lutInfo.output_count == 2)) {
+                        if (dbg_validity_runtime)
+                            log_info("  invalid-arm-387: lut6=%s(BEL=%d) in=%d out=%d lut5=%s(BEL=%d) imported_slot=%d\n",
+                                     nameOf(lut6), int(lut6->attrs.count(id_BEL)), lut6->lutInfo.input_count,
+                                     lut6->lutInfo.output_count, nameOf(lut5), int(lut5->attrs.count(id_BEL)),
+                                     int(imported_slot));
                         DBG();
                         return false;
                     }
                     // If more than 5 total inputs are used, need to check number of shared input
-                    if ((lut6->lutInfo.input_count + lut5->lutInfo.input_count) > 5) {
+                    if (!srl_pair && (lut6->lutInfo.input_count + lut5->lutInfo.input_count) > 5) {
                         int shared = 0, need_shared = (lut6->lutInfo.input_count + lut5->lutInfo.input_count - 5);
                         for (int j = 0; j < lut6->lutInfo.input_count; j++) {
                             for (int k = 0; k < lut5->lutInfo.input_count; k++) {
@@ -354,8 +484,32 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
                             }
                         }
                         if (shared < need_shared) {
-                            DBG();
-                            return false;
+                            // Imported (Vivado/golden) CARRY4 slot: the operand LUT
+                            // (O6->S) and the DI feed-through (O5->DI) are ONE
+                            // dual-output LUT on real hardware -- O5 and O6 of the
+                            // same 5-input LUT -- so they share all physical inputs
+                            // by construction.  SVS/pack represents that as two cells
+                            // whose lone feed-through input is a renamed net copy, so
+                            // input_sigs no longer match by identity (shared=0 here)
+                            // even though the placement is physically legal (golden
+                            // uses it and runs).  When the slot's 6LUT is BEL-pinned
+                            // (imported) and the 5LUT only drives the carry, trust the
+                            // import instead of rejecting a valid slot.
+                            bool imported_carry_feedthrough =
+                                lut6->attrs.count(id_BEL) && lut5->lutInfo.only_drives_carry;
+                            // General imported-slot trust: when BOTH LUTs are
+                            // BEL-pinned (a frozen Vivado placement), Vivado has
+                            // already proven the slot legal on silicon.  The
+                            // shared-input heuristic under-counts when the two
+                            // logical LUT inputs are distinct nets that Vivado
+                            // routes to the SAME physical A-pin (LUT input-pin
+                            // permutation / shared IMUX), which our net-identity
+                            // comparison cannot see.  Trust the import rather
+                            // than reject a placement that demonstrably works.
+                            if (!imported_carry_feedthrough && !imported_slot) {
+                                DBG();
+                                return false;
+                            }
                         }
                     }
                 }
@@ -377,6 +531,18 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
                 if (lut5->lutInfo.input_count > 5 || lut5->lutInfo.output_count == 2) {
                     DBG();
                     return false; // Memory and SRLs only valid in SLICEMs
+                }
+                // The 5LUT bel has neither an A6 input nor an O6 output: a cell
+                // occupying it must not use either.  input_count only counts
+                // A1..A6 ports, so it misses an ABC LUT that still drives the
+                // 6-output "O6" port (or draws A6) -- which passes every input
+                // check above yet is unroutable ("No wire found for port O6").
+                // Catch it HERE so SA swaps and the final placement check
+                // enforce it, not just the initial-placement isValidBelForCell
+                // gate (which SA/legalisation bypass).
+                if (get_net_or_empty(lut5, id_A6) != nullptr || get_net_or_empty(lut5, id_O6) != nullptr) {
+                    DBG();
+                    return false;
                 }
             }
 
@@ -424,12 +590,23 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
 
             // FF1 might use X, if it isn't driven directly
             CellInfo *ff1 = lts.cells[i << 4 | BEL_FF];
+            bool ff1_uses_x = false;
             if (ff1 != nullptr && ff1->ffInfo.d != nullptr && ff1->ffInfo.d->driver.cell != nullptr) {
                 auto &drv = ff1->ffInfo.d->driver;
-                if ((drv.cell == lut6 && drv.port != id_MC31) || drv.cell == lut5 || drv.cell == out_fmux) {
-                    // Direct, OK
+                if ((drv.cell == lut6 && drv.port != id_MC31) || drv.cell == lut5 || drv.cell == out_fmux ||
+                    (carry4 != nullptr && drv.cell == carry4)) {
+                    // Direct, OK (LUT O6/O5, F7/F8 mux out, or the slot's
+                    // CARRY4 O/CO via the XOR/CY xFFMUX paths)
+                } else if (ff1->attrs.count(id_BEL) && (lut6 == nullptr || lut5 == nullptr)) {
+                    // Imported (Vivado-placed) FF with a free LUT position in
+                    // the slot: Vivado feeds the main FF through a LUT
+                    // routethru (free 6LUT: INIT buffer + xFFMUX.O6; free
+                    // 5LUT: lower-half INIT buffer + xFFMUX.O5) and leaves
+                    // the X bypass for the 5FF -- no X usage here.  The
+                    // router realises this via the route-thru pseudo pip.
                 } else {
                     // Indirect, must use X input
+                    ff1_uses_x = true;
                     if (x_net == nullptr)
                         x_net = ff1->ffInfo.d;
                     else if (x_net != ff1->ffInfo.d) {
@@ -460,6 +637,23 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
                 }
             }
 
+            // Legalisation fix (xc7): when the main FF (BEL_FF) takes its D from
+            // the X bypass (indirect) AND the column's secondary "5" FF (BEL_FF2)
+            // is also placed, nextpnr's router fails to bind the main FF's input
+            // MUX (xFFMUX) from X — it silently leaves the main FF's D floating
+            // (observed via physical sim: the bypass-fed AFF's D = X, corrupting
+            // an LFSR).  Forbid that co-pack so the placer separates the two FFs.
+            // Exception: when BOTH FFs carry absolute BEL pins (imported
+            // Vivado placement), trust the import -- Vivado co-packs this
+            // legally, and the route-only flow cannot separate them.  Any
+            // residual xFFMUX emission bug then shows up as a bit-level
+            // diff against the golden bitstream instead of a place error.
+            if (ff1_uses_x && ff2 != nullptr &&
+                !(ff1->attrs.count(id_BEL) && ff2->attrs.count(id_BEL))) {
+                DBG();
+                return false;
+            }
+
             // collision with top address bits
             if (tile_is_memory && !small_memory) {
                 CellInfo *top_lut = lts.cells[(3 << 4) | BEL_6LUT];
@@ -487,12 +681,47 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
             }
 
             if (carry4 != nullptr && carry4->carryInfo.out_sigs[i % 4] != nullptr) {
-                // FIXME: direct connections to FF
-                if (mux_output_used) {
-                    DBG();
-                    return false; // Memory and SRLs only valid in SLICEMs
+                // The carry O output reaches the main FF directly through
+                // the XOR path of xFFMUX; only fabric fanout (or feeding
+                // anything else) needs this subslice's output mux.
+                NetInfo *o = carry4->carryInfo.out_sigs[i % 4];
+                bool o_uses_mux = o->users.size() > 1 || ff1 == nullptr || o != ff1->ffInfo.d;
+                if (o_uses_mux) {
+                    if (mux_output_used) {
+                        DBG();
+                        return false;
+                    }
+                    mux_output_used = true;
                 }
-                mux_output_used = true;
+            }
+            // This CO-fabric vs output-mux contention check stops nextpnr's own
+            // placer from co-locating a CARRY4 CO and a 5FF into an unroutable
+            // slot.  A *stamped* vendor placement (hybrid R0 flow: Vivado places,
+            // nextpnr only routes) can legally co-locate them via muxing nextpnr
+            // doesn't model, so let that flow opt out -- a wrong guess fails
+            // loudly in the router, it can't produce a silently-bad bitstream.
+            static const bool allow_co_5ff_contention =
+                    getenv("NEXTPNR_ALLOW_CO_5FF_CONTENTION") != nullptr;
+            if (!allow_co_5ff_contention && carry4 != nullptr && carry4->carryInfo.cout_sigs[i % 4] != nullptr) {
+                NetInfo *co = carry4->carryInfo.cout_sigs[i % 4];
+                bool co_uses_mux = false;
+                if ((i % 4) == 3) {
+                    // CO3 leaves on the dedicated COUT->CIN spine; only other
+                    // (fabric) users need this subslice's output mux
+                    for (auto &usr : co->users)
+                        if (usr.port != id_CIN)
+                            co_uses_mux = true;
+                } else {
+                    // CO0..CO2 can only reach the fabric through the output mux
+                    co_uses_mux = !co->users.empty();
+                }
+                if (co_uses_mux) {
+                    if (mux_output_used) {
+                        DBG();
+                        return false;
+                    }
+                    mux_output_used = true;
+                }
             }
             if (out_fmux != nullptr) {
                 NetInfo *f7f8 = out_fmux->muxInfo.out;
@@ -514,6 +743,8 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
 
             lts.eights[i].valid = true;
         } else if (!lts.eights[i].valid) {
+            if (dbg_validity_runtime)
+                log_info("  invalid-arm: cached eights[%d].valid=false\n", i);
             return false;
         }
     }
@@ -545,27 +776,53 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
                     CellInfo *ff = lts.cells[z << 4 | (BEL_FF + k)];
                     if (ff == nullptr)
                         continue;
-                    if (ff->ffInfo.is_latch && k == 1)
+                    if (ff->ffInfo.is_latch && k == 1) {
+                        DBG_RT();
                         return false;
+                    }
                     if (found_ff[0] || found_ff[1]) {
-                        if (ff->ffInfo.clk != clk)
+                        if (ff->ffInfo.clk != clk) {
+                            if (dbg_validity_runtime)
+                                log_info("  invalid-arm: ctrlset clk %s: %s vs %s\n", nameOf(ff),
+                                         ff->ffInfo.clk ? nameOf(ff->ffInfo.clk) : "-", clk ? nameOf(clk) : "-");
                             return false;
-                        if (ff->ffInfo.sr != sr)
+                        }
+                        if (ff->ffInfo.sr != sr) {
+                            if (dbg_validity_runtime)
+                                log_info("  invalid-arm: ctrlset sr %s: %s vs %s\n", nameOf(ff),
+                                         ff->ffInfo.sr ? nameOf(ff->ffInfo.sr) : "-", sr ? nameOf(sr) : "-");
                             return false;
-                        if (ff->ffInfo.ce != ce)
+                        }
+                        if (ff->ffInfo.ce != ce) {
+                            if (dbg_validity_runtime)
+                                log_info("  invalid-arm: ctrlset ce %s: %s vs %s\n", nameOf(ff),
+                                         ff->ffInfo.ce ? nameOf(ff->ffInfo.ce) : "-", ce ? nameOf(ce) : "-");
                             return false;
-                        if (ff->ffInfo.is_clkinv != clkinv)
+                        }
+                        if (ff->ffInfo.is_clkinv != clkinv) {
+                            DBG_RT();
                             return false;
-                        if (ff->ffInfo.is_srinv != srinv)
+                        }
+                        if (ff->ffInfo.is_srinv != srinv) {
+                            DBG_RT();
                             return false;
-                        if (ff->ffInfo.is_latch != islatch)
+                        }
+                        if (ff->ffInfo.is_latch != islatch) {
+                            DBG_RT();
                             return false;
-                        if (ff->ffInfo.ffsync != ffsync)
+                        }
+                        if (ff->ffInfo.ffsync != ffsync) {
+                            DBG_RT();
                             return false;
+                        }
                     } else {
                         clk = ff->ffInfo.clk;
-                        if (i == 0 && wclk != nullptr && clk != wclk)
+                        if (i == 0 && wclk != nullptr && clk != wclk) {
+                            if (dbg_validity_runtime)
+                                log_info("  invalid-arm: wclk %s: clk %s vs wclk %s\n", nameOf(ff),
+                                         clk ? nameOf(clk) : "-", wclk ? nameOf(wclk) : "-");
                             return false;
+                        }
                         sr = ff->ffInfo.sr;
                         ce = ff->ffInfo.ce;
                         clkinv = ff->ffInfo.is_clkinv;
@@ -578,10 +835,35 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
             }
             lts.halfs[i].valid = true;
         } else if (!lts.halfs[i].valid) {
+            if (dbg_validity_runtime)
+                log_info("  invalid-arm: cached halfs[%d].valid=false\n", i);
             return false;
         }
     }
     return true;
+}
+
+void Arch::dumpTileStatus(BelId bel) const
+{
+    if (!isLogicTile(bel) || !tileStatus[bel.tile].lts)
+        return;
+    LogicTileStatus &lts = *(tileStatus[bel.tile].lts);
+    for (int z = 0; z < 128; z++) {
+        if (lts.cells[z] == nullptr)
+            continue;
+        CellInfo *c = lts.cells[z];
+        const char *stale = (c->bel == BelId() || c->bel.tile != bel.tile) ? " [STALE: cell not bound here]" : "";
+        log_info("  lts[z=%d eighth=%d slot=%d]: %s (%s)%s\n", z, z >> 4, z & 0xf, nameOf(c), c->type.c_str(this),
+                 stale);
+    }
+    // force a full re-evaluation so the failing arm prints (cached verdicts
+    // from the SA phase were computed with the runtime debug flag off)
+    for (int i = 0; i < 8; i++)
+        lts.eights[i].dirty = true;
+    for (int i = 0; i < 2; i++)
+        lts.halfs[i].dirty = true;
+    log_info("  revalidating tile with arms visible:\n");
+    (void)isBelLocationValid(bel);
 }
 
 bool Arch::isBelLocationValid(BelId bel) const
@@ -592,9 +874,12 @@ bool Arch::isBelLocationValid(BelId bel) const
         if (!tileStatus[bel.tile].lts)
             return true;
         LogicTileStatus &lts = *(tileStatus[bel.tile].lts);
-        if (xc7)
-            return xc7_logic_tile_valid(belTileType, lts);
-        else
+        if (xc7) {
+            bool v = xc7_logic_tile_valid(belTileType, lts);
+            if (!v && dbg_validity_runtime)
+                log_info("  invalid-check: xc7_logic_tile_valid=false (type %s)\n", belTileType.c_str(this));
+            return v;
+        } else
             return xcu_logic_tile_valid(belTileType, lts);
     } else if (belTileType == id_BRAM || belTileType == id_BRAM_L || belTileType == id_BRAM_R) {
         if (!tileStatus[bel.tile].bts)
@@ -632,12 +917,259 @@ bool Arch::isValidBelForCell(CellInfo *cell, BelId bel) const
 {
     if (usp_bel_hard_unavail(bel))
         return false;
+    // A distributed-RAM / SRL LUT (is_memory / is_srl) is only legal in a
+    // SLICEM.  Like the 6LUT-on-5LUT gate below, this MUST be enforced at
+    // candidate-selection time: the tile-level isBelLocationValid() rejects
+    // it only post-hoc, and legalisation can slip a memory/SRL LUT onto a
+    // SLICEL bel that the cached tile check then misses -- surfacing much
+    // later as an unroutable "Pin 'DI1'/'WE' of bel ... has no associated
+    // wire".  This is exactly what happens to the RAMD32/RAMD64 sub-cells
+    // pack_dram splits out of a RAM32X1D/RAM64M: they are created UNSTAMPED
+    // (no BEL attr), so the placer chooses their bels here.  A cell already
+    // carrying a BEL attr is trusted (Vivado/SVS-stamped to a proven SLICEM).
+    if (xc7 && cell->type == id_SLICE_LUTX &&
+        (cell->lutInfo.is_memory || cell->lutInfo.is_srl) &&
+        !cell->attrs.count(id("BEL"))) {
+        IdString tt = getBelTileType(bel);
+        if (tt != id_CLBLM_L && tt != id_CLBLM_R)
+            return false;
+    }
+    // A LUT that uses any 6LUT-only physical pin -- the A6 input or the O6
+    // output -- cannot sit on a 5LUT bel, which has neither (a 5LUT bel is
+    // A1..A5 in, O5 out).  The tile-level isBelLocationValid() also rejects the
+    // A6 case, but only post-hoc; the placer uses THIS per-candidate gate to
+    // choose bels, and legalisation can slip such a LUT onto a 5LUT bel that
+    // the cached tile check then misses -- surfacing much later as an
+    // unroutable "No wire found for port A6/O6".  A 5LUT bel is identified by
+    // the absence of an A6 pin.  The cell needs a 6LUT bel if it draws 6
+    // inputs, drives both outputs, or has a connected A6/O6 physical port
+    // (the latter covers a LUT whose output was mapped to O6 while at a 6LUT
+    // bel and then relocated).
+    // (Only gates USER cells: an imported BEL-pinned cell is fixed at a
+    // Vivado-proven bel -- e.g. a $trt routethru LUT1 deliberately placed at a
+    // free 5LUT -- so it is trusted, not re-validated by this heuristic.)
+    // Marker note: at candidate-selection time a STAMPED cell already carries
+    // its JSON BEL attr (but isn't bound yet, so belStrength is still NONE),
+    // whereas a nextpnr-placed USER cell has no BEL attr until place_initial
+    // back-annotates it post-bind.  So the BEL attr is the correct
+    // "is-this-a-frozen-cell" test HERE (unlike the post-placement fast-path,
+    // which must use belStrength because back-annotation pollutes the attr).
+    if (cell->type == id_SLICE_LUTX && !cell->attrs.count(id("BEL")) &&
+        getBelPinWire(bel, id_A6) == WireId()) {
+        // Count CONNECTED input ports directly rather than lutInfo.input_count:
+        // ABC-mapped LUTs still carry logical pin names (I0..I5) at placement
+        // time, for which lutInfo (which scans A1..A6) reports 0 -- so an
+        // input_count test silently misses them and the placer drops a
+        // 6-input LUT onto a 5LUT bel nondeterministically.
+        int in_used = 0;
+        bool drives_o6 = false;
+        for (auto &p : cell->ports) {
+            if (p.second.net == nullptr)
+                continue;
+            if (p.second.type == PORT_IN)
+                ++in_used;
+            else if (p.first == id_O6)
+                drives_o6 = true;
+        }
+        if (getenv("NEXTPNR_DBG_LUTGATE") && cell->name.str(this).find("47890") != std::string::npos) {
+            log_info("LUTGATE %s at 5LUT bel: in_used=%d drives_o6=%d out_count=%d in_count=%d\n",
+                     cell->name.c_str(this), in_used, int(drives_o6), cell->lutInfo.output_count,
+                     cell->lutInfo.input_count);
+            for (auto &p : cell->ports)
+                log_info("   port %s type=%d net=%d\n", p.first.c_str(this), int(p.second.type),
+                         int(p.second.net != nullptr));
+        }
+        if (in_used == 6 || cell->lutInfo.output_count == 2 || drives_o6 ||
+            get_net_or_empty(cell, id_A6) != nullptr)
+            return false;
+    }
+    // NEXTPNR_EXCLUDE_STAMPED_BBOX: keep unstamped cells out of the bounding
+    // box of the pre-placed (BEL-attr) fabric cells -- the frozen macro's
+    // region, whose LOCKED routing makes it unroutable for foreign logic.
+    // Lazy: computed on the first query for an unstamped cell, at which point
+    // constraint placement has already bound all stamped cells.
+    static bool excl_en = getenv("NEXTPNR_EXCLUDE_STAMPED_BBOX") != nullptr;
+    if (excl_en && !cell->attrs.count(id("BEL")) &&
+        cell->name.str(this).find("$PACKER_") == std::string::npos) {
+        // packer const drivers (GND/VCC legalisation LUTs) must be placeable
+        // next to their loads, including inside the locked macro region
+        static int ex0 = -2, ey0 = 0, ex1 = 0, ey1 = 0;
+        if (ex0 == -2) {
+            ex0 = -1;
+            for (auto &cp : cells) {
+                CellInfo *ci = cp.second.get();
+                if (ci->bel == BelId() || !ci->attrs.count(id("BEL")))
+                    continue;
+                std::string t = ci->type.str(this);
+                if (t.substr(0, 6) != "SLICE_" && t.substr(0, 4) != "RAMD" && t != "CARRY4")
+                    continue;
+                Loc l = getBelLocation(ci->bel);
+                if (ex0 < 0) {
+                    ex0 = ex1 = l.x;
+                    ey0 = ey1 = l.y;
+                } else {
+                    ex0 = std::min(ex0, l.x);
+                    ex1 = std::max(ex1, l.x);
+                    ey0 = std::min(ey0, l.y);
+                    ey1 = std::max(ey1, l.y);
+                }
+            }
+            if (ex0 >= 0)
+                log_info("isValidBelForCell: excluding unstamped cells from bbox (%d,%d)-(%d,%d)\n", ex0, ey0, ex1,
+                         ey1);
+        }
+        if (ex0 >= 0) {
+            Loc l = getBelLocation(bel);
+            if (l.x >= ex0 && l.x <= ex1 && l.y >= ey0 && l.y <= ey1)
+                return false;
+        }
+    }
     return true;
 }
 
 void Arch::fixupPlacement()
 {
+    if (getenv("DBG_SFEED")) {
+        for (auto cell : sorted(cells)) {
+            CellInfo *ci = cell.second;
+            std::string nm = ci->name.str(this);
+            if (nm.find("$LUT$24") != std::string::npos || nm.find("$LUT$26") != std::string::npos)
+                log_info("FEEDPOS %s bel=%s strength=%d constr_parent=%s\n", nm.c_str(),
+                         ci->bel == BelId() ? "UNBOUND" : getBelName(ci->bel).c_str(this),
+                         int(ci->belStrength),
+                         ci->constr_parent ? ci->constr_parent->name.c_str(this) : "none");
+        }
+    }
     log_info("Running post-placement legalisation...\n");
+    // Validity-repair pass: some bind paths (heap solution-apply, detailed
+    // refine) strand a cell at an invalid bel -- a LUT6 on a 5LUT (its 6th
+    // input is invisible at bind time because ABC LUTs carry logical I0..I5
+    // pins) or a memory/SRL LUT in a SLICEL.  Relocate each such standalone,
+    // non-stamped cell to the nearest valid free bel of its type before the
+    // pin-merge fixup below (which assumes a legal placement) runs.
+    {
+        int gw = chip_info->width, gh = chip_info->height;
+        // Collect stranded cluster roots / standalone cells (a LUT+FF pair has
+        // the LUT as root and the FF as a constr_z child; the placer can leave
+        // the LUT6 root on a 5LUT).  A cell is a root here if it has no parent.
+        std::vector<CellInfo *> roots;
+        for (auto &cp : cells) {
+            CellInfo *ci = cp.second.get();
+            if (ci->bel == BelId() || ci->constr_parent != nullptr)
+                continue; // only cluster roots / standalone
+            if (ci->attrs.count(id("BEL")))
+                continue; // stamped: trusted at a proven bel
+            // gather the full cluster tree (root + all transitive children)
+            std::vector<CellInfo *> tree;
+            tree.push_back(ci);
+            for (size_t i = 0; i < tree.size(); i++)
+                for (auto c : tree[i]->constr_children)
+                    tree.push_back(c);
+            // CARRY chains span multiple slices/tiles: nextpnr's dedicated carry
+            // placer handles them, and this single-tile repair would corrupt
+            // their multi-tile geometry -- leave them entirely alone.
+            bool has_carry = false;
+            for (auto m : tree)
+                if (m->type == id_CARRY4) {
+                    has_carry = true;
+                    break;
+                }
+            if (has_carry)
+                continue;
+            bool invalid = false;
+            for (auto m : tree)
+                if (m->bel != BelId() && !isValidBelForCell(m, m->bel))
+                    invalid = true;
+            if (invalid)
+                roots.push_back(ci);
+        }
+        int fixed = 0;
+        for (CellInfo *root : roots) {
+            const bool abs_z = root->constr_abs_z;
+            // Full cluster tree (root + all transitive constr_children), root first.
+            std::vector<CellInfo *> members;
+            members.push_back(root);
+            for (size_t i = 0; i < members.size(); i++)
+                for (auto c : members[i]->constr_children)
+                    members.push_back(c);
+            // Compute the bel of every member for a chosen root bel rb, mirroring
+            // the placer's cluster BFS: a child's z is abs (constr_z) or relative
+            // to its IMMEDIATE parent (parent_z + constr_z) -- this handles nested
+            // MUXF7/MUXF8 trees, not just single-level LUT+FF / DRAM clusters.
+            auto cluster_bels = [&](BelId rb, std::vector<BelId> &out) -> bool {
+                std::vector<std::pair<CellInfo *, Loc>> work;
+                work.emplace_back(root, getBelLocation(rb));
+                out.clear();
+                for (size_t i = 0; i < work.size(); i++) {
+                    CellInfo *vc = work[i].first;
+                    Loc ploc = work[i].second;
+                    BelId tb = getBelByLocation(ploc);
+                    if (tb == BelId() || !checkBelAvail(tb) || getBelType(tb) != vc->type ||
+                        !isValidBelForCell(vc, tb))
+                        return false;
+                    out.push_back(tb);
+                    for (auto child : vc->constr_children) {
+                        Loc cloc = ploc;
+                        if (child->constr_z != child->UNCONSTR)
+                            cloc.z = child->constr_abs_z ? child->constr_z : (ploc.z + child->constr_z);
+                        work.emplace_back(child, cloc);
+                    }
+                }
+                return out.size() == members.size();
+            };
+            Loc oloc = getBelLocation(root->bel);
+            for (auto m : members)
+                if (m->bel != BelId())
+                    unbindBel(m->bel);
+            bool placed = false;
+            std::vector<BelId> mbels;
+            for (int r = 0; r <= std::max(gw, gh) && !placed; r++)
+                for (int dx = -r; dx <= r && !placed; dx++)
+                    for (int dy = -r; dy <= r && !placed; dy++) {
+                        if (std::max(std::abs(dx), std::abs(dy)) != r)
+                            continue;
+                        int x = oloc.x + dx, y = oloc.y + dy;
+                        if (x < 0 || y < 0 || x >= gw || y >= gh)
+                            continue;
+                        for (BelId rb : getBelsByTile(x, y)) {
+                            if (abs_z && getBelLocation(rb).z != root->constr_z)
+                                continue; // abs-z root must sit at its fixed z
+                            if (getBelType(rb) != root->type || !checkBelAvail(rb) ||
+                                !isValidBelForCell(root, rb))
+                                continue;
+                            if (!cluster_bels(rb, mbels))
+                                continue;
+                            for (size_t i = 0; i < members.size(); i++)
+                                bindBel(mbels[i], members[i], STRENGTH_STRONG);
+                            bool allok = true;
+                            for (BelId b : mbels)
+                                if (!isBelLocationValid(b)) {
+                                    allok = false;
+                                    break;
+                                }
+                            if (allok) {
+                                placed = true;
+                                break;
+                            }
+                            for (size_t i = 0; i < members.size(); i++)
+                                unbindBel(mbels[i]);
+                        }
+                    }
+            if (!placed) {
+                // give up: restore members at their original positions
+                std::vector<BelId> obels;
+                if (cluster_bels(getBelByLocation(oloc), obels))
+                    for (size_t i = 0; i < members.size(); i++) {
+                        if (checkBelAvail(obels[i]))
+                            bindBel(obels[i], members[i], STRENGTH_WEAK);
+                    }
+                log_warning("post-place repair: no valid placement for '%s'\n", root->name.c_str(this));
+            } else
+                ++fixed;
+        }
+        if (fixed)
+            log_info("post-place repair: relocated %d stranded cluster(s)/cell(s) to valid bels\n", fixed);
+    }
     for (auto &ts : tileStatus) {
         if (ts.lts == nullptr)
             continue;
@@ -647,6 +1179,32 @@ void Arch::fixupPlacement()
             CellInfo *lut5 = lt.cells[z << 4 | BEL_5LUT];
             if (lut5 == nullptr)
                 continue;
+            // Skip imported (BEL-pinned) LUT slots: this fixup re-merges the
+            // 5LUT/6LUT inputs into <=6 shared physical pins assuming nextpnr's
+            // own packing.  Vivado-frozen LUTs route distinct nets to shared
+            // A-pins (input-pin permutation), so the by-net unique-input set can
+            // exceed 6 and overrun the 6-entry ports[] array (garbage IdString
+            // -> out_of_range).  Their pin mapping is already correct from the
+            // import; leave it untouched.
+            {
+                CellInfo *l6 = lt.cells[z << 4 | BEL_6LUT];
+                if (lut5->belStrength >= STRENGTH_STRONG || (l6 && l6->belStrength >= STRENGTH_STRONG)) {
+                    // Skip the INPUT remerge (it would overwrite Vivado's
+                    // input-pin permutation), but the cell at the 5LUT bel
+                    // still drives O5, not O6: if the imported netlist named
+                    // its output O6, rename it to O5 to match the bel, else the
+                    // router fails with "No wire found for port O6".
+                    if (lut5->ports.count(id_O6)) {
+                        rename_port(getCtx(), lut5, id_O6, id_O5);
+                        std::string orig = lut5->attrs.count(id("X_ORIG_PORT_O6"))
+                                                   ? lut5->attrs.at(id("X_ORIG_PORT_O6")).as_string()
+                                                   : std::string("O");
+                        lut5->attrs.erase(id("X_ORIG_PORT_O6"));
+                        lut5->attrs[id("X_ORIG_PORT_O5")] = orig;
+                    }
+                    continue;
+                }
+            }
             std::unordered_map<IdString, std::vector<int>> lut5Inputs, lut6Inputs;
             for (int i = 0; i < lut5->lutInfo.input_count; i++)
                 if (lut5->lutInfo.input_sigs[i])
@@ -663,7 +1221,11 @@ void Arch::fixupPlacement()
                         lut6->ports[id_A6].name = id_A6;
                         lut6->ports[id_A6].type = PORT_IN;
                     }
-                    connect_port(getCtx(), nets[id("$PACKER_VCC_NET")].get(), lut6, id_A6);
+                    // pack_srls already ties A6 for 6LUT SRLs -- only
+                    // connect when still floating (connect_port asserts
+                    // on an already-driven port)
+                    if (lut6->ports.at(id_A6).net == nullptr)
+                        connect_port(getCtx(), nets[id("$PACKER_VCC_NET")].get(), lut6, id_A6);
                 }
                 continue;
             }
@@ -672,6 +1234,17 @@ void Arch::fixupPlacement()
                 uniqueInputs.insert(i5.first);
             for (auto i6 : lut6Inputs)
                 uniqueInputs.insert(i6.first);
+            // A slot cannot hold more than 6 distinct inputs; if it does the
+            // input-remerge below would overrun ports[6] (garbage IdString ->
+            // out_of_range).  Never legal for a properly-packed slot, so log
+            // the offenders and skip rather than crash.
+            if (uniqueInputs.size() > 6) {
+                CellInfo *l6 = lt.cells[z << 4 | BEL_6LUT];
+                log_warning("fixupPlacement: slot with %d unique inputs (>6): lut5=%s(str%d) lut6=%s(str%d); skip\n",
+                            int(uniqueInputs.size()), nameOf(lut5), int(lut5->belStrength),
+                            l6 ? nameOf(l6) : "-", l6 ? int(l6->belStrength) : -1);
+                continue;
+            }
             // Disconnect LUT inputs, and re-connect them to not overlap
             IdString ports[6] = {id_A1, id_A2, id_A3, id_A4, id_A5, id_A6};
             for (auto p : ports) {
@@ -724,7 +1297,11 @@ void Arch::fixupPlacement()
                     lut6->ports[id_A6].name = id_A6;
                     lut6->ports[id_A6].type = PORT_IN;
                 }
-                connect_port(getCtx(), nets[id("$PACKER_VCC_NET")].get(), lut6, id_A6);
+                // Only tie A6 to VCC when still floating: the input de-dup above
+                // may already have routed a shared input onto A6 (connect_port
+                // asserts on an already-driven port -- same guard as the SRL A6 tie).
+                if (lut6->ports.at(id_A6).net == nullptr)
+                    connect_port(getCtx(), nets[id("$PACKER_VCC_NET")].get(), lut6, id_A6);
             }
         }
     }
