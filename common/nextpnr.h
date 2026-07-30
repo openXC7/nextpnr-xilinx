@@ -861,7 +861,7 @@ struct Context : Arch, DeterministicRNG
 
     WireId getNetinfoSourceWire(const NetInfo *net_info) const;
     WireId getNetinfoSinkWire(const NetInfo *net_info, const PortRef &sink) const;
-    delay_t getNetinfoRouteDelay(const NetInfo *net_info, const PortRef &sink) const;
+    delay_t getNetinfoRouteDelay(const NetInfo *net_info, const PortRef &sink, bool min_delay = false) const;
 
     // provided by router1.cc
     bool checkRoutedDesign() const;

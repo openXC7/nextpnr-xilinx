@@ -2404,8 +2404,9 @@ TimingClockingInfo Arch::getPortClockingInfo(const CellInfo *cell, IdString port
     // slow/late corner; the min/early (hold) corner scales by ~0.45 once
     // DelayInfo carries a separate min (Phase-1 hold pass).
     info.setup = getDelayFromNS(0.05);
-    info.hold = getDelayFromNS(0.143);
+    info.hold = getDelayFromNS(0.143);    // hold requirement: use as-is (min==max)
     info.clockToQ = getDelayFromNS(0.259);
+    info.clockToQ.min = getDelayFromNS(0.117).delay;  // fast-corner clk->Q for hold
     info.clock_port = xc7 ? id_CK : id_CLK;
     info.edge = RISING_EDGE;
     return info;

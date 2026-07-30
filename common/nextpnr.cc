@@ -296,15 +296,22 @@ WireId Context::getNetinfoSinkWire(const NetInfo *net_info, const PortRef &user_
     return getBelPinWire(dst_bel, user_port);
 }
 
-delay_t Context::getNetinfoRouteDelay(const NetInfo *net_info, const PortRef &user_info) const
+delay_t Context::getNetinfoRouteDelay(const NetInfo *net_info, const PortRef &user_info, bool min_delay) const
 {
 #ifdef ARCH_ECP5
     if (net_info->is_global)
         return 0;
 #endif
 
+    // min_delay=true returns the early/fast-corner routed delay for the hold
+    // pass (per-arc DelayInfo::minDelay(), populated in getPipDelay).  The
+    // unrouted predictDelay() fallback is scaled to the fast corner too.
+    auto pd = [&](const NetInfo *n, const PortRef &u) {
+        return min_delay ? delay_t(predictDelay(n, u) * 0.45f) : predictDelay(n, u);
+    };
+
     if (net_info->wires.empty())
-        return predictDelay(net_info, user_info);
+        return pd(net_info, user_info);
 
     WireId src_wire = getNetinfoSourceWire(net_info);
     if (src_wire == WireId())
@@ -324,15 +331,15 @@ delay_t Context::getNetinfoRouteDelay(const NetInfo *net_info, const PortRef &us
         if (pip == PipId())
             break;
 
-        delay += getPipDelay(pip).maxDelay();
-        delay += getWireDelay(cursor).maxDelay();
+        delay += min_delay ? getPipDelay(pip).minDelay() : getPipDelay(pip).maxDelay();
+        delay += min_delay ? getWireDelay(cursor).minDelay() : getWireDelay(cursor).maxDelay();
         cursor = getPipSrcWire(pip);
     }
 
     if (cursor == src_wire)
-        return delay + getWireDelay(src_wire).maxDelay();
+        return delay + (min_delay ? getWireDelay(src_wire).minDelay() : getWireDelay(src_wire).maxDelay());
 
-    return predictDelay(net_info, user_info);
+    return pd(net_info, user_info);
 }
 
 static uint32_t xorshift32(uint32_t x)
