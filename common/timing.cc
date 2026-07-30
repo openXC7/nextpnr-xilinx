@@ -720,16 +720,29 @@ struct Timing
             // annealer keeps near-critical nets short.  Overwrite each call ->
             // holds the last (most-converged) routing iteration's criticality.
             if (const char *cf = getenv("NEXTPNR_CRIT_EXPORT")) {
-                std::ofstream out(cf);
-                if (out) {
-                    for (auto &nc : *net_crit) {
-                        float mx = 0.0f;
-                        for (float c : nc.second.criticality)
-                            mx = std::max(mx, c);
-                        if (mx > 0.05f)
-                            out << nc.first.c_str(ctx) << '\t' << mx << '\n';
-                    }
+                // Key by DRIVER-CELL name, not net name: net names don't survive
+                // bir_to_nextpnr_json flattening on the place_lef side, but cell
+                // names do (as the hold-target export relies on).  Emit the max
+                // criticality over each driver cell's output nets.
+                std::map<IdString, float> cell_crit;
+                for (auto &nc : *net_crit) {
+                    float mx = 0.0f;
+                    for (float c : nc.second.criticality)
+                        mx = std::max(mx, c);
+                    if (mx <= 0.05f)
+                        continue;
+                    auto it = ctx->nets.find(nc.first);
+                    if (it == ctx->nets.end() || it->second->driver.cell == nullptr)
+                        continue;
+                    IdString dc = it->second->driver.cell->name;
+                    auto cur = cell_crit.find(dc);
+                    if (cur == cell_crit.end() || cur->second < mx)
+                        cell_crit[dc] = mx;
                 }
+                std::ofstream out(cf);
+                if (out)
+                    for (auto &cc : cell_crit)
+                        out << cc.first.c_str(ctx) << '\t' << cc.second << '\n';
             }
 #if 0
             if (ctx->debug) {
