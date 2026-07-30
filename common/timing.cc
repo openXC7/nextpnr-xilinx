@@ -95,6 +95,15 @@ struct Timing
     bool update;
     delay_t min_slack;
     delay_t worst_hold_slack = std::numeric_limits<delay_t>::max() / 4;  // WHS (hold pass)
+    // Per-endpoint hold slack (Phase 2: drives targeted hold-buffer insertion).
+    // Recorded only in the reporting analysis (crit_path != nullptr), not during P&R.
+    struct HoldEndpoint
+    {
+        const NetInfo *net;   // net feeding the endpoint (where a delay buffer would go)
+        IdString cell, port;  // the capture FF D pin
+        delay_t slack;
+    };
+    std::vector<HoldEndpoint> hold_endpoints;
     CriticalPathMap *crit_path;
     DelayFrequency *slack_histogram;
     NetCriticalityMap *net_crit;
@@ -410,6 +419,8 @@ struct Timing
                                     delay_t hold_slack =
                                             nd.min_arrival + net_delay_min - clkInfo.hold.maxDelay();
                                     worst_hold_slack = std::min(worst_hold_slack, hold_slack);
+                                    if (crit_path)  // reporting analysis only
+                                        hold_endpoints.push_back({net, usr.cell->name, usr.port, hold_slack});
                                 }
                             }
                         } else {
@@ -758,6 +769,18 @@ void timing_analysis(Context *ctx, bool print_histogram, bool print_fmax, bool p
         // capture FF hold window.  Golden Vivado/OpenSTA ibex reference ~ +0.06ns.
         log_info("Estimated worst hold slack: %.2f ns%s\n", ctx->getDelayNS(timing.worst_hold_slack),
                  timing.worst_hold_slack < 0 ? "  *** HOLD VIOLATION ***" : "");
+        // Phase 2: the tightest hold endpoints -- targets for hold-buffer insertion.
+        auto &he = timing.hold_endpoints;
+        std::sort(he.begin(), he.end(), [](const Timing::HoldEndpoint &a, const Timing::HoldEndpoint &b) {
+            return a.slack < b.slack;
+        });
+        int nshow = std::min<int>(5, he.size());
+        if (nshow > 0) {
+            log_info("Tightest hold endpoints (targets for hold buffering):\n");
+            for (int i = 0; i < nshow; i++)
+                log_info("    %+.3f ns  %s.%s\n", ctx->getDelayNS(he[i].slack), he[i].cell.c_str(ctx),
+                         he[i].port.c_str(ctx));
+        }
     }
     std::map<IdString, std::pair<ClockPair, CriticalPath>> clock_reports;
     std::map<IdString, double> clock_fmax;
