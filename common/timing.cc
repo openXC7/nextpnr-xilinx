@@ -715,6 +715,22 @@ struct Timing
                     nc.cd_worst_slack = worst_slack.at(startdomain.first);
                 }
             }
+            // Export per-net max criticality (0..1) for timing-driven PLACEMENT
+            // feedback: place_lef weights net HPWL by (1 + K*crit), so the SA
+            // annealer keeps near-critical nets short.  Overwrite each call ->
+            // holds the last (most-converged) routing iteration's criticality.
+            if (const char *cf = getenv("NEXTPNR_CRIT_EXPORT")) {
+                std::ofstream out(cf);
+                if (out) {
+                    for (auto &nc : *net_crit) {
+                        float mx = 0.0f;
+                        for (float c : nc.second.criticality)
+                            mx = std::max(mx, c);
+                        if (mx > 0.05f)
+                            out << nc.first.c_str(ctx) << '\t' << mx << '\n';
+                    }
+                }
+            }
 #if 0
             if (ctx->debug) {
                 for (auto &nc : *net_crit) {
