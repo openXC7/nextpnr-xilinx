@@ -324,9 +324,9 @@ PipId Arch::getPipByName(IdString name) const
 IdString Arch::getPipName(PipId pip) const
 {
     NPNR_ASSERT(pip != PipId());
-    auto loc_info  = locInfo(pip);
-    auto pip_data  = loc_info.pip_data[pip.index];
-    auto tile_inst = chip_info->tile_insts[pip.tile];
+    const auto &loc_info  = locInfo(pip);
+    const auto &pip_data  = loc_info.pip_data[pip.index];
+    const auto &tile_inst = chip_info->tile_insts[pip.tile];
     auto site      = pip_data.site;
     auto bel       = pip_data.bel;
 
@@ -2247,7 +2247,7 @@ std::vector<GraphicElement> Arch::getDecalGraphics(DecalId decal) const
         int wires_per_side = int(((swb_x1 - swb_x0) - 2 * wire_margin) / wire_space);
 
         for (auto w : getTileWireRange(wire)) {
-            auto wire_data = locInfo(w).wire_data[w.index];
+            const auto &wire_data = locInfo(w).wire_data[w.index];
             if (wire_data.site != -1)
                 continue;
             int wx = (w.tile % chip_info->width) - (wire_tile % chip_info->width),
