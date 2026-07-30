@@ -27,21 +27,25 @@ typedef int delay_t;
 
 struct DelayInfo
 {
-    delay_t delay = 0;
+    delay_t delay = 0;    // late / slow / max corner
+    // early / fast / min corner.  0 = "unset" -> falls back to `delay`, so all
+    // existing code that only sets `.delay` keeps min==max and the setup pass is
+    // byte-identical.  Set `min` explicitly (fast corner) to enable hold analysis.
+    delay_t min = 0;
 
-    delay_t minRaiseDelay() const { return delay; }
-    delay_t maxRaiseDelay() const { return delay; }
-
-    delay_t minFallDelay() const { return delay; }
-    delay_t maxFallDelay() const { return delay; }
-
-    delay_t minDelay() const { return delay; }
     delay_t maxDelay() const { return delay; }
+    delay_t minDelay() const { return min ? min : delay; }
+
+    delay_t maxRaiseDelay() const { return maxDelay(); }
+    delay_t minRaiseDelay() const { return minDelay(); }
+    delay_t maxFallDelay() const { return maxDelay(); }
+    delay_t minFallDelay() const { return minDelay(); }
 
     DelayInfo operator+(const DelayInfo &other) const
     {
         DelayInfo ret;
-        ret.delay = this->delay + other.delay;
+        ret.delay = this->maxDelay() + other.maxDelay();
+        ret.min = this->minDelay() + other.minDelay();
         return ret;
     }
 };

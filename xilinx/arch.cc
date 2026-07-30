@@ -2396,9 +2396,16 @@ TimingPortClass Arch::getPortTimingClass(const CellInfo *cell, IdString port, in
 TimingClockingInfo Arch::getPortClockingInfo(const CellInfo *cell, IdString port, int index) const
 {
     TimingClockingInfo info;
-    info.setup = getDelayFromNS(0.1);
-    info.hold = getDelayFromNS(0.1);
-    info.clockToQ = getDelayFromNS(0.1);
+    // FF (SLICE_FFX/FDRE-family) timing.  Was a flat 0.1ns stub for all three,
+    // which under-set clk->Q (real slow-corner ~0.26ns) and made hold analysis
+    // impossible.  Values below are the golden-Vivado xc7 -2 calibration
+    // (arcs.tsv per-type slow corner: FDRE clk->Q ~0.26, setup ~0.05, hold
+    // ~0.14ns).  DelayInfo is single-valued today (min==max) so these are the
+    // slow/late corner; the min/early (hold) corner scales by ~0.45 once
+    // DelayInfo carries a separate min (Phase-1 hold pass).
+    info.setup = getDelayFromNS(0.05);
+    info.hold = getDelayFromNS(0.143);
+    info.clockToQ = getDelayFromNS(0.259);
     info.clock_port = xc7 ? id_CK : id_CLK;
     info.edge = RISING_EDGE;
     return info;

@@ -1396,12 +1396,18 @@ struct Arch : BaseCtx
     DelayInfo getPipDelay(PipId pip) const
     {
         DelayInfo delay;
+        // early/fast-corner scale for the min-delay (hold) pass.  Fabric routing
+        // ~0.45x slow (golden get_net_delays FAST_MIN/SLOW_MAX = 0.562, but the
+        // per-PIP tail is lower); the dedicated global clock tree is low-variation
+        // (~0.9) so hold-critical clock skew isn't understated.
+        float minscale = 0.45f;
         NPNR_ASSERT(pip != PipId());
         if (locInfo(pip).pip_data[pip.index].flags == PIP_TILE_ROUTING) {
             int src_intent = wireIntent(getPipSrcWire(pip)), dst_intent = wireIntent(getPipDstWire(pip));
             if (src_intent == ID_NODE_GLOBAL_VDISTR || src_intent == ID_NODE_GLOBAL_HROUTE ||
                 src_intent == ID_NODE_GLOBAL_VROUTE || src_intent == ID_NODE_GLOBAL_HDISTR ||
                 src_intent == ID_NODE_GLOBAL_LEAF || src_intent == ID_NODE_GLOBAL_BUFG) {
+                minscale = 0.9f;
 
                 // Global clock-network per-hop delays, CALIBRATED to the golden
                 // Vivado write_sdf on the VC707 ethloop design (see
@@ -1455,6 +1461,7 @@ struct Arch : BaseCtx
             delay.delay = 300;
         } else
             delay.delay = 25;
+        delay.min = delay_t(delay.delay * minscale);   // fast/early corner (hold)
         return delay;
     }
 
