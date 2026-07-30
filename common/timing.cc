@@ -25,6 +25,7 @@
 #include <deque>
 #include <fstream>
 #include <map>
+#include <sstream>
 #include <unordered_map>
 #include <utility>
 #include "log.h"
@@ -111,6 +112,26 @@ struct Timing
     NetCriticalityMap *net_crit;
     IdString async_clock;
 
+    // Async clock-group exclusion (nextpnr-xilinx has no set_clock_groups): a
+    // setup path from a launch clock in one group to a capture clock in another
+    // is a CDC false path (synchroniser) and must NOT be timed -- otherwise a
+    // 61 ns cpu->eth synchroniser wire reads as a "16 MHz" failure and misleads
+    // the timing-driven router.  Loaded from NEXTPNR_ASYNC_GROUPS: one group per
+    // line, each a whitespace-separated list of substrings; a clock net joins
+    // the first group whose substring its name contains.
+    std::vector<std::vector<std::string>> async_groups;
+    int clock_group(IdString clk) const
+    {
+        if (async_groups.empty())
+            return -1;
+        std::string n = clk.c_str(ctx);
+        for (size_t g = 0; g < async_groups.size(); g++)
+            for (const auto &sub : async_groups[g])
+                if (n.find(sub) != std::string::npos)
+                    return int(g);
+        return -1;
+    }
+
     struct TimingData
     {
         TimingData() : max_arrival(), max_path_length(), min_remaining_budget() {}
@@ -131,6 +152,21 @@ struct Timing
               crit_path(crit_path), slack_histogram(slack_histogram), net_crit(net_crit),
               async_clock(ctx->id("$async$"))
     {
+        if (const char *fn = getenv("NEXTPNR_ASYNC_GROUPS")) {
+            std::ifstream in(fn);
+            std::string line;
+            while (std::getline(in, line)) {
+                std::istringstream iss(line);
+                std::vector<std::string> grp;
+                std::string tok;
+                while (iss >> tok)
+                    grp.push_back(tok);
+                if (!grp.empty())
+                    async_groups.push_back(std::move(grp));
+            }
+            if (!async_groups.empty())
+                log_info("timing: loaded %zu async clock group(s) from %s\n", async_groups.size(), fn);
+        }
     }
 
     delay_t walk_paths()
@@ -355,6 +391,17 @@ struct Timing
                     TimingPortClass portClass = ctx->getPortTimingClass(usr.cell, usr.port, port_clocks);
                     if (portClass == TMG_REGISTER_INPUT || portClass == TMG_ENDPOINT) {
                         auto process_endpoint = [&](IdString clksig, ClockEdge edge, delay_t setup) {
+                            // Async clock-group exclusion: a launch->capture path
+                            // crossing two different async groups is a CDC false
+                            // path -- skip it entirely (no slack/budget/crit).
+                            {
+                                IdString launch_clk = startdomain.first.clock;
+                                if (launch_clk != async_clock && clksig != async_clock) {
+                                    int gl = clock_group(launch_clk), gc = clock_group(clksig);
+                                    if (gl >= 0 && gc >= 0 && gl != gc)
+                                        return;
+                                }
+                            }
                             const auto net_arrival = nd.max_arrival;
                             const auto endpoint_arrival = net_arrival + net_delay + setup;
                             delay_t period;
