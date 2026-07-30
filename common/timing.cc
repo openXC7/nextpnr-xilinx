@@ -21,7 +21,9 @@
 #include "timing.h"
 #include <algorithm>
 #include <boost/range/adaptor/reversed.hpp>
+#include <cstdlib>
 #include <deque>
+#include <fstream>
 #include <map>
 #include <unordered_map>
 #include <utility>
@@ -780,6 +782,24 @@ void timing_analysis(Context *ctx, bool print_histogram, bool print_fmax, bool p
             for (int i = 0; i < nshow; i++)
                 log_info("    %+.3f ns  %s.%s\n", ctx->getDelayNS(he[i].slack), he[i].cell.c_str(ctx),
                          he[i].port.c_str(ctx));
+        }
+        // Phase 2b: export the sub-threshold hold targets (net + capture pin +
+        // slack) so an edit pass -- place_lef FPGA_HOLD_LUT1 or a reroute-detour --
+        // buffers ONLY these instead of blanket every FF->FF.  Env-gated:
+        //   NEXTPNR_HOLD_TARGETS=<file>  NEXTPNR_HOLD_MARGIN_NS=<slack thresh (0.15)>
+        if (const char *tf = getenv("NEXTPNR_HOLD_TARGETS")) {
+            const char *mg = getenv("NEXTPNR_HOLD_MARGIN_NS");
+            double margin = mg ? atof(mg) : 0.15;
+            std::ofstream ofs(tf);
+            int nwr = 0;
+            for (auto &e : he) {
+                if (ctx->getDelayNS(e.slack) >= margin)
+                    break; // sorted ascending
+                ofs << e.net->name.c_str(ctx) << '\t' << e.cell.c_str(ctx) << '.' << e.port.c_str(ctx) << '\t'
+                    << ctx->getDelayNS(e.slack) << '\n';
+                nwr++;
+            }
+            log_info("Wrote %d hold target(s) (< %.3f ns) to %s\n", nwr, margin, tf);
         }
     }
     std::map<IdString, std::pair<ClockPair, CriticalPath>> clock_reports;
