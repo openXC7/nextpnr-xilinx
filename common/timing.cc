@@ -20,6 +20,7 @@
 
 #include "timing.h"
 #include <algorithm>
+#include <cstdio>
 #include <boost/range/adaptor/reversed.hpp>
 #include <deque>
 #include <map>
@@ -715,6 +716,57 @@ void assign_budget(Context *ctx, bool quiet)
 
     if (!quiet)
         log_info("Checksum: 0x%08x\n", ctx->checksum());
+}
+
+std::string Context::reportClockFmaxJson()
+{
+    Context *ctx = this;
+    std::map<IdString, double> clock_fmax;
+    try {
+        CriticalPathMap crit_paths;
+        Timing timing(ctx, true /* net_delays */, false /* update */, &crit_paths, nullptr);
+        timing.walk_paths();
+
+        for (auto &path : crit_paths) {
+            const ClockEvent &a = path.first.start;
+            const ClockEvent &b = path.first.end;
+            if (a.clock != b.clock || a.clock == ctx->id("$async$"))
+                continue;
+            double Fmax;
+            if (a.edge == b.edge)
+                Fmax = 1000 / ctx->getDelayNS(path.second.path_delay);
+            else
+                Fmax = 500 / ctx->getDelayNS(path.second.path_delay);
+            if (!clock_fmax.count(a.clock) || Fmax < clock_fmax.at(a.clock))
+                clock_fmax[a.clock] = Fmax;
+        }
+    } catch (log_execution_error_exception &) {
+        // the timing walk can log_error (combinatorial loops, incomplete
+        // timing ports, ...); a failed REPORT must not kill an already
+        // successfully routed flow -> report no clocks instead
+        return "{}";
+    }
+
+    std::string json = "{";
+    bool first = true;
+    for (auto &clock : clock_fmax) {
+        float target = ctx->setting<float>("target_freq") / 1e6;
+        auto ni = ctx->nets.find(clock.first);
+        if (ni != ctx->nets.end() && ni->second->clkconstr)
+            target = 1000 / ctx->getDelayNS(ni->second->clkconstr->period.minDelay());
+        json += first ? "\"" : ", \"";
+        for (char c : clock.first.str(ctx)) {
+            if (c == '"' || c == '\\')
+                json += '\\';
+            json += c;
+        }
+        char buf[80];
+        snprintf(buf, sizeof(buf), "\": {\"achieved\": %.2f, \"constraint\": %.2f}", clock.second, target);
+        json += buf;
+        first = false;
+    }
+    json += "}";
+    return json;
 }
 
 void timing_analysis(Context *ctx, bool print_histogram, bool print_fmax, bool print_path, bool warn_on_failure)

@@ -43,7 +43,8 @@ void arch_wrap_python()
                            .def("checksum", &Context::checksum)
                            .def("pack", &Context::pack)
                            .def("place", &Context::place)
-                           .def("route", &Context::route);
+                           .def("route", &Context::route)
+                           .def("reportClockFmaxJson", &Context::reportClockFmaxJson);
 
     fn_wrapper_2a<Context, decltype(&Context::isValidBelForCell), &Context::isValidBelForCell, pass_through<bool>,
                   addr_and_unwrap<CellInfo>, conv_from_str<BelId>>::def_wrap(ctx_cls, "isValidBelForCell");

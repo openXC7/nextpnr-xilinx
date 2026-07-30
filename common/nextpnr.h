@@ -877,6 +877,11 @@ struct Context : Arch, DeterministicRNG
     // provided by sdf.cc
     void writeSDF(std::ostream &out, bool cvc_mode = false) const;
 
+    // provided by timing.cc; computes timing on the current (routed) design
+    // and returns per-clock fmax/target as a JSON string. Exposed to Python
+    // for --post-route report scripts (the fork lacks mainline's --report).
+    std::string reportClockFmaxJson();
+
     // --------------------------------------------------------------
 
     uint32_t checksum() const;
