@@ -2309,6 +2309,19 @@ bool Arch::getCellDelay(const CellInfo *cell, IdString fromPort, IdString toPort
     }
 
     if (cell->type == id_SLICE_LUTX) {
+        // Fractured LUT pairs share their physical input pins: the
+        // post-placement and post-routing legalisation bind a shared pin to
+        // BOTH cells of the pair and erase the X_ORIG_PORT_<pin> attribute
+        // on the cell whose logical function does not use it (it can even
+        // end up bound to the cell's own output net). Such a pin has no arc
+        // through THIS lut; reporting one creates false combinational
+        // cycles that deadlock the timing walk post-route.
+        if (fromPort == id_A1 || fromPort == id_A2 || fromPort == id_A3 || fromPort == id_A4 ||
+            fromPort == id_A5 || fromPort == id_A6) {
+            auto orig = cell->attrs.find(id("X_ORIG_PORT_" + fromPort.str(this)));
+            if (orig == cell->attrs.end() || orig->second.str.empty())
+                return false;
+        }
         if (xc7 && inst_id != -1) {
             int z = locInfo(cell->bel).bel_data[cell->bel.index].z;
             IdString tiletype = getBelTileType(cell->bel);
