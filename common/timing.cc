@@ -176,6 +176,15 @@ struct Timing
                     // Otherwise, for all driven input ports on this cell, if a timing arc exists between the input and
                     // the current output port, increment fanin counter
                     for (auto i : input_ports) {
+                        // A cell input pin can end up bound to the cell's own
+                        // output net (e.g. the xc7 post-route LUT pin fixup
+                        // when the router feeds the output back through an
+                        // unused input pin of the same site). Such an arc can
+                        // never be a real timing path, but counting it here
+                        // deadlocks the topological sort below as a false
+                        // combinational loop.
+                        if (cell.second->ports.at(i).net == o->net)
+                            continue;
                         DelayInfo comb_delay;
                         bool is_path = ctx->getCellDelay(cell.second.get(), i, o->name, comb_delay);
                         if (is_path)
@@ -222,6 +231,11 @@ struct Timing
                     // Skip if this is a clocked output (but allow non-clocked ones)
                     if (portClass == TMG_REGISTER_OUTPUT || portClass == TMG_STARTPOINT || portClass == TMG_IGNORE ||
                         portClass == TMG_GEN_CLOCK)
+                        continue;
+                    // Skip the same self-net arcs that were skipped when
+                    // counting fanin above (input bound to the same net as
+                    // the output), keeping both sides symmetrical.
+                    if (port.second.net == net)
                         continue;
                     DelayInfo comb_delay;
                     bool is_path = ctx->getCellDelay(usr.cell, usr.port, port.first, comb_delay);
