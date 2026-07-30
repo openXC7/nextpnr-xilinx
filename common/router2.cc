@@ -28,10 +28,10 @@
 
 #include "router2.h"
 #include <algorithm>
-#include <boost/container/flat_map.hpp>
 #include <chrono>
 #include <deque>
 #include <fstream>
+#include <map>
 #include <queue>
 #include <thread>
 #include "log.h"
@@ -81,7 +81,7 @@ struct Router2
         // nextpnr
         WireId w;
         // net --> number of arcs; driving pip
-        boost::container::flat_map<int, std::pair<int, PipId>> bound_nets;
+        std::map<int, std::pair<int, PipId>> bound_nets;
         // Historical congestion cost
         float hist_cong_cost = 1.0;
         // Wire is unavailable as locked to another arc
