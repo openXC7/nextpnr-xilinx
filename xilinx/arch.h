@@ -1552,6 +1552,13 @@ struct Arch : BaseCtx
     bool getCellDelay(const CellInfo *cell, IdString fromPort, IdString toPort, DelayInfo &delay) const;
     // Get the port class, also setting clockInfoCount to the number of TimingClockingInfos associated with a port
     TimingPortClass getPortTimingClass(const CellInfo *cell, IdString port, int &clockInfoCount) const;
+
+    // DSP48E1 combinational timing helpers (see arch.cc). Phase 1: model the
+    // fully-combinational DSP48E1; registered configs stay TMG_IGNORE.
+    IdString dspStripBusIndex(IdString port) const;
+    bool dsp48e1IsCombinational(const CellInfo *cell) const;
+    double dsp48e1CombInputDelayNS(IdString base) const;
+    bool dsp48e1IsTimedOutput(IdString base) const;
     // Get the TimingClockingInfo of a port
     TimingClockingInfo getPortClockingInfo(const CellInfo *cell, IdString port, int index) const;
 
