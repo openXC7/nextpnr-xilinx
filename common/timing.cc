@@ -20,6 +20,7 @@
 
 #include "timing.h"
 #include <algorithm>
+#include <cstdio>
 #include <boost/range/adaptor/reversed.hpp>
 #include <deque>
 #include <map>
@@ -176,6 +177,15 @@ struct Timing
                     // Otherwise, for all driven input ports on this cell, if a timing arc exists between the input and
                     // the current output port, increment fanin counter
                     for (auto i : input_ports) {
+                        // A cell input pin can end up bound to the cell's own
+                        // output net (e.g. the xc7 post-route LUT pin fixup
+                        // when the router feeds the output back through an
+                        // unused input pin of the same site). Such an arc can
+                        // never be a real timing path, but counting it here
+                        // deadlocks the topological sort below as a false
+                        // combinational loop.
+                        if (cell.second->ports.at(i).net == o->net)
+                            continue;
                         DelayInfo comb_delay;
                         bool is_path = ctx->getCellDelay(cell.second.get(), i, o->name, comb_delay);
                         if (is_path)
@@ -222,6 +232,11 @@ struct Timing
                     // Skip if this is a clocked output (but allow non-clocked ones)
                     if (portClass == TMG_REGISTER_OUTPUT || portClass == TMG_STARTPOINT || portClass == TMG_IGNORE ||
                         portClass == TMG_GEN_CLOCK)
+                        continue;
+                    // Skip the same self-net arcs that were skipped when
+                    // counting fanin above (input bound to the same net as
+                    // the output), keeping both sides symmetrical.
+                    if (port.second.net == net)
                         continue;
                     DelayInfo comb_delay;
                     bool is_path = ctx->getCellDelay(usr.cell, usr.port, port.first, comb_delay);
@@ -715,6 +730,57 @@ void assign_budget(Context *ctx, bool quiet)
 
     if (!quiet)
         log_info("Checksum: 0x%08x\n", ctx->checksum());
+}
+
+std::string Context::reportClockFmaxJson()
+{
+    Context *ctx = this;
+    std::map<IdString, double> clock_fmax;
+    try {
+        CriticalPathMap crit_paths;
+        Timing timing(ctx, true /* net_delays */, false /* update */, &crit_paths, nullptr);
+        timing.walk_paths();
+
+        for (auto &path : crit_paths) {
+            const ClockEvent &a = path.first.start;
+            const ClockEvent &b = path.first.end;
+            if (a.clock != b.clock || a.clock == ctx->id("$async$"))
+                continue;
+            double Fmax;
+            if (a.edge == b.edge)
+                Fmax = 1000 / ctx->getDelayNS(path.second.path_delay);
+            else
+                Fmax = 500 / ctx->getDelayNS(path.second.path_delay);
+            if (!clock_fmax.count(a.clock) || Fmax < clock_fmax.at(a.clock))
+                clock_fmax[a.clock] = Fmax;
+        }
+    } catch (log_execution_error_exception &) {
+        // the timing walk can log_error (combinatorial loops, incomplete
+        // timing ports, ...); a failed REPORT must not kill an already
+        // successfully routed flow -> report no clocks instead
+        return "{}";
+    }
+
+    std::string json = "{";
+    bool first = true;
+    for (auto &clock : clock_fmax) {
+        float target = ctx->setting<float>("target_freq") / 1e6;
+        auto ni = ctx->nets.find(clock.first);
+        if (ni != ctx->nets.end() && ni->second->clkconstr)
+            target = 1000 / ctx->getDelayNS(ni->second->clkconstr->period.minDelay());
+        json += first ? "\"" : ", \"";
+        for (char c : clock.first.str(ctx)) {
+            if (c == '"' || c == '\\')
+                json += '\\';
+            json += c;
+        }
+        char buf[80];
+        snprintf(buf, sizeof(buf), "\": {\"achieved\": %.2f, \"constraint\": %.2f}", clock.second, target);
+        json += buf;
+        first = false;
+    }
+    json += "}";
+    return json;
 }
 
 void timing_analysis(Context *ctx, bool print_histogram, bool print_fmax, bool print_path, bool warn_on_failure)
