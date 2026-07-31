@@ -339,7 +339,19 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
             // frozen == stamped: bound STRENGTH_USER by the BEL-attr placer.
             // (A BEL *attribute* is NOT a reliable marker -- place_initial
             //  back-annotates one onto every nextpnr-placed user cell too.)
-            if (c->belStrength < STRENGTH_STRONG) {
+            //
+            // The bar is LOCKED, not STRONG.  STRENGTH_STRONG is what nextpnr's
+            // OWN cluster/macro placement binds at (place_common.cc place_macro,
+            // the radius search below), so accepting it let a self-placed macro
+            // count as "imported, trust it".  A dist-RAM macro landing in a tile
+            // whose FFs were stamped by place_lef then skipped every control-set
+            // check: RAMD64E on one clock co-packed with FDREs on another, in a
+            // slice with ONE CLK pin.  Unroutable by construction -- it surfaced
+            // as permanently skipped clock arcs (eth-arp: 4 slices of the txf
+            // CDC FIFO, u_txf_wr WCLK vs u_txf_rd CK).  Imported placements bind
+            // USER (attributesToArchInfo / HeAP / placer1), so they still hit
+            // this fast path; nextpnr's own STRONG bindings now get validated.
+            if (c->belStrength < STRENGTH_LOCKED) {
                 all_frozen = false;
                 break;
             }
