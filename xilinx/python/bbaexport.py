@@ -229,18 +229,22 @@ def main():
 					wire_count += 1
 				node_wire_count.append(wire_count)
 				node_intent.append(constid.make("PSEUDO_VCC" if i == 1 else "PSEUDO_GND"))
-		# Create the global Vcc and Ground nodes
+		# Create the global Vcc and Ground nodes.
+		# PATCH: include the GLBL wire of EVERY tile (not only column x=0):
+		# the pseudo const driver bel can be placed in any tile, and if its
+		# GLBL wire is not part of the global node the constant can only
+		# reach its own row -> 'Invalid global constant node' at route time.
 		for i in range(2):
 			wire_count = 0
 			bba.label("n{}_tw".format(len(node_wire_count)))
 			for row in range(d.height):
-				t = d.tiles_by_xy[0, row]
-				tileidx = row * d.width
-				bba.u32(tileidx)
-				wire_idx = tile_types[tile_insts[tileidx].tile_type].global_vcc_wire_index if i == 1 else tile_types[tile_insts[tileidx].tile_type].global_gnd_wire_index
-				bba.u32(wire_idx)
-				tile_insts[tileidx].tilewire_to_node[wire_idx] = len(node_wire_count)
-				wire_count += 1
+				for col in range(d.width):
+					tileidx = row * d.width + col
+					bba.u32(tileidx)
+					wire_idx = tile_types[tile_insts[tileidx].tile_type].global_vcc_wire_index if i == 1 else tile_types[tile_insts[tileidx].tile_type].global_gnd_wire_index
+					bba.u32(wire_idx)
+					tile_insts[tileidx].tilewire_to_node[wire_idx] = len(node_wire_count)
+					wire_count += 1
 			node_wire_count.append(wire_count)
 			node_intent.append(constid.make("PSEUDO_VCC" if i == 1 else "PSEUDO_GND"))
 		print("Exporting tile and site instances...")
