@@ -178,9 +178,128 @@ NetInfo *XilinxPacker::create_internal_net(IdString base, const std::string &pos
     return ctx->nets.at(name).get();
 }
 
+// A LUT6_2 drives two outputs (O5 and O6) and therefore needs two bels -- the
+// 5LUT and the 6LUT of one slice -- but a nextpnr cell occupies exactly one
+// bel. Previously LUT6_2 simply inherited the LUT6 transform rule, which only
+// renames a port called "O"; LUT6_2 has no such port, so O5 was left with no
+// bel pin and routing aborted with "No wire found for port O5".
+//
+// Split each LUT6_2 into two ordinary LUT cells, one per output. Whenever both
+// halves are five-input functions they are constrained back onto the 6LUT and
+// 5LUT of a single site by constrain_lut6_2_pairs(), so the LUT6_2 still costs
+// one physical LUT; the names of such pairs are returned as (lut6, lut5).
+std::vector<std::pair<IdString, IdString>> XilinxPacker::split_lut6_2()
+{
+    std::vector<std::pair<IdString, IdString>> pairs;
+    std::vector<CellInfo *> to_split;
+    for (auto &cell : ctx->cells)
+        if (cell.second->type == ctx->id("LUT6_2"))
+            to_split.push_back(cell.second.get());
+    if (to_split.empty())
+        return pairs;
+
+    for (CellInfo *ci : to_split) {
+        NetInfo *o5 = get_net_or_empty(ci, ctx->id("O5"));
+        NetInfo *o6 = get_net_or_empty(ci, ctx->id("O6"));
+        NetInfo *i5 = get_net_or_empty(ci, ctx->id("I5"));
+        Property init = get_or_default(ci->params, ctx->id("INIT"), Property()).extract(0, 64);
+
+        // Build one LUT<n_in> cell driving `out`, whose INIT is the
+        // 2^n_in-bit slice of the LUT6_2 INIT starting at bit `lo`.
+        auto make_half = [&](const char *suffix, NetInfo *out, int n_in, int lo) {
+            if (out == nullptr)
+                return;
+            std::unique_ptr<CellInfo> half = create_cell(
+                    ctx, ctx->id("LUT" + std::to_string(n_in)), ctx->id(ci->name.str(ctx) + suffix));
+            for (int i = 0; i < n_in; i++) {
+                IdString p = ctx->id("I" + std::to_string(i));
+                half->addInput(p);
+                NetInfo *in = get_net_or_empty(ci, p);
+                if (in != nullptr)
+                    connect_port(ctx, in, half.get(), p);
+            }
+            half->addOutput(ctx->id("O"));
+            connect_port(ctx, out, half.get(), ctx->id("O"));
+            half->params[ctx->id("INIT")] = init.extract(lo, 1 << n_in);
+            new_cells.push_back(std::move(half));
+        };
+
+        // Detach both outputs before reattaching them to the halves.
+        if (o5 != nullptr)
+            disconnect_port(ctx, ci, ctx->id("O5"));
+        if (o6 != nullptr)
+            disconnect_port(ctx, ci, ctx->id("O6"));
+
+        // O5 is always a five-input function of I0..I4, taken from INIT[31:0].
+        make_half("$LUT5", o5, 5, 0);
+
+        // O6 depends on I5. When I5 is tied to a constant, fold it away and
+        // keep O6 as a five-input function -- both halves then draw the same
+        // I0..I4 nets and can share one physical LUT.
+        bool i5_gnd = (i5 != nullptr) && (i5->name == ctx->id("$PACKER_GND_NET"));
+        bool i5_vcc = (i5 != nullptr) && (i5->name == ctx->id("$PACKER_VCC_NET"));
+        bool i5_const = (i5 == nullptr) || i5_gnd || i5_vcc;
+        if (i5 == nullptr || i5_gnd)
+            make_half("$LUT6", o6, 5, 0);
+        else if (i5_vcc)
+            make_half("$LUT6", o6, 5, 32);
+        else
+            make_half("$LUT6", o6, 6, 0);
+
+        // Only a five-input O6 can share a site with the O5 half: a genuine
+        // six-input O6 needs A6, which a 5LUT bel does not have, and the two
+        // halves would then no longer agree on the shared A1..A5 sitewires.
+        if (o5 != nullptr && o6 != nullptr && i5_const)
+            pairs.emplace_back(ctx->id(ci->name.str(ctx) + "$LUT6"), ctx->id(ci->name.str(ctx) + "$LUT5"));
+
+        packed_cells.insert(ci->name);
+    }
+
+    flush_cells();
+    log_info("    split %d LUT6_2 cell(s) into LUT5/LUT6 pairs\n", int(to_split.size()));
+    return pairs;
+}
+
+// Constrain each (lut6, lut5) pair onto the 6LUT and 5LUT of one site, so a
+// LUT6_2 still costs a single physical LUT.
+//
+// This has to run after generic_xform(): pack_luts() maps every LUT output to
+// O6, but a 5LUT bel has only O5, and isValidBelForCell() rejects an
+// O6-driving cell there -- leaving a 5LUT-constrained cell with no legal site
+// and aborting placement. Renaming the O5 half's output first makes the
+// constraint placeable. fixupPlacement() would do the same rename after
+// placement for an opportunistically fractured pair; doing it up front simply
+// lets the constraint be satisfied in the first place.
+void XilinxPacker::constrain_lut6_2_pairs(const std::vector<std::pair<IdString, IdString>> &pairs)
+{
+    for (auto &p : pairs) {
+        if (!ctx->cells.count(p.first) || !ctx->cells.count(p.second))
+            continue;
+        CellInfo *lut6 = ctx->cells.at(p.first).get();
+        CellInfo *lut5 = ctx->cells.at(p.second).get();
+        if (lut6->type != id_SLICE_LUTX || lut5->type != id_SLICE_LUTX)
+            continue;
+
+        rename_port(ctx, lut5, id_O6, id_O5);
+        lut5->attrs.erase(ctx->id("X_ORIG_PORT_O6"));
+        lut5->attrs[ctx->id("X_ORIG_PORT_O5")] = std::string("O");
+
+        // Both halves carry the same nets on A1..A5, which is what lets them
+        // share the fractured LUT's input sitewires.
+        lut6->constr_children.push_back(lut5);
+        lut5->constr_parent = lut6;
+        lut5->constr_x = 0;
+        lut5->constr_y = 0;
+        lut5->constr_abs_z = false;
+        lut5->constr_z = BEL_5LUT - BEL_6LUT;
+    }
+}
+
 void XilinxPacker::pack_luts()
 {
     log_info("Packing LUTs..\n");
+
+    auto lut6_2_pairs = split_lut6_2();
 
     std::unordered_map<IdString, XFormRule> lut_rules;
     for (int k = 1; k <= 6; k++) {
@@ -190,8 +309,8 @@ void XilinxPacker::pack_luts()
             lut_rules[lut].port_xform[ctx->id("I" + std::to_string(i))] = ctx->id("A" + std::to_string(i + 1));
         lut_rules[lut].port_xform[ctx->id("O")] = ctx->id("O6");
     }
-    lut_rules[ctx->id("LUT6_2")] = lut_rules[ctx->id("LUT6")];
     generic_xform(lut_rules, true);
+    constrain_lut6_2_pairs(lut6_2_pairs);
 }
 
 void XilinxPacker::pack_ffs()
