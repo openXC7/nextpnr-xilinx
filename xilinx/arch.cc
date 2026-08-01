@@ -324,9 +324,9 @@ PipId Arch::getPipByName(IdString name) const
 IdString Arch::getPipName(PipId pip) const
 {
     NPNR_ASSERT(pip != PipId());
-    auto loc_info  = locInfo(pip);
-    auto pip_data  = loc_info.pip_data[pip.index];
-    auto tile_inst = chip_info->tile_insts[pip.tile];
+    const auto &loc_info  = locInfo(pip);
+    const auto &pip_data  = loc_info.pip_data[pip.index];
+    const auto &tile_inst = chip_info->tile_insts[pip.tile];
     auto site      = pip_data.site;
     auto bel       = pip_data.bel;
 
@@ -2247,7 +2247,7 @@ std::vector<GraphicElement> Arch::getDecalGraphics(DecalId decal) const
         int wires_per_side = int(((swb_x1 - swb_x0) - 2 * wire_margin) / wire_space);
 
         for (auto w : getTileWireRange(wire)) {
-            auto wire_data = locInfo(w).wire_data[w.index];
+            const auto &wire_data = locInfo(w).wire_data[w.index];
             if (wire_data.site != -1)
                 continue;
             int wx = (w.tile % chip_info->width) - (wire_tile % chip_info->width),
@@ -2300,6 +2300,62 @@ DecalXY Arch::getGroupDecal(GroupId pip) const { return {}; };
 
 // -----------------------------------------------------------------------
 
+IdString Arch::dspStripBusIndex(IdString port) const
+{
+    const std::string &s = port.str(this);
+    size_t n = s.size();
+    while (n > 0 && s[n - 1] >= '0' && s[n - 1] <= '9')
+        --n;
+    return id(s.substr(0, n));
+}
+
+bool Arch::dsp48e1IsCombinational(const CellInfo *cell) const
+{
+    // Combinational only if every internal register is bypassed. Params are
+    // stored as binary strings; any '1' bit means the register is enabled.
+    static const char *regs[] = {"AREG", "BREG",  "CREG", "DREG",    "ADREG",
+                                 "MREG", "PREG",  "ACASCREG", "BCASCREG"};
+    for (const char *r : regs) {
+        auto it = cell->params.find(id(r));
+        // Property::as_bool() handles the numeric (bit-string) params without
+        // asserting is_string; any non-zero register value means it's enabled.
+        if (it != cell->params.end() && it->second.as_bool())
+            return false;
+    }
+    return true;
+}
+
+double Arch::dsp48e1CombInputDelayNS(IdString base) const
+{
+    // Conservative propagation delay from a DSP48E1 data input to any timed
+    // output: worst case over the prjxray DSP_R.sdf combinational variants
+    // (all internal registers bypassed). 0.0 == not a combinational data input.
+    const std::string &s = base.str(this);
+    if (s == "A") return 5.40;
+    if (s == "ACIN") return 5.20;
+    if (s == "INMODE") return 5.48;
+    if (s == "D") return 5.05;
+    if (s == "B") return 3.85;
+    if (s == "BCIN") return 3.61;
+    if (s == "OPMODE") return 2.52;
+    if (s == "ALUMODE") return 2.29;
+    if (s == "CARRYINSEL") return 2.11;
+    if (s == "C") return 2.02;
+    if (s == "MULTSIGNIN") return 1.71;
+    if (s == "PCIN") return 1.71;
+    if (s == "CARRYIN") return 1.61;
+    if (s == "CARRYCASCIN") return 1.34;
+    return 0.0;
+}
+
+bool Arch::dsp48e1IsTimedOutput(IdString base) const
+{
+    const std::string &s = base.str(this);
+    return s == "P" || s == "PCOUT" || s == "CARRYOUT" || s == "CARRYCASCOUT" ||
+           s == "MULTSIGNOUT" || s == "PATTERNDETECT" || s == "PATTERNBDETECT" ||
+           s == "OVERFLOW" || s == "UNDERFLOW" || s == "ACOUT" || s == "BCOUT";
+}
+
 bool Arch::getCellDelay(const CellInfo *cell, IdString fromPort, IdString toPort, DelayInfo &delay) const
 {
     int tt_id = -1, inst_id = -1;
@@ -2309,6 +2365,19 @@ bool Arch::getCellDelay(const CellInfo *cell, IdString fromPort, IdString toPort
     }
 
     if (cell->type == id_SLICE_LUTX) {
+        // Fractured LUT pairs share their physical input pins: the
+        // post-placement and post-routing legalisation bind a shared pin to
+        // BOTH cells of the pair and erase the X_ORIG_PORT_<pin> attribute
+        // on the cell whose logical function does not use it (it can even
+        // end up bound to the cell's own output net). Such a pin has no arc
+        // through THIS lut; reporting one creates false combinational
+        // cycles that deadlock the timing walk post-route.
+        if (fromPort == id_A1 || fromPort == id_A2 || fromPort == id_A3 || fromPort == id_A4 ||
+            fromPort == id_A5 || fromPort == id_A6) {
+            auto orig = cell->attrs.find(id("X_ORIG_PORT_" + fromPort.str(this)));
+            if (orig == cell->attrs.end() || orig->second.str.empty())
+                return false;
+        }
         if (xc7 && inst_id != -1) {
             int z = locInfo(cell->bel).bel_data[cell->bel.index].z;
             IdString tiletype = getBelTileType(cell->bel);
@@ -2347,6 +2416,18 @@ bool Arch::getCellDelay(const CellInfo *cell, IdString fromPort, IdString toPort
                 delay.delay = 200; // FIXME
                 return true;
             }
+    } else if (cell->type == id("DSP48E1_DSP48E1")) {
+        // Combinational DSP48E1 (Phase 1). getPortTimingClass leaves any
+        // registered config as TMG_IGNORE, so this is only reached when the
+        // DSP is fully combinational. Conservative per-input delay; the
+        // accurate per-variant chipdb model is Phase 2. Upstream PR material.
+        if (!dsp48e1IsCombinational(cell))
+            return false;
+        double d = dsp48e1CombInputDelayNS(dspStripBusIndex(fromPort));
+        if (d <= 0.0 || !dsp48e1IsTimedOutput(dspStripBusIndex(toPort)))
+            return false;
+        delay = getDelayFromNS(d);
+        return true;
     }
     return false;
 }
@@ -2389,6 +2470,17 @@ TimingPortClass Arch::getPortTimingClass(const CellInfo *cell, IdString port, in
             return TMG_COMB_INPUT;
         if (port == id("O"))
             return TMG_COMB_OUTPUT;
+    } else if (cell->type == id("DSP48E1_DSP48E1")) {
+        // Phase 1: only the fully-combinational DSP48E1. Registered configs
+        // stay transparent (TMG_IGNORE) exactly as before -> no regression.
+        if (!dsp48e1IsCombinational(cell))
+            return TMG_IGNORE;
+        IdString base = dspStripBusIndex(port);
+        if (dsp48e1IsTimedOutput(base))
+            return TMG_COMB_OUTPUT;
+        if (dsp48e1CombInputDelayNS(base) > 0.0)
+            return TMG_COMB_INPUT;
+        return TMG_IGNORE; // CLK / CE* / RST* / config pins
     }
     return TMG_IGNORE;
 }

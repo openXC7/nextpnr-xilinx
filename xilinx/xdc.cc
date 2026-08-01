@@ -185,6 +185,12 @@ void Arch::parseXdc(std::istream &in)
             }
             if (!got_period)
                 log_error("found create_clock without period (on line %d)", lineno);
+            if (cursor >= int(arguments.size())) {
+                // virtual clock (no target ports/nets): not supported; skip it
+                // instead of crashing with std::out_of_range
+                log_warning("ignoring virtual clock (unsupported, on line %d)\n", lineno);
+                continue;
+            }
             std::vector<NetInfo *> dest = get_nets(arguments.at(cursor));
             for (auto n : dest) {
                 n->clkconstr = std::unique_ptr<ClockConstraint>(new ClockConstraint);
