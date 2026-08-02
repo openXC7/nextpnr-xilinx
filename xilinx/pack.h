@@ -117,6 +117,8 @@ struct XilinxPacker
 
     // LUTs & FFs
     void pack_inverters();
+    std::vector<std::pair<IdString, IdString>> split_lut6_2();
+    void constrain_lut6_2_pairs(const std::vector<std::pair<IdString, IdString>> &pairs);
     void pack_luts();
     void pack_ffs();
     void pack_lutffs();
