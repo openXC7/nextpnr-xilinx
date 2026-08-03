@@ -76,6 +76,11 @@ struct Router2
         float total() const { return cost + togo_cost; }
     };
 
+    // reserved_net sentinel: the wire sits on the forced corridor of MORE
+    // THAN ONE arc. Absorbing state — once contested, no net ever re-claims
+    // it (this is what makes the reservation fixpoint terminate).
+    static constexpr int RESERVED_CONTESTED = -2;
+
     struct PerWireData
     {
         // nextpnr
@@ -86,8 +91,13 @@ struct Router2
         float hist_cong_cost = 1.0;
         // Wire is unavailable as locked to another arc
         bool unavailable = false;
-        // This wire has to be used for this net
+        // This wire has to be used for this net (-1 = unreserved;
+        // RESERVED_CONTESTED = two arcs' forced corridors share it, so no
+        // net pre-claims it and the congestion loop arbitrates instead)
         int reserved_net = -1;
+        // reserved_net came from a LOCKED binding (frozen macro / clock
+        // spine): a hard keepout for every other net, never contestable
+        bool reserved_locked = false;
         // The notional location of the wire, to guarantee thread safety
         int16_t x = 0, y = 0;
         // Visit data
@@ -224,6 +234,7 @@ struct Router2
                     // Vivado's PIP list omits) itself, deterministically, using
                     // a real maze route instead of an external BFS guess.
                     pwd.reserved_net = bound->udata;
+                    pwd.reserved_locked = true;
                 }
             }
 
@@ -432,7 +443,7 @@ struct Router2
         // and LUT
         if (iter_count > 0)
             return false; // heuristic to assume we've hit general routing
-        if (wire_data(wire).reserved_net != -1 && wire_data(wire).reserved_net != net->udata)
+        if (wire_data(wire).reserved_net >= 0 && wire_data(wire).reserved_net != net->udata)
             return true; // reserved for another net
         for (auto bp : ctx->getWireBelPins(wire))
             if ((net->driver.cell == nullptr || bp.bel == net->driver.cell->bel) &&
@@ -469,8 +480,29 @@ struct Router2
             auto &wd = wire_data(cursor);
             if (ctx->debug)
                 log("      %s\n", ctx->nameOfWire(cursor));
-            did_something |= (wd.reserved_net != net->udata);
-            wd.reserved_net = net->udata;
+            if (wd.reserved_locked) {
+                if (wd.reserved_net != net->udata)
+                    // the corridor crosses another net's LOCKED wire: hard
+                    // keepout, nothing to claim beyond it — stop and let the
+                    // arc route (or fail) on its own merits
+                    break;
+                // our own locked wire: already effectively reserved
+            } else if (wd.reserved_net == RESERVED_CONTESTED) {
+                // shared corridor trunk: stays contested (absorbing state)
+            } else if (wd.reserved_net != -1 && wd.reserved_net != net->udata) {
+                // two arcs' forced corridors share this wire. Handing it to
+                // either net starves the other, and flip-flopping ownership
+                // never converges (the historic fixpoint hang) — mark it
+                // contested so NO net pre-claims it and the congestion loop
+                // arbitrates instead.
+                if (ctx->debug)
+                    log("      contested with %s\n", ctx->nameOf(nets_by_udata.at(wd.reserved_net)));
+                wd.reserved_net = RESERVED_CONTESTED;
+                did_something = true;
+            } else {
+                did_something |= (wd.reserved_net != net->udata);
+                wd.reserved_net = net->udata;
+            }
             if (cursor == src)
                 break;
             WireId next_cursor;
@@ -508,7 +540,9 @@ struct Router2
                 for (size_t i = 0; i < net->users.size(); i++)
                     did_something |= reserve_wires_for_arc(net, i);
             }
-        } while (did_something && ++iters < 5);
+        } while (did_something && ++iters < 100);
+        if (did_something)
+            log_warning("router2: wire reservation did not converge after %d sweeps\n", iters);
     }
 
     void reset_wires(ThreadContext &t)
@@ -650,7 +684,7 @@ struct Router2
                     auto &wd = flat_wires[next];
                     if (wd.unavailable)
                         continue;
-                    if (!unbounded && wd.reserved_net != -1 && wd.reserved_net != net->udata)
+                    if (!unbounded && wd.reserved_net >= 0 && wd.reserved_net != net->udata)
                         continue; // final pass ignores reservations too (cf. router1 ripup)
                     if (!unbounded && (int(wd.bound_nets.size()) > (allowed_cong + 1) ||
                         (allowed_cong == 0 && wd.bound_nets.size() == 1 && !wd.bound_nets.count(net->udata))))
@@ -781,7 +815,7 @@ struct Router2
                 auto &wd = flat_wires[next];
                 if (wd.unavailable)
                     continue;
-                if (wd.reserved_net != -1 && wd.reserved_net != net->udata)
+                if (wd.reserved_net >= 0 && wd.reserved_net != net->udata)
                     continue;
                 if (wd.bound_nets.size() > 1 || (wd.bound_nets.size() == 1 && !wd.bound_nets.count(net->udata)))
                     continue; // never allow congestion in backwards routing
@@ -891,7 +925,7 @@ struct Router2
                 auto &nwd = flat_wires.at(next_idx);
                 if (nwd.unavailable)
                     continue;
-                if (nwd.reserved_net != -1 && nwd.reserved_net != net->udata)
+                if (nwd.reserved_net >= 0 && nwd.reserved_net != net->udata)
                     continue;
                 if (nwd.bound_nets.count(net->udata) && nwd.bound_nets.at(net->udata).second != dh)
                     continue;
