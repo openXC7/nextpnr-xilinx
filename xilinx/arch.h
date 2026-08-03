@@ -23,6 +23,7 @@
 #error Include "arch.h" via "nextpnr.h" only.
 #endif
 
+#include <unordered_set>
 #include <boost/iostreams/device/mapped_file.hpp>
 
 #include <iostream>
@@ -875,8 +876,25 @@ struct Arch : BaseCtx
             updateBramBel(bel, nullptr);
     }
 
+    // NEXTPNR_BEL_BLACKLIST=<file>: reserve individual BELs by name (one
+    // "SLICE_X27Y57/A5LUT" per line).  Needed to hand a PARTIALLY pre-placed
+    // design to HeAP: the analytic placer happily drops a free cell into a spare
+    // bel of a slice that already holds a pinned CARRY4/SRL cluster, which the
+    // validity checker then rejects ("constraint satisfaction check failed") --
+    // and re-pinning offenders one at a time is whack-a-mole across every carry
+    // slice.  Blacklisting the spare bels of cluster slices keeps HeAP out of
+    // them entirely.  Lazily loaded on first use (env read once).
+    mutable std::unordered_set<int64_t> blacklist_bels;
+    mutable bool blacklist_bels_loaded = false;
+    void load_bel_blacklist() const;
+
     bool usp_bel_hard_unavail(BelId bel) const
     {
+        if (!blacklist_bels_loaded)
+            load_bel_blacklist();
+        if (!blacklist_bels.empty() &&
+            blacklist_bels.count((int64_t(bel.tile) << 32) | uint32_t(bel.index)))
+            return true;
         // if (chip_info->height > 600 && (bel.tile / chip_info->width) < 752) // constrain to SLR0
         //    return true;
         if ((getBelType(bel) == id_PSEUDO_GND || getBelType(bel) == id_PSEUDO_VCC) &&

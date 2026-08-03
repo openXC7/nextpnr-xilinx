@@ -513,7 +513,13 @@ class SAPlacer
             if (get_constraints_distance(ctx, cell.second) != 0)
                 log_error("constraint satisfaction check failed for cell '%s' at Bel '%s'\n", cell.first.c_str(ctx),
                           ctx->getBelName(cell.second->bel).c_str(ctx));
-        timing_analysis(ctx);
+        // NEXTPNR_CRIT_PATH_REPORT=1: also dump the per-stage critical path
+        // breakdown (logic vs routing ns).  router2 never calls timing_analysis,
+        // and only router1 passes print_path, so without this the open flow can
+        // report "43 MHz" with no way to see WHICH path is slow.
+        timing_analysis(ctx, true /* slack_histogram */, true /* print_fmax */,
+                        getenv("NEXTPNR_CRIT_PATH_REPORT") != nullptr /* print_path */,
+                        false /* warn_on_failure */);
         ctx->unlock();
         return true;
     }

@@ -2512,4 +2512,31 @@ const std::vector<std::string> Arch::availablePlacers = {"sa",
 const std::string Arch::defaultRouter = "router2";
 const std::vector<std::string> Arch::availableRouters = {"router1", "router2"};
 
+void Arch::load_bel_blacklist() const
+{
+    blacklist_bels_loaded = true;
+    const char *f = getenv("NEXTPNR_BEL_BLACKLIST");
+    if (f == nullptr)
+        return;
+    std::ifstream in(f);
+    if (!in)
+        return;
+    std::string ln;
+    int n = 0, miss = 0;
+    while (std::getline(in, ln)) {
+        while (!ln.empty() && (ln.back() == '\r' || ln.back() == ' '))
+            ln.pop_back();
+        if (ln.empty() || ln[0] == '#')
+            continue;
+        BelId b = getBelByName(id(ln));
+        if (b == BelId()) {
+            miss++;
+            continue;
+        }
+        blacklist_bels.insert((int64_t(b.tile) << 32) | uint32_t(b.index));
+        n++;
+    }
+    log_info("bel blacklist: reserved %d bel(s) from %s (%d unresolved)\n", n, f, miss);
+}
+
 NEXTPNR_NAMESPACE_END
