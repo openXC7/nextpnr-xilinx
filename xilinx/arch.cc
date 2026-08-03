@@ -2369,6 +2369,20 @@ bool Arch::route()
     // exited 255; as a post-router fill it only consumes leftover resources.
     routeVcc();
     fixupRouting();
+    // POST-ROUTE timing.  Only router1 runs timing_analysis after routing, so
+    // with router2 the ONLY "Max frequency" lines in the log come from
+    // placer1's post-placement call -- an estimate built from
+    // estimateDelay(), before a single wire is chosen.  Every Fmax quoted for
+    // a router2 build is therefore a placement estimate, not routed timing,
+    // which is a poor objective to optimise against.
+    //   NEXTPNR_POST_ROUTE_TIMING=1  re-run the analysis on the real routing
+    //   NEXTPNR_CRIT_PATH_REPORT=1   also dump the critical path stage by stage
+    if (getenv("NEXTPNR_POST_ROUTE_TIMING") != nullptr) {
+        log_info("Post-route timing analysis:\n");
+        timing_analysis(getCtx(), false /* slack_histogram */, true /* print_fmax */,
+                        getenv("NEXTPNR_CRIT_PATH_REPORT") != nullptr /* print_path */,
+                        false /* warn_on_failure */);
+    }
     getCtx()->settings[getCtx()->id("route")] = 1;
     archInfoToAttributes();
     return result;
