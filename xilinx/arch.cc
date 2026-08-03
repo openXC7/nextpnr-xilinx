@@ -1725,10 +1725,17 @@ void Arch::applyFixedRoutes(const std::string &filename)
             IdString pk = id("A" + std::to_string(k));
             IdString ak = id("X_ORIG_PORT_A" + std::to_string(k));
             NetInfo *n = ci->ports.count(pk) ? ci->ports.at(pk).net : nullptr;
-            auto it = (n == nullptr) ? net_orig.end() : net_orig.find(n);
-            if (it == net_orig.end())
-                ci->attrs.erase(ak);
-            else
+            // Only REWRITE labels for pins that carry a net; never erase.
+            // Erasing a netless pin's label costs 430 extra unrouted arcs
+            // (516 -> 946 with everything else equal): X_ORIG_PORT drives the
+            // FASM INIT permutation but is also read when deciding how a LUT's
+            // inputs may be permuted, so removing it changes routing. A stale
+            // label on a pin with no net cannot mis-permute INIT anyway --
+            // get_lut_init only consults log_to_bit for nets that exist.
+            if (n == nullptr)
+                continue;
+            auto it = net_orig.find(n);
+            if (it != net_orig.end())
                 ci->attrs[ak] = Property(it->second);
         }
     }
