@@ -1140,7 +1140,8 @@ void Arch::applyFixedRoutes(const std::string &filename)
         return s.substr(a, b - a + 1);
     };
 
-    int nbound = 0, nlines = 0, miss_net = 0, miss_tile = 0, miss_pip = 0, conflict = 0, malformed = 0;
+    int nbound = 0, nlines = 0, miss_net = 0, miss_tile = 0, miss_pip = 0, conflict = 0, malformed = 0,
+        redundant = 0;
     std::unordered_set<NetInfo *> fixed_nets;
 
     // hierarchy-seam-normalised net lookup: Vivado-extracted names join levels
@@ -1208,7 +1209,17 @@ void Arch::applyFixedRoutes(const std::string &filename)
             continue;
         int home = bp.tile;
         std::function<void(WireId, int)> rec = [&](WireId w, int depth) {
-            WireId cw = canonicalWireId(chip_info, w.tile, w.index);
+            if (w == WireId())
+                return;
+            // A NODAL wire is already canonical and encodes tile == -1 (see
+            // canonicalWireId / wireInfo).  Re-canonicalising one indexes
+            // tile_insts[-1] and returns a garbage WireId, which segfaults in
+            // getPipsDownhill.  This bites whenever the driver's own belpin wire
+            // is nodal: `home` is then -1, so the "same tile" containment test
+            // below (d.tile != home) MATCHES other nodal wires instead of
+            // excluding them, and the walk recurses straight into shared INT
+            // routing with an invalid wire.
+            WireId cw = w.tile < 0 ? w : canonicalWireId(chip_info, w.tile, w.index);
             // A wire reachable from TWO different drivers is a shared OUTMUX
             // (xMUX) output that several cells could drive -- mapping it to one
             // driver is a guess that binds the wrong net, so mark it ambiguous
@@ -1218,7 +1229,11 @@ void Arch::applyFixedRoutes(const std::string &filename)
                 drv_net[cw] = ni;
             else if (it->second != ni)
                 it->second = nullptr;
-            if (depth <= 0)
+            // home < 0 means the driver belpin is itself nodal, so "stay in the
+            // driver's tile" cannot be expressed -- every nodal wire would
+            // compare equal to it.  Record the mapping and stop, which is what
+            // the containment test was there to achieve.
+            if (depth <= 0 || home < 0)
                 return;
             for (auto pip : getPipsDownhill(cw)) { // pips attach to the canonical wire
                 WireId d = getPipDstWire(pip);
@@ -1296,6 +1311,84 @@ void Arch::applyFixedRoutes(const std::string &filename)
     }
     log_info("    fixed-routes: %d/%zu route-nets resolved by driver topology\n", topo_hits, byname.size());
 
+    // ---- slice output mux (xMUX) as a SITE pip ---------------------------
+    // A Vivado node route crosses the slice's combinational output mux
+    // ("CLBLM_R_X129Y5/CLBLM_L_D -> .../CLBLM_L_DMUX").  prjxray marks those 10
+    // per CLB tile type is_pseudo=1 -- correctly, they are not interconnect --
+    // so the chipdb carries no TILE pip and the wire-name scan above finds
+    // nothing.  nextpnr models the same mux as a SITE pip feeding the site wire
+    // "<lane>MUX", which is what makes fasm.cc emit <lane>OUTMUX.<sel>.
+    //
+    // Resolve through the NET'S DRIVER BEL rather than by parsing the tile wire
+    // name: one CLB tile holds two slices and only the name prefix
+    // (CLBLM_L_ vs CLBLM_M_, CLBLL_L_ vs CLBLL_LL_) distinguishes them, which is
+    // fragile.  The driver is by definition in the site whose mux this is.
+    int xmux_hits = 0, xmux_fail = 0;
+    auto xmux_site_pip = [&](NetInfo *net, const std::string &srcname,
+                             const std::string &dstname) -> PipId {
+        size_t sl = dstname.rfind('/');
+        std::string w = (sl == std::string::npos) ? dstname : dstname.substr(sl + 1);
+        // short name must end "<A-D>MUX" (excludes CLBLM_IMUX*, GFAN etc.)
+        if (w.size() < 4 || w.compare(w.size() - 3, 3, "MUX") != 0)
+            return PipId();
+        char lane = w[w.size() - 4];
+        if (lane < 'A' || lane > 'D')
+            return PipId();
+        if (net == nullptr || net->driver.cell == nullptr)
+            return PipId();
+        BelId bel = net->driver.cell->bel;
+        if (bel == BelId())
+            return PipId();
+        // the "<lane>MUX" wire belonging to the DRIVER's own site
+        auto &l = locInfo(bel);
+        auto &bd = l.bel_data[bel.index];
+        IdString want = id(std::string(1, lane) + "MUX");
+        WireId xmux;
+        for (int i = 0; i < l.num_wires; i++) {
+            auto &wd = l.wire_data[i];
+            if (wd.site == bd.site && wd.name == want.index) {
+                xmux.tile = bel.tile;
+                xmux.index = i;
+                break;
+            }
+        }
+        if (xmux == WireId())
+            return PipId();
+        // Pick the uphill site pip carrying THIS net.  Prefer a source already
+        // bound to it; otherwise fall back to the source the Vivado wire name
+        // implies -- "<tile>_COUT" is the carry out (CY), anything else is the
+        // LUT's direct output (O6).  Never guess beyond that: a wrong mux
+        // selection silently mis-routes rather than failing loudly.
+        // Site source wire names are LANE-QUALIFIED: the D6LUT's output is
+        // "D6LUT_O6", not "O6", and the carry out feeding DMUX is "CARRY4_CO3"
+        // (the prjxray feature spells the same selection DOUTMUX.CY).
+        bool from_cout = srcname.size() >= 4 &&
+                         srcname.compare(srcname.size() - 4, 4, "COUT") == 0;
+        std::string implied = from_cout
+                                      ? "CARRY4_CO" + std::to_string(lane - 'A')
+                                      : std::string(1, lane) + "6LUT_O6";
+        PipId by_name;
+        for (auto p : getPipsUphill(xmux)) {
+            WireId s = getPipSrcWire(p);
+            if (getBoundWireNet(s) == net)
+                return p;
+            if (wireInfo(s).name == id(implied).index && by_name == PipId())
+                by_name = p;
+        }
+        if (by_name != PipId()) {
+            xmux_hits++;
+            return by_name;
+        }
+        if (xmux_fail++ < 5) {
+            std::string avail;
+            for (auto p : getPipsUphill(xmux))
+                avail += std::string(" ") + IdString(wireInfo(getPipSrcWire(p)).name).str(this);
+            log_warning("fixed-routes: xMUX %c of %s: no source '%s' (have:%s)\n", lane,
+                        nameOf(net), implied, avail.c_str());
+        }
+        return PipId();
+    };
+
     std::string line;
     while (std::getline(in, line)) {
         auto hash = line.find('#');
@@ -1324,6 +1417,21 @@ void Arch::applyFixedRoutes(const std::string &filename)
             auto nn = norm_nets.find(norm_name(netname));
             if (nn != norm_nets.end())
                 net = nn->second;
+        }
+        if (net == nullptr) {
+            // CONSTANT nets have no shared name: Vivado calls them GND/VCC (or
+            // <const0>/<const1>), the packer calls them $PACKER_GND_NET /
+            // $PACKER_VCC_NET.  Nor can driver topology find them -- a const net
+            // is multi-source, one tie-off per region, with no driver cell.
+            // Map them explicitly so an imported route can carry the tie-off
+            // distribution instead of leaving it to routeVcc()'s fill pass.
+            const char *pk = nullptr;
+            if (netname == "GND" || netname == "<const0>" || netname == "\\<const0>")
+                pk = "$PACKER_GND_NET";
+            else if (netname == "VCC" || netname == "<const1>" || netname == "\\<const1>")
+                pk = "$PACKER_VCC_NET";
+            if (pk != nullptr)
+                net = getNetByAlias(id(pk));
         }
         if (net == nullptr) {
             if (miss_net++ < 20)
@@ -1363,6 +1471,8 @@ void Arch::applyFixedRoutes(const std::string &filename)
                         pip = p;
                         break;
                     }
+            if (pip == PipId())
+                pip = xmux_site_pip(net, srcname, dstname);
             if (pip == PipId()) {
                 if (miss_pip++ < 20)
                     log_warning("fixed-routes: no pip %s->%s\n", srcname.c_str(), dstname.c_str());
@@ -1427,6 +1537,27 @@ void Arch::applyFixedRoutes(const std::string &filename)
                             getPipName(pip).str(this).c_str(), nameOf(sn != nullptr && sn != net ? sn : dn));
             continue;
         }
+        // A wire has exactly ONE driver.  If dst already belongs to this net it
+        // may already be DRIVEN -- routeClock() runs before us and routes the
+        // dedicated clock backbone, so a whole-design import (which carries the
+        // clock nets too, they are TYPE == SIGNAL in Vivado) can offer a second,
+        // fabric-side source for a BUFGCTRL input the backbone already feeds.
+        // The check above only rejects a different NET, so the second pip was
+        // bound and the FASM selected two sources for one mux -- fasm2frames
+        // then aborts with FasmInconsistentBits (measured: 3 BUFGCTRL I0 muxes,
+        // each CK_MUXED* from routeClock plus IMUX* from the import).
+        if (dn == net) {
+            bool already_driven = false;
+            for (auto up : getPipsUphill(dst))
+                if (getBoundPipNet(up) != nullptr) {
+                    already_driven = true;
+                    break;
+                }
+            if (already_driven) {
+                redundant++;
+                continue;
+            }
+        }
         if (sn == nullptr)
             bindWire(src, net, STRENGTH_LOCKED);
         if (dn == nullptr)
@@ -1435,8 +1566,12 @@ void Arch::applyFixedRoutes(const std::string &filename)
         fixed_nets.insert(net);
         nbound++;
     }
-    log_info("    fixed-routes: bound %d/%d pips (net-miss %d, tile-miss %d, pip-miss %d, conflict %d, malformed %d)\n",
-             nbound, nlines, miss_net, miss_tile, miss_pip, conflict, malformed);
+    log_info("    fixed-routes: bound %d/%d pips (net-miss %d, tile-miss %d, pip-miss %d, conflict %d, malformed %d, "
+             "redundant-driver %d)\n",
+             nbound, nlines, miss_net, miss_tile, miss_pip, conflict, malformed, redundant);
+    if (xmux_hits > 0 || xmux_fail > 0)
+        log_info("    fixed-routes: %d xMUX pseudo-pips resolved to site pips (%d unresolved)\n", xmux_hits,
+                 xmux_fail);
 
     // LUT-pin TEMPLATE: align every frozen LUT's input ports to the physical
     // input sitewire each net's locked (inter-slice) route actually delivers it
@@ -1454,8 +1589,30 @@ void Arch::applyFixedRoutes(const std::string &filename)
     // aligning each cell independently to the shared per-sitewire net stays
     // consistent.  Only fixed (locked-route-fed) LUTs are touched: a fresh LUT's
     // inputs carry no fixed net, so dnet stays null and it is skipped.
+    // REPLICATE MODE: when the netlist, the placement AND the routing all come
+    // from the same external implementation, each LUT's INIT and its pin
+    // assignment are ALREADY mutually consistent -- Vivado's word is
+    // authoritative and there is nothing to reconcile.  The template exists for
+    // the opposite case (our own placement fed by a foreign route), and it
+    // re-permutes INIT along with the ports, which is the known-buggy path
+    // noted above.  Skip it entirely; set NEXTPNR_FIXEDROUTES_PINSWAP=1 to force
+    // the old behaviour for comparison.
+    // Two INDEPENDENT switches: skipping the pin swap must NOT imply skipping
+    // the router.  The intra-site last mile (xFFMUX / xOUTMUX / input crossbar)
+    // exists only as SITE pips, which an external node-level route never
+    // contains -- and those muxes are emitted from BOUND site wires, so if
+    // router2 never runs they are never selected.  Measured: a
+    // ROUTE_FIXED_ONLY fasm had 24 FFMUX features where a routed build has
+    // 2235, i.e. essentially every flip-flop left with an unconfigured D mux --
+    // dead on hardware.  So allow "keep Vivado's pin assignment" while still
+    // letting the router complete the last mile.
+    bool replicate = getenv("NEXTPNR_FIXEDROUTES_NO_PINSWAP") != nullptr ||
+                     (getenv("NEXTPNR_ROUTE_FIXED_ONLY") != nullptr &&
+                      getenv("NEXTPNR_FIXEDROUTES_PINSWAP") == nullptr);
     int pin_swaps = 0;
     for (auto &cellp : cells) {
+        if (replicate)
+            break;
         CellInfo *ci = cellp.second.get();
         if (ci->type != id("SLICE_LUTX") || ci->bel == BelId())
             continue;
@@ -1463,6 +1620,25 @@ void Arch::applyFixedRoutes(const std::string &filename)
         if (zpos != BEL_6LUT && zpos != BEL_5LUT)
             continue;
         int npin = (zpos == BEL_6LUT) ? 6 : 5;
+        // Snapshot net -> ORIGINAL logical port (I0..I5) before any swap.  The
+        // FASM INIT permutation is driven entirely by X_ORIG_PORT_A*, and the
+        // hand-rolled label shuffling below loses a label whenever the target
+        // pin was empty (orig_tgt == "" so X_ORIG_PORT_A<src> is erased and not
+        // restored) -- that input then reads as don't-care and the emitted truth
+        // table changes popcount.  Measured against Vivado's own netlist: only
+        // 82 of 2265 LUT INITs survived, vs 1792 with no swapping at all.
+        // Rederiving every label from the FINAL port assignment makes the
+        // labels correct by construction, whatever the swaps did.
+        std::unordered_map<NetInfo *, std::string> net_orig;
+        for (int k = 1; k <= 6; k++) {
+            IdString pk = id("A" + std::to_string(k));
+            IdString ak = id("X_ORIG_PORT_A" + std::to_string(k));
+            if (!ci->attrs.count(ak) || !ci->ports.count(pk))
+                continue;
+            NetInfo *n = ci->ports.at(pk).net;
+            if (n != nullptr)
+                net_orig[n] = ci->attrs.at(ak).as_string();
+        }
         // Align all inputs: nextpnr's router treats each belpin as fixed to its
         // tile input (A6-only leaves A1..A5 mismatched -> hooking collides ->
         // 516-overused livelock), so the swap IS needed for routing.  KNOWN BUG:
@@ -1543,8 +1719,24 @@ void Arch::applyFixedRoutes(const std::string &filename)
                 ci->attrs[oa_src] = orig_tgt;
             pin_swaps++;
         }
+        // Rebuild X_ORIG_PORT_A* from where the nets ACTUALLY ended up, so the
+        // INIT permutation in get_lut_init matches the final pin assignment.
+        for (int k = 1; k <= 6; k++) {
+            IdString pk = id("A" + std::to_string(k));
+            IdString ak = id("X_ORIG_PORT_A" + std::to_string(k));
+            NetInfo *n = ci->ports.count(pk) ? ci->ports.at(pk).net : nullptr;
+            auto it = (n == nullptr) ? net_orig.end() : net_orig.find(n);
+            if (it == net_orig.end())
+                ci->attrs.erase(ak);
+            else
+                ci->attrs[ak] = Property(it->second);
+        }
     }
-    log_info("    fixed-routes: %d LUT-pin template swaps\n", pin_swaps);
+    if (replicate)
+        log_info("    fixed-routes: LUT-pin template SKIPPED (replicate mode -- the imported "
+                 "netlist's INIT and pin assignment are authoritative)\n");
+    else
+        log_info("    fixed-routes: %d LUT-pin template swaps\n", pin_swaps);
 
     // Complete the last mile of every locked arc.  With the hard-macro
     // contract (router2 now RESERVES locked wires to their own net rather
@@ -2115,6 +2307,27 @@ bool Arch::route()
         std::string fixed = str_or_default(settings, id("fixed-routes"), "");
         if (!fixed.empty())
             applyFixedRoutes(fixed);
+    }
+    // NEXTPNR_ROUTE_FIXED_ONLY=1: treat the IMPORTED routing AS the routing and
+    // run no general router at all.  Replaying a complete external route (e.g.
+    // a Vivado implementation via dcp2routes) leaves router2 nothing useful to
+    // do -- every inter-site pip is already bound and LOCKED -- while it still
+    // spends hours failing to "complete" arcs whose wires it may not touch.
+    //
+    // --route-clock-only is NOT a substitute: it returns before routeVcc(), and
+    // the fixed-routes file carries SIGNAL nets only (dcp2routes filters on
+    // Vivado's TYPE == SIGNAL), so every constant tie-off would be left
+    // unrouted and the bitstream dead.  Run the same finishing passes the
+    // normal path does -- routeVcc() as the fill, then fixupRouting() -- so the
+    // FASM is complete.
+    if (getenv("NEXTPNR_ROUTE_FIXED_ONLY") != nullptr) {
+        findSourceSinkLocations();
+        routeVcc();
+        fixupRouting();
+        getCtx()->settings[getCtx()->id("route")] = 1;
+        archInfoToAttributes();
+        log_info("    route-fixed-only: imported routing kept as-is; no general router run\n");
+        return true;
     }
     // --route-clock-only: nextpnr routes just the dedicated clock backbone
     // (IBUFDS->BUFG input on CCIO->CMT->HROW->CK_MUXED, and BUFG->global) and
