@@ -35,7 +35,11 @@ inline NetInfo *port_or_nullptr(const CellInfo *cell, IdString name)
 }
 
 //#define DEBUG_VALIDITY
-bool dbg_validity_runtime = false;
+// Initialised from the environment here rather than in a placer: placer1
+// already sets it, but the default xc7 flow uses HeAP, whose strict
+// legaliser is precisely the caller one needs to observe when a placement
+// refuses to legalise.
+bool dbg_validity_runtime = getenv("NEXTPNR_DUMP_INVALID_TILE") != nullptr;
 #define DBG_RT()                                                                                                       \
     do {                                                                                                               \
         if (dbg_validity_runtime)                                                                                      \
@@ -339,7 +343,21 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
             // frozen == stamped: bound STRENGTH_USER by the BEL-attr placer.
             // (A BEL *attribute* is NOT a reliable marker -- place_initial
             //  back-annotates one onto every nextpnr-placed user cell too.)
-            if (c->belStrength < STRENGTH_STRONG) {
+            //
+            // The threshold must be STRENGTH_USER, exactly as the comment
+            // above says.  STRENGTH_STRONG is what nextpnr's own machinery
+            // uses for cells IT constrains: HeAP's strict legaliser binds
+            // every chain it places with STRENGTH_STRONG and calls
+            // isBelLocationValid() right after (placer_heap.cc,
+            // legalise_placement_strict), and placer1 binds cluster children
+            // the same way.  At STRENGTH_STRONG, any tile filled by a carry
+            // chain or F7/F8 mux tree was mistaken for a frozen import and
+            // skipped validation entirely -- making the legaliser's own
+            // validity query vacuous, so illegal LUT pairings (two LUTs
+            // whose logical inputs need more distinct physical pins than
+            // the slice has) survived to the router, which then failed with
+            // one overused SITEWIRE contended by two nets.
+            if (c->belStrength < STRENGTH_USER) {
                 all_frozen = false;
                 break;
             }
@@ -382,17 +400,25 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
         if (l5->lutInfo.is_memory || l5->lutInfo.is_srl)
             continue;
         int in_used = 0;
-        bool drives_o6 = false;
         for (auto &port : l5->ports) {
             if (port.second.net == nullptr)
                 continue;
             if (port.second.type == PORT_IN)
                 ++in_used;
-            else if (port.first == id_O6)
-                drives_o6 = true;
         }
-        if (in_used > 5 || drives_o6 || l5->lutInfo.output_count == 2 ||
-            get_net_or_empty(l5, id_A6) != nullptr || get_net_or_empty(l5, id_O6) != nullptr)
+        // Reject only what the 5LUT bel PHYSICALLY cannot provide: a 6th
+        // input (in_used / A6) or a second output.  A single-output cell
+        // whose port happens to be NAMED O6 is NOT invalid here: that is the
+        // documented pre-fixup state of every carry DI feed-through --
+        // pack_carry_xc7 constrains them to the 5LUT bel with the output
+        // still called O6, and fixupPlacement() renames it to O5 after
+        // placement ("the cell at the 5LUT bel still drives O5, not O6",
+        // below).  Rejecting on the port NAME made every carry chain with
+        // DI feed-throughs impossible to legalise: the condition travels
+        // with the chain, so no location could ever pass, and HeAP's strict
+        // legaliser span forever.
+        if (in_used > 5 || l5->lutInfo.output_count == 2 ||
+            get_net_or_empty(l5, id_A6) != nullptr)
             return false;
     }
     bool tile_is_memory = false;
@@ -532,15 +558,15 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
                     DBG();
                     return false; // Memory and SRLs only valid in SLICEMs
                 }
-                // The 5LUT bel has neither an A6 input nor an O6 output: a cell
-                // occupying it must not use either.  input_count only counts
-                // A1..A6 ports, so it misses an ABC LUT that still drives the
-                // 6-output "O6" port (or draws A6) -- which passes every input
-                // check above yet is unroutable ("No wire found for port O6").
-                // Catch it HERE so SA swaps and the final placement check
-                // enforce it, not just the initial-placement isValidBelForCell
-                // gate (which SA/legalisation bypass).
-                if (get_net_or_empty(lut5, id_A6) != nullptr || get_net_or_empty(lut5, id_O6) != nullptr) {
+                // The 5LUT bel has no A6 input: a cell occupying it must not
+                // draw one.  The output side is NOT checked by port name --
+                // a single-output cell whose port is still called O6 is the
+                // legal pre-fixup state of a carry DI feed-through
+                // (pack_carry_xc7 constrains them to the 5LUT bel;
+                // fixupPlacement() renames O6->O5 after placement).  What the
+                // bel physically cannot provide -- a second output -- is
+                // already rejected by the output_count check above.
+                if (get_net_or_empty(lut5, id_A6) != nullptr) {
                     DBG();
                     return false;
                 }
@@ -1188,7 +1214,16 @@ void Arch::fixupPlacement()
             // import; leave it untouched.
             {
                 CellInfo *l6 = lt.cells[z << 4 | BEL_6LUT];
-                if (lut5->belStrength >= STRENGTH_STRONG || (l6 && l6->belStrength >= STRENGTH_STRONG)) {
+                // "Imported" must mean STRENGTH_USER (the strength the
+                // BEL-attr placer binds with), NOT STRENGTH_STRONG: that is
+                // how HeAP's legaliser binds every chain it places, so at
+                // STRENGTH_STRONG this skipped the remerge for every carry
+                // chain and mux tree nextpnr itself placed -- leaving the
+                // 5LUT and 6LUT of a slot with uncoordinated default pin
+                // assignments, i.e. two different nets on the same physical
+                // A-pin, which the router reports as one overused SITEWIRE
+                // contended by two nets.
+                if (lut5->belStrength >= STRENGTH_USER || (l6 && l6->belStrength >= STRENGTH_USER)) {
                     // Skip the INPUT remerge (it would overwrite Vivado's
                     // input-pin permutation), but the cell at the 5LUT bel
                     // still drives O5, not O6: if the imported netlist named
