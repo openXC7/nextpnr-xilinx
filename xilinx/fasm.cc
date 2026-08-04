@@ -622,6 +622,29 @@ struct FasmBackend
                     continue;
 
                 if (belname.substr(1) == "DI1MUX") {
+                    // prjxray names the non-default leg of these muxes after
+                    // BOTH signals sharing it -- the LUTRAM write-data
+                    // broadcast and the SRL MC31 cascade run through one
+                    // config bit: ADI1MUX -> BDI1_BMC31, BDI1MUX -> DI_CMC31,
+                    // CDI1MUX -> DI_DMC31 (there is no DDI1MUX).  The
+                    // default own-letter leg (AI/BI/CI) keeps its plain name.
+                    // Emitting the bare site-wire name (e.g. BMC31) makes
+                    // fasm2frames reject the feature.
+                    if (pinname != std::string(1, belname[0]) + "I") {
+                        switch (belname[0]) {
+                        case 'A':
+                            pinname = "BDI1_BMC31";
+                            break;
+                        case 'B':
+                            pinname = "DI_CMC31";
+                            break;
+                        case 'C':
+                            pinname = "DI_DMC31";
+                            break;
+                        default:
+                            break;
+                        }
+                    }
                     belname = "DI1MUX";
                 }
 
