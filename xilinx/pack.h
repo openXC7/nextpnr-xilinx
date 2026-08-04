@@ -132,6 +132,7 @@ struct XilinxPacker
                           const std::vector<NetInfo *> &select, NetInfo *out, int zoffset);
 
     void pack_srls();
+    void constrain_srl_cascades();
 
     void split_carry4s();
 
