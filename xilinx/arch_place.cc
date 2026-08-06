@@ -1594,7 +1594,15 @@ void Arch::fixupRouting()
                     auto &orig_attr = lut6->attrs[id("X_ORIG_PORT_" + p.str(this))].str;
                     bool first = true;
                     for (auto &nc : new_connections.at(p)) {
-                        orig_attr += orig_ports_l6[nc] + (first ? "" : " ");
+                        // Separator goes BETWEEN labels, not after each one: suffixing
+                        // fused the pins into "I0I1 ", which Vivado rejects on import
+                        // as "InstTerm I0I1 does not exist".
+                        const std::string &lbl = orig_ports_l6[nc];
+                        if (lbl.empty())
+                            continue;
+                        if (!first)
+                            orig_attr += " ";
+                        orig_attr += lbl;
                         first = false;
                     }
                     if (orig_attr.empty())
@@ -1610,7 +1618,12 @@ void Arch::fixupRouting()
                     auto &orig_attr = lut5->attrs[id("X_ORIG_PORT_" + p.str(this))].str;
                     bool first = true;
                     for (auto &nc : new_connections.at(p)) {
-                        orig_attr += orig_ports_l5[nc] + (first ? "" : " ");
+                        const std::string &lbl = orig_ports_l5[nc];
+                        if (lbl.empty())
+                            continue;
+                        if (!first)
+                            orig_attr += " ";
+                        orig_attr += lbl;
                         first = false;
                     }
                     if (orig_attr.empty())
