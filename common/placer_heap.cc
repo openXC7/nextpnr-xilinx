@@ -936,8 +936,16 @@ class HeAPPlacer
 
             while (!placed) {
 
-                // Set a conservative timeout
-                if (attempts > std::max(10000, 3 * int(ctx->cells.size())))
+                // Set a conservative timeout.  The radius-expansion branch
+                // resets iter every ~10*(radius+1) attempts, so reaching the
+                // full-grid radius cap costs ~5*max(max_x,max_y)^2 attempts
+                // before the search can even see sparse site types (e.g.
+                // BUFGCTRL: 32 sites on a ~160x100 die).  A plain
+                // max(10000, 3*cells) guard fires before that, making every
+                // unpinned BUFG/BUFH unplaceable (regression from
+                // 369038ed).  Budget the radius growth plus a full-grid
+                // search pass on top of the cell-count term.
+                if (attempts > std::max(10000, 3 * int(ctx->cells.size())) + 10 * max_x * max_y)
                     log_error("Unable to find legal placement for cell '%s', check constraints and utilisation.\n",
                               ctx->nameOf(ci));
 
