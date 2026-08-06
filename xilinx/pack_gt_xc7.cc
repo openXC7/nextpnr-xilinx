@@ -136,6 +136,20 @@ void XC7Packer::pack_gt()
     for (auto &cell : ctx->cells) {
         CellInfo *ci = cell.second.get();
 
+        // Tag every GT primitive with X_ORIG_TYPE.  xform_cell() sets this when
+        // it TRANSFORMS a cell, but GT cells are configured in place and keep
+        // their type, so they never got one -- and json2dcp needs it to know
+        // which Unisim to re-create (Unisim.valueOf(X_ORIG_TYPE)).  Without it
+        // a DCP rebuilt from a routed json aborts with "cell ... of type
+        // 'GTXE2_CHANNEL' has no X_ORIG_TYPE attribute", so no GT-bearing open
+        // -flow design could be measured in Vivado at all.  Untransformed cell:
+        // the original type IS the current type.
+        if (ci->type == id_GTPE2_COMMON || ci->type == id_GTXE2_COMMON ||
+            ci->type == id_GTPE2_CHANNEL || ci->type == id_GTXE2_CHANNEL ||
+            ci->type == ctx->id("IBUFDS_GTE2"))
+            if (!ci->attrs.count(ctx->id("X_ORIG_TYPE")))
+                ci->attrs[ctx->id("X_ORIG_TYPE")] = ci->type.str(ctx);
+
         if (ci->type == id_GTPE2_COMMON || ci->type == id_GTXE2_COMMON) {
             all_plls.push_back(ci);
             const IdString refclk0_used_attr = ctx->id("_GTREFCLK0_USED"),
