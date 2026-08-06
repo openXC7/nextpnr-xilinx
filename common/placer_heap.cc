@@ -291,6 +291,44 @@ class HeAPPlacer
             ctx->bindBel(bel, cell, strength);
         }
 
+        // LAST-RESORT BIND FOR PARENTLESS PACKER-CREATED CELLS.
+        //
+        // The packer invents cells the placer's solution never covered.  Two
+        // hooks already handle the ones that are CHAIN CHILDREN of a placed
+        // parent (bind_unplaced_children here and in place_common.cc, for the
+        // carry S/DI feed-through LUTs under a stamped CARRY4).  A constant
+        // driver such as $PACKER_GND_NET$LUT$10 has NO parent, so neither hook
+        // reaches it and it arrives here unbound -- which killed an otherwise
+        // healthy run of an externally-placed design ("Found unbound cell
+        // $PACKER_GND_NET$LUT$10") after the analytical placer had finished.
+        //
+        // Such a cell is free to sit anywhere a compatible BEL is available:
+        // it drives a constant, so it has no timing or congestion cost worth
+        // optimising.  Place it rather than abort.  Anything still unbound
+        // after this is a genuine failure and still errors.
+        for (auto cell : sorted(ctx->cells)) {
+            CellInfo *ci = cell.second;
+            if (ci->bel != BelId())
+                continue;
+            log_info("HeAP: unbound after solution: '%s' type=%s parent=%s\n",
+                     ci->name.c_str(ctx), ci->type.c_str(ctx),
+                     ci->constr_parent ? ci->constr_parent->name.c_str(ctx) : "<none>");
+            // A cell with a placed parent belongs to the chain-binding hooks
+            // above; only take the ones they cannot reach.
+            if (ci->constr_parent != nullptr && ci->constr_parent->bel != BelId())
+                continue;
+            bool ok = place_single_cell(ctx, ci, /*require_legality=*/true);
+            if (!ok) {
+                // Retry without the legality requirement: a constant driver has
+                // no timing or congestion cost, so any compatible BEL will do,
+                // and a strict-legality miss here is not worth aborting over.
+                ok = place_single_cell(ctx, ci, /*require_legality=*/false);
+            }
+            log_info("HeAP: late-bind packer cell '%s' (type %s): %s\n",
+                     ci->name.c_str(ctx), ci->type.c_str(ctx),
+                     ok ? ctx->getBelName(ci->bel).c_str(ctx) : "FAILED");
+        }
+
         for (auto cell : sorted(ctx->cells)) {
             if (cell.second->bel == BelId())
                 log_error("Found unbound cell %s\n", cell.first.c_str(ctx));
