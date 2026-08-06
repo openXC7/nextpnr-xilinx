@@ -909,6 +909,14 @@ class HeAPPlacer
             int radius = 0;
             int iter = 0;
             int iter_at_radius = 0;
+            // Total attempts for this cell, never reset (unlike iter, which
+            // the radius-expansion branch resets).  Without this the
+            // per-cell timeout below can never fire: once radius is capped at
+            // max(max_x,max_y), iter oscillates in [0, 10*(radius+1)] forever
+            // and an unplaceable cell (e.g. validity-rejected carry/mux
+            // conflict) spins the legaliser in an endless loop instead of
+            // failing fast.
+            int attempts = 0;
             bool placed = false;
             BelId bestBel;
             int best_inp_len = std::numeric_limits<int>::max();
@@ -929,7 +937,7 @@ class HeAPPlacer
             while (!placed) {
 
                 // Set a conservative timeout
-                if (iter > std::max(10000, 3 * int(ctx->cells.size())))
+                if (attempts > std::max(10000, 3 * int(ctx->cells.size())))
                     log_error("Unable to find legal placement for cell '%s', check constraints and utilisation.\n",
                               ctx->nameOf(ci));
 
@@ -951,6 +959,7 @@ class HeAPPlacer
 
                 iter++;
                 iter_at_radius++;
+                attempts++;
                 if (iter >= (10 * (radius + 1))) {
                     radius = std::min(std::max(max_x, max_y), radius + 1);
                     while (radius < std::max(max_x, max_y)) {
