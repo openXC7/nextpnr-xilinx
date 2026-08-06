@@ -1198,7 +1198,17 @@ struct FasmBackend
             // is_riob18 branch only emitted one or the other; this restructure
             // emits both on HP banks.
             if (slew == "SLOW") {
-                if (iostandard != "LVDS_25" && iostandard != "TMDS_33")
+                // On HP banks Vivado encodes SSTL15/SSTL135 SLOW with the
+                // per-standard bits only (segbits_riob18.db); the general
+                // LVCMOS-family group is used for LVCMOS/LVTTL (and for the
+                // unused half of an active HP tile).  Emitting both makes
+                // fasm2frames hit FasmInconsistentBits (SSTL bits overlap
+                // the general group with opposite polarity).
+                bool is_hp_sstl_slow =
+                    is_hp_bank &&
+                    (iostandard == "SSTL15" || iostandard == "SSTL135");
+                if (iostandard != "LVDS_25" && iostandard != "TMDS_33" &&
+                    !is_hp_sstl_slow)
                     write_bit("LVCMOS12_LVCMOS15_LVCMOS18_LVCMOS25_LVCMOS33_LVTTL_SSTL135_SSTL15.SLEW.SLOW");
                 if (is_hp_bank) {
                     if (iostandard == "SSTL135")
