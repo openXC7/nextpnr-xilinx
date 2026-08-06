@@ -427,14 +427,115 @@ std::pair<CellInfo *, PortRef> XilinxPacker::insert_pad_and_buf(CellInfo *npnr_i
         pad_cell->attrs[ctx->id("X_IO_DIR")] = std::string(npnr_io->type == ctx->id("$nextpnr_ibuf") ? "IN" : "INOUT");
     }
 
-    if (!iobuf.cell) {
-        // No IO buffer, need to create one
+    // A GT's serial pins (GTXRXP/N, GTXTXP/N and the IBUFDS_GTE2 refclk pair)
+    // go STRAIGHT to the package -- there is no IOB, so there must be no buffer.
+    // Synthesis knows this; the buffer is deliberately absent by the time we get
+    // here (in our flow yosys inserts one and place_lef's stitch_gt_pad_buffers
+    // takes it back out).  Creating one "because none exists" then SPLITS the
+    // net: the port keeps one bit, the GT keeps another, and the transceiver's
+    // pins end up with no driver --
+    //   [DRC NDRV-1] Net sgmii_rxp$auto$IOBUF_O$, sgmii_rxn$auto$IOBUF_O$ are
+    //                undriven
+    // (the "$auto$IOBUF_O$" suffix is create_iobuf's own rename, which is how
+    // this was traced).  All four GT serial pads were affected.
+    //
+    // Inserting IO buffers is a SYNTHESIS job.  Where the netlist has none and
+    // the net reaches a GT dedicated pin, take that as intentional: connect the
+    // PAD directly and synthesise nothing.
+    if (!iobuf.cell && ionet != nullptr) {
+        static const std::unordered_set<std::string> gt_types = {
+                "GTXE2_CHANNEL", "GTXE2_COMMON", "IBUFDS_GTE2",
+                "GTPE2_CHANNEL", "GTPE2_COMMON", "GTHE2_CHANNEL", "GTHE2_COMMON"};
+        static const std::unordered_set<std::string> gt_pad_pins = {
+                "GTXRXP", "GTXRXN", "GTXTXP", "GTXTXN",
+                "GTPRXP", "GTPRXN", "GTPTXP", "GTPTXN",
+                "GTHRXP", "GTHRXN", "GTHTXP", "GTHTXN", "I", "IB"};
+        auto is_gt_pad = [&](const CellInfo *c, IdString port) {
+            return c != nullptr && gt_types.count(c->type.str(ctx)) &&
+                   gt_pad_pins.count(port.str(ctx));
+        };
+        bool gt_direct = is_gt_pad(ionet->driver.cell, ionet->driver.port);
+        if (!gt_direct)
+            for (auto &usr : ionet->users)
+                if (is_gt_pad(usr.cell, usr.port)) { gt_direct = true; break; }
+        if (gt_direct) {
+            log_info("    IO port '%s' feeds a GT dedicated pin -- no IO buffer "
+                     "(pad connects directly)\n", npnr_io->name.c_str(ctx));
+            for (auto &port : npnr_io->ports)
+                disconnect_port(ctx, npnr_io, port.first);
+            connect_port(ctx, ionet, pad_cell.get(), ctx->id("PAD"));
+            result.first = pad_cell.get();
+            result.second = iobuf;          // .cell stays null: there is no buffer
+            packed_cells.insert(npnr_io->name);
+            new_cells.push_back(std::move(pad_cell));
+            return result;
+        }
+    }
+
+    // INSERTING IO BUFFERS IS SYNTHESIS'S JOB, NOT THE PLACER'S.
+    //
+    // Inventing one here is silently destructive: create_iobuf() renames the
+    // buffer-side net ("<net>$auto$IOBUF_O$") and thereby SPLITS a net that
+    // synthesis had deliberately left whole.  On a GT that orphans the
+    // transceiver -- all four sgmii serial pads ended up with the port on one
+    // net and GTXRXP/GTXTXP on another, giving
+    //   [DRC NDRV-1] Net sgmii_rxp$auto$IOBUF_O$, sgmii_rxn$auto$IOBUF_O$ are
+    //                undriven
+    // and the receive path simply absent from the netlist.  Note the code below
+    // then DELETES that same buffer again (an IBUF feeding a GT channel "is
+    // integrated into the pad") without rejoining the halves -- so even a
+    // synthesis-provided buffer leaves the gap.  Creating one cannot help.
+    //
+    // So: no buffer is created.  Where none exists the net is connected to the
+    // PAD directly, which is CORRECT for a GT's dedicated pins (they go straight
+    // to the package, there is no IOB).  For any other port a missing buffer is
+    // a synthesis bug and is reported as one rather than papered over with a
+    // buffer that changes the netlist.
+    //
+    // NEXTPNR_LEGACY_AUTO_IOBUF=1 restores the old create-a-buffer behaviour.
+    if (!iobuf.cell && getenv("NEXTPNR_LEGACY_AUTO_IOBUF") != nullptr) {
+        // legacy: synthesise a buffer as upstream nextpnr does
         iobuf.cell = create_iobuf(npnr_io, iobuf.port);
         std::unique_ptr<NetInfo> pad_ionet{new NetInfo};
         pad_ionet->name = npnr_io->name;
         NPNR_ASSERT(!ctx->nets.count(pad_ionet->name));
         ionet = pad_ionet.get();
         ctx->nets[npnr_io->name] = std::move(pad_ionet);
+    } else if (!iobuf.cell) {
+        static const std::unordered_set<std::string> gt_types = {
+                "GTXE2_CHANNEL", "GTXE2_COMMON", "IBUFDS_GTE2",
+                "GTPE2_CHANNEL", "GTPE2_COMMON", "GTHE2_CHANNEL", "GTHE2_COMMON"};
+        static const std::unordered_set<std::string> gt_pad_pins = {
+                "GTXRXP", "GTXRXN", "GTXTXP", "GTXTXN",
+                "GTPRXP", "GTPRXN", "GTPTXP", "GTPTXN",
+                "GTHRXP", "GTHRXN", "GTHTXP", "GTHTXN", "I", "IB"};
+        auto is_gt_pad = [&](const CellInfo *c, IdString port) {
+            return c != nullptr && gt_types.count(c->type.str(ctx)) &&
+                   gt_pad_pins.count(port.str(ctx));
+        };
+        bool gt_direct = false;
+        if (ionet != nullptr) {
+            gt_direct = is_gt_pad(ionet->driver.cell, ionet->driver.port);
+            if (!gt_direct)
+                for (auto &usr : ionet->users)
+                    if (is_gt_pad(usr.cell, usr.port)) { gt_direct = true; break; }
+        }
+        if (!gt_direct)
+            log_error("Top-level port '%s' has no IO buffer.  Inserting one is a "
+                      "SYNTHESIS responsibility -- add an IBUF/OBUF/IOBUF (yosys: "
+                      "iopadmap) rather than relying on the placer, which has to "
+                      "split the net to do it.  Set NEXTPNR_LEGACY_AUTO_IOBUF=1 to "
+                      "restore the old behaviour.\n", npnr_io->name.c_str(ctx));
+        log_info("    IO port '%s' feeds a GT dedicated pin -- no IO buffer "
+                 "(pad connects directly)\n", npnr_io->name.c_str(ctx));
+        for (auto &port : npnr_io->ports)
+            disconnect_port(ctx, npnr_io, port.first);
+        connect_port(ctx, ionet, pad_cell.get(), ctx->id("PAD"));
+        result.first = pad_cell.get();
+        result.second = iobuf;          // .cell stays null: there is no buffer
+        packed_cells.insert(npnr_io->name);
+        new_cells.push_back(std::move(pad_cell));
+        return result;
     } else {
         log_info("    IO port '%s' driven by %s '%s'\n", npnr_io->name.c_str(ctx), iobuf.cell->type.c_str(ctx),
                  iobuf.cell->name.c_str(ctx));

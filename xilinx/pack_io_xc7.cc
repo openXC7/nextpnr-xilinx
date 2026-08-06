@@ -361,6 +361,30 @@ void XC7Packer::pack_io()
         auto pad_cell = iob.first;
         auto buf_cell = iob.second.cell;
 
+        // No buffer: insert_pad_and_buf() declined to invent one because this
+        // port feeds a GT dedicated pin, which goes straight to the package.
+        // The pad is already wired to the GT's net, so nothing needs packing --
+        // but the GT still has to be CONSTRAINED relative to the pad, which is
+        // what constrain_gt() does for the buffered case below.
+        if (buf_cell == nullptr) {
+            auto net = pad_cell->ports[ctx->id("PAD")].net;
+            CellInfo *gt = nullptr;
+            if (net != nullptr) {
+                if (net->driver.cell != nullptr &&
+                    (net->driver.cell->type == id_GTPE2_CHANNEL || net->driver.cell->type == id_GTXE2_CHANNEL))
+                    gt = net->driver.cell;
+                if (gt == nullptr)
+                    for (auto &usr : net->users)
+                        if (usr.cell->type == id_GTPE2_CHANNEL || usr.cell->type == id_GTXE2_CHANNEL) {
+                            gt = usr.cell;
+                            break;
+                        }
+            }
+            if (gt != nullptr)
+                constrain_gt(pad_cell, gt);
+            continue;
+        }
+
         if (packed_cells.count(buf_cell->name))
             continue;
 
