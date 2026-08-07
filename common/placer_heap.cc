@@ -918,6 +918,7 @@ class HeAPPlacer
             // failing fast.
             int attempts = 0;
             bool placed = false;
+            bool tried_full_scan = false;
             BelId bestBel;
             int best_inp_len = std::numeric_limits<int>::max();
 
@@ -988,6 +989,54 @@ class HeAPPlacer
                 notempty:
                     iter_at_radius = 0;
                     iter = 0;
+                }
+                // Deterministic last resort for sparse site types: with a
+                // singleton bel (DCIRESET: ONE site on the die) the uniform
+                // random draw above can exhaust the whole attempts budget
+                // without ever sampling the site's coordinates (~15% miss
+                // probability per legalise pass on an xc7s50 grid), killing
+                // an otherwise placeable design a few solver iterations in.
+                // Once the walk has burnt a healthy budget without seeing a
+                // single candidate, scan the type's bel grid directly --
+                // single-cell case only, once per cell, same acceptance
+                // rules as the random path below.  (Ordinary cells find a
+                // candidate within tens of attempts; only needle-in-haystack
+                // types ever get here.)
+                if (!tried_full_scan && bestBel == BelId() && attempts >= 5000 &&
+                    ci->constr_children.empty() && !ci->constr_abs_z) {
+                    tried_full_scan = true;
+                    for (int x = 0; x < int(fb.size()) && !placed; x++) {
+                        for (int y = 0; y < int(fb.at(x).size()) && !placed; y++) {
+                            for (auto sz : fb.at(x).at(y)) {
+                                if (ci->region != nullptr && ci->region->constr_bels &&
+                                    !ci->region->bels.count(sz))
+                                    continue;
+                                CellInfo *scan_bound = ctx->getBoundBelCell(sz);
+                                if (scan_bound != nullptr) {
+                                    if (scan_bound->constr_parent != nullptr ||
+                                        !scan_bound->constr_children.empty() || scan_bound->constr_abs_z)
+                                        continue;
+                                    ctx->unbindBel(scan_bound->bel);
+                                }
+                                ctx->bindBel(sz, ci, STRENGTH_WEAK);
+                                if (require_validity && !ctx->isBelLocationValid(sz)) {
+                                    ctx->unbindBel(sz);
+                                    if (scan_bound != nullptr)
+                                        ctx->bindBel(sz, scan_bound, STRENGTH_WEAK);
+                                    continue;
+                                }
+                                if (scan_bound != nullptr)
+                                    remaining.emplace(chain_size[scan_bound->name], scan_bound->name);
+                                placed = true;
+                                Loc loc = ctx->getBelLocation(sz);
+                                cell_locs[ci->name].x = loc.x;
+                                cell_locs[ci->name].y = loc.y;
+                                break;
+                            }
+                        }
+                    }
+                    if (placed)
+                        break;
                 }
                 if (nx < 0 || nx > max_x)
                     continue;
