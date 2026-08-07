@@ -1097,6 +1097,12 @@ void XC7Packer::relocate_carry_o_fabric()
                      ctx->nameOf(c4), bit, moved);
     };
 
+    // Re-anchored split-lane cells keep a y=0 placeholder until the chain
+    // renumber; 0 is also the root's own row, so ownership must be tracked
+    // explicitly for the renumber to move each lane to its split's row
+    // (re-splitting a split re-assigns the moved cells to the newest owner).
+    std::unordered_map<CellInfo *, CellInfo *> split_lane_owner;
+
     // Split c4 (holding global bits off..3) at global bit i: bits i..3 move
     // to a new CARRY4 whose CIN is the old CO[i-1] net; the old tail passes
     // the carry through (S=0, DI=0 -> CO3 = CIN).  Moved LUT/FF constraints
@@ -1117,20 +1123,13 @@ void XC7Packer::relocate_carry_o_fabric()
             for (const char *p : {"O", "CO"})
                 declare(ctx->id(std::string(p) + std::to_string(b)), PORT_OUT);
         }
-        // The old CARRY4's trimmed tail passes the carry through (S=0, DI=0),
-        // so its physical CO3 carries the value of the old CO[i-1] -- i.e. the
-        // carry INTO the split bit.  The new CARRY4's CIN must be driven by
-        // that CO3 (dedicated COUT->CIN spine); the model has no fabric pips
-        // into CIN, so a link via the old CO[i-1] fabric net is unroutable.
-        IdString cout_port = pname("CO", 3, off); // this cell's own COUT
-        NetInfo *cout = get_net_or_empty(c4, cout_port);
-        disconnect_port(ctx, c4, cout_port);
-        std::unique_ptr<NetInfo> link{new NetInfo};
-        link->name = ctx->id(c4->name.str(ctx) + "$carry$" + std::to_string(++autoidx));
-        connect_port(ctx, link.get(), c4, cout_port);
-        connect_port(ctx, link.get(), nb.get(), ctx->id("CIN"));
-        IdString lname = link->name;
-        ctx->nets[lname] = std::move(link);
+        // Move global bits i..3 to the new CARRY4 FIRST -- the range includes
+        // this cell's top CO port, so the COUT->CIN link must only be created
+        // once the move is done.  (Creating it before let the move loop steal
+        // the link net back onto the new cell: a CO->CIN self-loop, a
+        // driverless chain net, and a broken CO->CIN walk that left every
+        // split row-less -- root and splits then fought for one bel, which
+        // was the legaliser livelock on the litex ddr3 designs.)
         for (int b = 0; b < cnt; b++) {
             for (const char *p : {"S", "DI", "O", "CO"}) {
                 IdString op = pname(p, i + b, off);
@@ -1141,6 +1140,18 @@ void XC7Packer::relocate_carry_o_fabric()
                     connect_port(ctx, net, nb.get(), np);
             }
         }
+        // The old CARRY4's trimmed tail passes the carry through (S=0, DI=0),
+        // so its physical CO3 carries the value of the old CO[i-1] -- i.e. the
+        // carry INTO the split bit.  The new CARRY4's CIN must be driven by
+        // that CO3 (dedicated COUT->CIN spine); the model has no fabric pips
+        // into CIN, so a link via the old CO[i-1] fabric net is unroutable.
+        IdString cout_port = pname("CO", 3, off); // this cell's own COUT (freed by the move)
+        std::unique_ptr<NetInfo> link{new NetInfo};
+        link->name = ctx->id(c4->name.str(ctx) + "$carry$" + std::to_string(++autoidx));
+        connect_port(ctx, link.get(), c4, cout_port);
+        connect_port(ctx, link.get(), nb.get(), ctx->id("CIN"));
+        IdString lname = link->name;
+        ctx->nets[lname] = std::move(link);
         // pass-through the trimmed tail (S=0, DI=0 -> CO3 = CIN = old CO[i-1])
         for (int b = i - off; b < 4 - off; b++) {
             connect_port(ctx, gnd, c4, ctx->id("S" + std::to_string(b)));
@@ -1157,6 +1168,7 @@ void XC7Packer::relocate_carry_o_fabric()
                     continue;
                 drv->constr_z = (b << 4) | (drv->constr_z & 0xF);
                 drv->constr_y = 0;
+                split_lane_owner[drv] = nb.get();
             }
             NetInfo *o = get_net_or_empty(nb.get(), ctx->id("O" + std::to_string(b)));
             if (o != nullptr) {
@@ -1170,6 +1182,7 @@ void XC7Packer::relocate_carry_o_fabric()
                     // adoption) that must not leak into the new lane.
                     u.cell->constr_z = (b << 4) | BEL_FF;
                     u.cell->constr_y = 0;
+                    split_lane_owner[u.cell] = nb.get();
                 }
             }
         }
@@ -1248,8 +1261,16 @@ void XC7Packer::relocate_carry_o_fabric()
             int old_y = c->constr_y;
             int new_y = -(idx + idx / 25);
             c->constr_y = new_y;
-            int dy = new_y - old_y;
-            if (dy != 0) {
+            if (old_y == c->UNCONSTR) {
+                // a fresh split: its lane cells sit at the y=0 placeholder,
+                // indistinguishable by value from the root's own row -- move
+                // them via the ownership map, and never compute a dy from the
+                // UNCONSTR sentinel
+                for (auto &lo : split_lane_owner)
+                    if (lo.second == c)
+                        lo.first->constr_y = new_y;
+            } else if (old_y != new_y) {
+                int dy = new_y - old_y;
                 for (auto &child : root->constr_children) {
                     if (child->constr_parent != root || child->constr_y != old_y)
                         continue;
