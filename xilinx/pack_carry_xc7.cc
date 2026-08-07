@@ -1065,7 +1065,6 @@ void XC7Packer::relocate_carry_o_fabric()
     };
 
     // Duplicate the sum (S ^ CIN) into a LUT; the O net keeps only FF sinks.
-    int chain_seq = 0;
     auto relocate_sum = [&](CellInfo *c4, int bit, NetInfo *cin_net, CellInfo *root) {
         NetInfo *s = get_net_or_empty(c4, pname("S", bit));
         NetInfo *o = get_net_or_empty(c4, pname("O", bit));
@@ -1235,12 +1234,16 @@ void XC7Packer::relocate_carry_o_fabric()
     for (auto *root : roots) {
         if (root->attrs.count(ctx->id("BEL")))
             continue; // imported (Vivado-proven) placement: leave alone
-        chain_seq++;
-        // Spread chains onto distinct rows: with many split chains the HeAP
-        // legaliser's cluster BFS assumes chains never overlap, and two roots
-        // on the same row make it assert (vc->bel already bound) or displace
-        // a chain LUT.  Pin each root to its own HCLK-skip-safe absolute row.
-        root->constr_y = -(chain_seq + chain_seq / 25);
+        // NOTE: roots deliberately keep constr_x/y UNCONSTR.  An earlier
+        // revision pinned each root to a distinct row via
+        // constr_y = -(chain_seq + chain_seq/25), but on a parentless cell
+        // constr_y is an ABSOLUTE grid position (place_common's
+        // get_constraints_distance) -- a negative row can never be
+        // satisfied, so the final constraint check failed the moment
+        // placement completed.  The overlap scenario the pin targeted
+        // (a LUT shared between two chains, adopted by one and bound by
+        // the other's BFS) is handled by the legaliser's leaf relocation
+        // instead.
         // work items: (CARRY4, global bit offset)
         std::vector<std::pair<CellInfo *, int>> work;
         for (CellInfo *c = root; c != nullptr; c = next_in_chain(c))
