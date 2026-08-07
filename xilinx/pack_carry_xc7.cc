@@ -1089,6 +1089,28 @@ void XC7Packer::relocate_carry_o_fabric()
             connect_port(ctx, sum_copy.get(), u.cell, u.port);
             moved++;
         }
+        // A moved sum-FF must leave the cluster too: anchored in the
+        // carry's own lane, its D would now have to arrive from the fabric
+        // sum LUT through the slice's input mux, whose only fabric path
+        // (the lane's X bypass) can be claimed by the carry's DI --
+        // leaving the arc unroutable (seen on litex ddr3 as a failed
+        // route into DFFMUX_OUT).  Like the sum LUT itself, the general
+        // placer finds them a routable home.
+        for (auto &u : users) {
+            if (!(u.port == ctx->id("D") && ff_types.count(u.cell->type)))
+                continue;
+            CellInfo *ff = u.cell;
+            if (ff->constr_parent != root)
+                continue;
+            root->constr_children.erase(
+                    std::remove(root->constr_children.begin(), root->constr_children.end(), ff),
+                    root->constr_children.end());
+            ff->constr_parent = nullptr;
+            ff->constr_x = ff->UNCONSTR;
+            ff->constr_y = ff->UNCONSTR;
+            ff->constr_z = ff->UNCONSTR;
+            ff->constr_abs_z = false;
+        }
         // Leave the sum LUT unconstrained: the general placer puts it in any
         // slice with a free output mux (the validity check rejects carry
         // tiles), while a fixed relative row can collide with another chain's
