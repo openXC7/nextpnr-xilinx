@@ -1117,9 +1117,20 @@ void XC7Packer::relocate_carry_o_fabric()
             for (const char *p : {"O", "CO"})
                 declare(ctx->id(std::string(p) + std::to_string(b)), PORT_OUT);
         }
-        NetInfo *cin = get_net_or_empty(c4, pname("CO", i - 1, off));
-        if (cin != nullptr)
-            connect_port(ctx, cin, nb.get(), ctx->id("CIN"));
+        // The old CARRY4's trimmed tail passes the carry through (S=0, DI=0),
+        // so its physical CO3 carries the value of the old CO[i-1] -- i.e. the
+        // carry INTO the split bit.  The new CARRY4's CIN must be driven by
+        // that CO3 (dedicated COUT->CIN spine); the model has no fabric pips
+        // into CIN, so a link via the old CO[i-1] fabric net is unroutable.
+        IdString cout_port = pname("CO", 3, off); // this cell's own COUT
+        NetInfo *cout = get_net_or_empty(c4, cout_port);
+        disconnect_port(ctx, c4, cout_port);
+        std::unique_ptr<NetInfo> link{new NetInfo};
+        link->name = ctx->id(c4->name.str(ctx) + "$carry$" + std::to_string(++autoidx));
+        connect_port(ctx, link.get(), c4, cout_port);
+        connect_port(ctx, link.get(), nb.get(), ctx->id("CIN"));
+        IdString lname = link->name;
+        ctx->nets[lname] = std::move(link);
         for (int b = 0; b < cnt; b++) {
             for (const char *p : {"S", "DI", "O", "CO"}) {
                 IdString op = pname(p, i + b, off);
@@ -1189,6 +1200,11 @@ void XC7Packer::relocate_carry_o_fabric()
         if (root->attrs.count(ctx->id("BEL")))
             continue; // imported (Vivado-proven) placement: leave alone
         chain_seq++;
+        // Spread chains onto distinct rows: with many split chains the HeAP
+        // legaliser's cluster BFS assumes chains never overlap, and two roots
+        // on the same row make it assert (vc->bel already bound) or displace
+        // a chain LUT.  Pin each root to its own HCLK-skip-safe absolute row.
+        root->constr_y = -(chain_seq + chain_seq / 25);
         // work items: (CARRY4, global bit offset)
         std::vector<std::pair<CellInfo *, int>> work;
         for (CellInfo *c = root; c != nullptr; c = next_in_chain(c))
@@ -1277,6 +1293,8 @@ void XC7Packer::relocate_carry_o_fabric()
                 ports += "]";
             }
             log_info("CARRO-C4 %s%s\n", ctx->nameOf(ci), ports.c_str());
+            log_info("CARRO-C4P %s parent=%d nchild=%d y=%d\n", ctx->nameOf(ci),
+                     int(ci->constr_parent != nullptr), int(ci->constr_children.size()), ci->constr_y);
             for (int b = 0; b < 4; b++) {
                 NetInfo *o = get_net_or_empty(ci, ctx->id("O" + std::to_string(b)));
                 if (!o) continue;

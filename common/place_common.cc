@@ -562,7 +562,7 @@ class ConstraintLegaliseWorker
                         for (auto child : c->constr_children) {
                             int d = get_constraints_distance(ctx, child);
                             Loc ccl = ctx->getBelLocation(child->bel);
-                            log_error("   %*schild %s at (%d,%d,%d) constr x=%d y=%d z=%d abs=%d dist=%d\n",
+                            log_info("   %*schild %s at (%d,%d,%d) constr x=%d y=%d z=%d abs=%d dist=%d\n",
                                       depth, "", ctx->nameOf(child), ccl.x, ccl.y, ccl.z, child->constr_x,
                                       child->constr_y, child->constr_z, int(child->constr_abs_z), d);
                             dump(child, depth + 1);
