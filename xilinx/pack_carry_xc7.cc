@@ -1097,12 +1097,6 @@ void XC7Packer::relocate_carry_o_fabric()
                      ctx->nameOf(c4), bit, moved);
     };
 
-    // Re-anchored split-lane cells keep a y=0 placeholder until the chain
-    // renumber; 0 is also the root's own row, so ownership must be tracked
-    // explicitly for the renumber to move each lane to its split's row
-    // (re-splitting a split re-assigns the moved cells to the newest owner).
-    std::unordered_map<CellInfo *, CellInfo *> split_lane_owner;
-
     // Split c4 (holding global bits off..3) at global bit i: bits i..3 move
     // to a new CARRY4 whose CIN is the old CO[i-1] net; the old tail passes
     // the carry through (S=0, DI=0 -> CO3 = CIN).  Moved LUT/FF constraints
@@ -1168,7 +1162,6 @@ void XC7Packer::relocate_carry_o_fabric()
                     continue;
                 drv->constr_z = (b << 4) | (drv->constr_z & 0xF);
                 drv->constr_y = 0;
-                split_lane_owner[drv] = nb.get();
             }
             NetInfo *o = get_net_or_empty(nb.get(), ctx->id("O" + std::to_string(b)));
             if (o != nullptr) {
@@ -1182,7 +1175,6 @@ void XC7Packer::relocate_carry_o_fabric()
                     // adoption) that must not leak into the new lane.
                     u.cell->constr_z = (b << 4) | BEL_FF;
                     u.cell->constr_y = 0;
-                    split_lane_owner[u.cell] = nb.get();
                 }
             }
         }
@@ -1258,28 +1250,41 @@ void XC7Packer::relocate_carry_o_fabric()
                 idx++;
                 continue;
             }
-            int old_y = c->constr_y;
-            int new_y = -(idx + idx / 25);
-            c->constr_y = new_y;
-            if (old_y == c->UNCONSTR) {
-                // a fresh split: its lane cells sit at the y=0 placeholder,
-                // indistinguishable by value from the root's own row -- move
-                // them via the ownership map, and never compute a dy from the
-                // UNCONSTR sentinel
-                for (auto &lo : split_lane_owner)
-                    if (lo.second == c)
-                        lo.first->constr_y = new_y;
-            } else if (old_y != new_y) {
-                int dy = new_y - old_y;
-                for (auto &child : root->constr_children) {
-                    if (child->constr_parent != root || child->constr_y != old_y)
+            c->constr_y = -(idx + idx / 25);
+            idx++;
+        }
+        // Lane members follow their carry by NETLIST relation (the S/DI
+        // driver LUTs and O-sink FFs clustered under this root), never by
+        // matching y values: split lanes and original chain rows live in
+        // the same small negative integers, so any value-matching shift
+        // cross-assigns lanes between owners (observed on litex ddr3:
+        // lanes pinned to rows -7/-8 where no CARRY4 sits, and two LUTs
+        // booked onto one (x,y,z) -- unroutable carry S inputs).
+        for (CellInfo *c = root; c != nullptr; c = next_in_chain(c)) {
+            if (c->attrs.count(ctx->id("BEL")))
+                continue;
+            int row_y = (c == root) ? 0 : c->constr_y;
+            for (int b = 0; b < 4; b++) {
+                for (const char *p : {"S", "DI"}) {
+                    NetInfo *net = get_net_or_empty(c, ctx->id(std::string(p) + std::to_string(b)));
+                    if (net == nullptr || net->driver.cell == nullptr)
                         continue;
-                    if (child->type == ctx->id("CARRY4") && child != c)
-                        continue; // sibling CARRY4s are renumbered here, not shifted
-                    child->constr_y += dy;
+                    CellInfo *drv = net->driver.cell;
+                    if (drv->constr_parent != root || drv->type == ctx->id("CARRY4"))
+                        continue;
+                    drv->constr_y = row_y;
+                }
+                NetInfo *o = get_net_or_empty(c, ctx->id("O" + std::to_string(b)));
+                if (o == nullptr)
+                    continue;
+                for (auto &u : o->users) {
+                    if (!(u.port == ctx->id("D") && ff_types.count(u.cell->type)))
+                        continue;
+                    if (u.cell->constr_parent != root)
+                        continue;
+                    u.cell->constr_y = row_y;
                 }
             }
-            idx++;
         }
     }
 
