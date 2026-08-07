@@ -1013,33 +1013,38 @@ void XC7Packer::relocate_carry_o_fabric()
 {
     if (getenv("NEXTPNR_NO_CARRY_O_RELOC"))
         return;
-    if (!ctx->nets.count(ctx->id("$PACKER_GND_NET")))
+    if (!ctx->nets.count(ctx->id("$PACKER_GND_NET")) || !ctx->nets.count(ctx->id("$PACKER_VCC_NET")))
         return;
     NetInfo *gnd = ctx->nets.at(ctx->id("$PACKER_GND_NET")).get();
+    NetInfo *vcc = ctx->nets.at(ctx->id("$PACKER_VCC_NET")).get();
     static const std::unordered_set<IdString> ff_types{
         ctx->id("FDRE"), ctx->id("FDSE"), ctx->id("FDCE"), ctx->id("FDPE"),
         ctx->id("FDRSE")};
     int relocated = 0, split_carries = 0, skipped = 0;
 
-    // bit = GLOBAL bit index within the original 4-bit CARRY4; each cell's
-    // local port = global - off (split cells start at their split point).
-    auto pname = [&](const char *p, int bit, int off) {
-        return ctx->id(std::string(p) + std::to_string(bit - off));
+    // bit = GLOBAL bit index within the original 4-bit CARRY4.  Every cell
+    // (original or split) keeps global port indices 0..3: the COUT->CIN
+    // spine only exists between physical CO3 and CIN, so a split cell with
+    // ports renumbered from 0 puts its carry exit on CO(3-off), which has
+    // no route to the next cell's CIN (seen as an unroutable CO2->CIN arc
+    // on litex ddr3).  Lanes outside a cell's real bit range are
+    // pass-through filled instead.
+    auto pname = [&](const char *p, int bit) {
+        return ctx->id(std::string(p) + std::to_string(bit));
     };
-    auto o_has_fabric = [&](CellInfo *c4, int off, int bit) {
+    auto o_has_fabric = [&](CellInfo *c4, int bit) {
         // ANY user (sum FFs included): a lone FF is only mux-free when it
         // lands in the carry's own subslice, which the placer is not
         // guaranteed to honour after a split -- and the validity check
         // re-evaluates the carry bit against both eighths of the pair.
-        NetInfo *o = get_net_or_empty(c4, pname("O", bit, off));
+        NetInfo *o = get_net_or_empty(c4, pname("O", bit));
         return o != nullptr && !o->users.empty();
     };
-    auto co_has_fabric = [&](CellInfo *c4, int off, int bit) {
-        NetInfo *co = get_net_or_empty(c4, pname("CO", bit, off));
+    auto co_has_fabric = [&](CellInfo *c4, int bit) {
+        NetInfo *co = get_net_or_empty(c4, pname("CO", bit));
         if (co == nullptr)
             return false;
-        int local = bit - off; // physical CO pin of THIS cell
-        if (local == 3) {
+        if (bit == 3) { // physical COUT: CIN users ride the spine
             for (auto &u : co->users)
                 if (u.port != ctx->id("CIN"))
                     return true;
@@ -1061,9 +1066,9 @@ void XC7Packer::relocate_carry_o_fabric()
 
     // Duplicate the sum (S ^ CIN) into a LUT; the O net keeps only FF sinks.
     int chain_seq = 0;
-    auto relocate_sum = [&](CellInfo *c4, int off, int bit, NetInfo *cin_net, CellInfo *root) {
-        NetInfo *s = get_net_or_empty(c4, pname("S", bit, off));
-        NetInfo *o = get_net_or_empty(c4, pname("O", bit, off));
+    auto relocate_sum = [&](CellInfo *c4, int bit, NetInfo *cin_net, CellInfo *root) {
+        NetInfo *s = get_net_or_empty(c4, pname("S", bit));
+        NetInfo *o = get_net_or_empty(c4, pname("O", bit));
         if (s == nullptr || cin_net == nullptr || o == nullptr)
             return;
         std::unique_ptr<NetInfo> sum_copy{new NetInfo};
@@ -1097,64 +1102,68 @@ void XC7Packer::relocate_carry_o_fabric()
                      ctx->nameOf(c4), bit, moved);
     };
 
-    // Split c4 (holding global bits off..3) at global bit i: bits i..3 move
-    // to a new CARRY4 whose CIN is the old CO[i-1] net; the old tail passes
-    // the carry through (S=0, DI=0 -> CO3 = CIN).  Moved LUT/FF constraints
-    // are re-anchored onto the new CARRY4 (y fixed by the chain renumber).
-    auto split_at = [&](CellInfo *c4, int off, int i, CellInfo *root) -> CellInfo * {
+    // Split c4 at global bit i: bits i..3 move to a new full-width CARRY4
+    // whose CIN carries the old CO[i-1] value via a dedicated COUT->CIN
+    // link.  Both cells pass the carry through their empty lanes with
+    // S=VCC: in the MUXCY, CO = S ? CIN : DI, so S must be HIGH to
+    // propagate (the earlier S=GND fill selected DI and silently zeroed
+    // the carry -- O, not CO, is what passes CIN when S is low).  Moved
+    // LUT/FF constraints are re-anchored onto the new CARRY4 (rows
+    // assigned by the chain renumber).
+    auto split_at = [&](CellInfo *c4, int i, CellInfo *root) -> CellInfo * {
         std::unique_ptr<CellInfo> nb{new CellInfo};
         nb->name = ctx->id(c4->name.str(ctx) + "$split$" + std::to_string(++autoidx));
         nb->type = ctx->id("CARRY4");
-        int cnt = 4 - i; // global bits i..3 -> local 0..cnt-1
         auto declare = [&](IdString name, PortType t) {
             nb->ports[name].name = name;
             nb->ports[name].type = t;
         };
         declare(ctx->id("CIN"), PORT_IN);
-        for (int b = 0; b < cnt; b++) {
+        for (int b = 0; b < 4; b++) {
             for (const char *p : {"S", "DI"})
-                declare(ctx->id(std::string(p) + std::to_string(b)), PORT_IN);
+                declare(pname(p, b), PORT_IN);
             for (const char *p : {"O", "CO"})
-                declare(ctx->id(std::string(p) + std::to_string(b)), PORT_OUT);
+                declare(pname(p, b), PORT_OUT);
         }
-        // Move global bits i..3 to the new CARRY4 FIRST -- the range includes
-        // this cell's top CO port, so the COUT->CIN link must only be created
-        // once the move is done.  (Creating it before let the move loop steal
-        // the link net back onto the new cell: a CO->CIN self-loop, a
-        // driverless chain net, and a broken CO->CIN walk that left every
-        // split row-less -- root and splits then fought for one bel, which
-        // was the legaliser livelock on the litex ddr3 designs.)
-        for (int b = 0; b < cnt; b++) {
+        // Move global bits i..3 FIRST -- the range includes CO3, so the
+        // COUT->CIN link must only be created once the move is done.
+        // (Creating it before let the move loop steal the link net back
+        // onto the new cell: a CO->CIN self-loop, a driverless chain net,
+        // and a broken CO->CIN walk that left every split row-less -- the
+        // legaliser livelock on the litex ddr3 designs.  On a re-split the
+        // steal becomes the WANTED effect: CO3 holds the link to the upper
+        // split, and moving it re-chains it through the new cell.)
+        for (int b = i; b < 4; b++) {
             for (const char *p : {"S", "DI", "O", "CO"}) {
-                IdString op = pname(p, i + b, off);
-                IdString np = ctx->id(std::string(p) + std::to_string(b));
-                NetInfo *net = get_net_or_empty(c4, op);
-                disconnect_port(ctx, c4, op);
+                IdString port = pname(p, b);
+                NetInfo *net = get_net_or_empty(c4, port);
+                disconnect_port(ctx, c4, port);
                 if (net != nullptr)
-                    connect_port(ctx, net, nb.get(), np);
+                    connect_port(ctx, net, nb.get(), port);
             }
         }
-        // The old CARRY4's trimmed tail passes the carry through (S=0, DI=0),
-        // so its physical CO3 carries the value of the old CO[i-1] -- i.e. the
-        // carry INTO the split bit.  The new CARRY4's CIN must be driven by
-        // that CO3 (dedicated COUT->CIN spine); the model has no fabric pips
-        // into CIN, so a link via the old CO[i-1] fabric net is unroutable.
-        IdString cout_port = pname("CO", 3, off); // this cell's own COUT (freed by the move)
+        // Dedicated COUT->CIN spine link: the model has no fabric pips into
+        // CIN, so a link via the old CO[i-1] fabric net is unroutable.
         std::unique_ptr<NetInfo> link{new NetInfo};
         link->name = ctx->id(c4->name.str(ctx) + "$carry$" + std::to_string(++autoidx));
-        connect_port(ctx, link.get(), c4, cout_port);
+        connect_port(ctx, link.get(), c4, ctx->id("CO3"));
         connect_port(ctx, link.get(), nb.get(), ctx->id("CIN"));
         IdString lname = link->name;
         ctx->nets[lname] = std::move(link);
-        // pass-through the trimmed tail (S=0, DI=0 -> CO3 = CIN = old CO[i-1])
-        for (int b = i - off; b < 4 - off; b++) {
-            connect_port(ctx, gnd, c4, ctx->id("S" + std::to_string(b)));
-            connect_port(ctx, gnd, c4, ctx->id("DI" + std::to_string(b)));
+        // pass-through fills: c4's freed head i..3 carries CO[i-1] up to its
+        // CO3; nb's empty tail 0..i-1 carries its CIN up to bit i
+        for (int b = i; b < 4; b++) {
+            connect_port(ctx, vcc, c4, pname("S", b));
+            connect_port(ctx, gnd, c4, pname("DI", b));
+        }
+        for (int b = 0; b < i; b++) {
+            connect_port(ctx, vcc, nb.get(), pname("S", b));
+            connect_port(ctx, gnd, nb.get(), pname("DI", b));
         }
         // re-anchor the moved LUT/FF constraints onto the new CARRY4
-        for (int b = 0; b < cnt; b++) {
+        for (int b = i; b < 4; b++) {
             for (const char *p : {"S", "DI"}) {
-                NetInfo *net = get_net_or_empty(nb.get(), ctx->id(std::string(p) + std::to_string(b)));
+                NetInfo *net = get_net_or_empty(nb.get(), pname(p, b));
                 if (net == nullptr || net->driver.cell == nullptr)
                     continue;
                 CellInfo *drv = net->driver.cell;
@@ -1163,7 +1172,7 @@ void XC7Packer::relocate_carry_o_fabric()
                 drv->constr_z = (b << 4) | (drv->constr_z & 0xF);
                 drv->constr_y = 0;
             }
-            NetInfo *o = get_net_or_empty(nb.get(), ctx->id("O" + std::to_string(b)));
+            NetInfo *o = get_net_or_empty(nb.get(), pname("O", b));
             if (o != nullptr) {
                 for (auto &u : o->users) {
                     if (!(u.port == ctx->id("D") && ff_types.count(u.cell->type)))
@@ -1220,21 +1229,21 @@ void XC7Packer::relocate_carry_o_fabric()
             if (c4->attrs.count(ctx->id("BEL")))
                 continue;
             for (int i = 3; i >= off; i--) {
-                if (!o_has_fabric(c4, off, i) || !co_has_fabric(c4, off, i))
+                if (!o_has_fabric(c4, i) || !co_has_fabric(c4, i))
                     continue;
                 if (i == off) {
                     NetInfo *cin = get_net_or_empty(c4, ctx->id("CIN"));
                     if (cin != nullptr)
-                        relocate_sum(c4, off, i, cin, root);
+                        relocate_sum(c4, i, cin, root);
                 } else {
                     // Includes i == 3: a one-bit split makes bit 3 a new chain
                     // head whose CIN (the old CO[2]) becomes fabric-reachable.
-                    NetInfo *co_prev = get_net_or_empty(c4, pname("CO", i - 1, off));
+                    NetInfo *co_prev = get_net_or_empty(c4, pname("CO", i - 1));
                     if (co_prev == nullptr)
                         continue;
-                    CellInfo *c4b = split_at(c4, off, i, root);
+                    CellInfo *c4b = split_at(c4, i, root);
                     split_carries++;
-                    relocate_sum(c4b, i, i, co_prev, root);
+                    relocate_sum(c4b, i, co_prev, root);
                     work.emplace_back(c4b, i);
                 }
             }
