@@ -510,9 +510,25 @@ class SAPlacer
             }
         }
         for (auto cell : sorted(ctx->cells))
-            if (get_constraints_distance(ctx, cell.second) != 0)
-                log_error("constraint satisfaction check failed for cell '%s' at Bel '%s'\n", cell.first.c_str(ctx),
-                          ctx->getBelName(cell.second->bel).c_str(ctx));
+            if (get_constraints_distance(ctx, cell.second) != 0) {
+                Loc cl = ctx->getBelLocation(cell.second->bel);
+                if (getenv("NEXTPNR_DBG_CONSTR")) {
+                    std::function<void(const CellInfo *, int)> dump = [&](const CellInfo *c, int depth) {
+                        for (auto child : c->constr_children) {
+                            int d = get_constraints_distance(ctx, child);
+                            Loc ccl = ctx->getBelLocation(child->bel);
+                            log_error("   %*schild %s at (%d,%d,%d) constr x=%d y=%d z=%d abs=%d dist=%d\n",
+                                      depth, "", ctx->nameOf(child), ccl.x, ccl.y, ccl.z, child->constr_x,
+                                      child->constr_y, child->constr_z, int(child->constr_abs_z), d);
+                            dump(child, depth + 1);
+                        }
+                    };
+                    dump(cell.second, 1);
+                }
+                log_error("constraint satisfaction check failed for cell '%s' at Bel '%s' (z=%d cz=%d cy=%d cx=%d loc=%d,%d,%d)\n",
+                          cell.first.c_str(ctx), ctx->getBelName(cell.second->bel).c_str(ctx), cl.z,
+                          cell.second->constr_z, cell.second->constr_y, cell.second->constr_x, cl.x, cl.y, cl.z);
+            }
         timing_analysis(ctx);
         ctx->unlock();
         return true;

@@ -990,4 +990,307 @@ void XC7Packer::pack_carries()
     }
 }
 
+// Carry-O fabric-fanout relocation for ALU chains.
+//
+// A chain sub-slice whose carry SUM (O) AND carry-out (CO) both have fabric
+// fanout is unplaceable: both need the subslice's single output path
+// (xc7_logic_tile_valid's mux_output_used / co_uses_mux contention check;
+// router-confirmed unroutable -- 51 overused wires when relaxed).  The
+// yosys/ABC $alu decomposition produces such taps (e.g. the MAC datapath of
+// ddr3-test-arty-s7).  Restructure:
+//
+//  - the sum is S ^ CIN; for a non-head bit its CIN is an internal carry
+//    (not fabric-reachable), so SPLIT the CARRY4 at the contended bit: the
+//    bit becomes the head of a new CARRY4 whose CIN is the previous carry
+//    (now a fabric net);
+//  - duplicate the sum into an ordinary LUT (S ^ CIN, 2-input XOR) and
+//    re-point the O net's fabric users at it; the CARRY4 O pin keeps only
+//    the local sum-FF (XOR-direct path).
+//
+// The duplicate LUT is unconstrained, so the general placer puts it in any
+// slice with a free output mux.  Opt out with NEXTPNR_NO_CARRY_O_RELOC.
+void XC7Packer::relocate_carry_o_fabric()
+{
+    if (getenv("NEXTPNR_NO_CARRY_O_RELOC"))
+        return;
+    if (!ctx->nets.count(ctx->id("$PACKER_GND_NET")))
+        return;
+    NetInfo *gnd = ctx->nets.at(ctx->id("$PACKER_GND_NET")).get();
+    static const std::unordered_set<IdString> ff_types{
+        ctx->id("FDRE"), ctx->id("FDSE"), ctx->id("FDCE"), ctx->id("FDPE"),
+        ctx->id("FDRSE")};
+    int relocated = 0, split_carries = 0, skipped = 0;
+
+    // bit = GLOBAL bit index within the original 4-bit CARRY4; each cell's
+    // local port = global - off (split cells start at their split point).
+    auto pname = [&](const char *p, int bit, int off) {
+        return ctx->id(std::string(p) + std::to_string(bit - off));
+    };
+    auto o_has_fabric = [&](CellInfo *c4, int off, int bit) {
+        // ANY user (sum FFs included): a lone FF is only mux-free when it
+        // lands in the carry's own subslice, which the placer is not
+        // guaranteed to honour after a split -- and the validity check
+        // re-evaluates the carry bit against both eighths of the pair.
+        NetInfo *o = get_net_or_empty(c4, pname("O", bit, off));
+        return o != nullptr && !o->users.empty();
+    };
+    auto co_has_fabric = [&](CellInfo *c4, int off, int bit) {
+        NetInfo *co = get_net_or_empty(c4, pname("CO", bit, off));
+        if (co == nullptr)
+            return false;
+        int local = bit - off; // physical CO pin of THIS cell
+        if (local == 3) {
+            for (auto &u : co->users)
+                if (u.port != ctx->id("CIN"))
+                    return true;
+            return false;
+        }
+        return !co->users.empty();
+    };
+    auto next_in_chain = [&](CellInfo *c4) -> CellInfo * {
+        for (int b = 0; b < 4; b++) {
+            NetInfo *co = get_net_or_empty(c4, ctx->id("CO" + std::to_string(b)));
+            if (!co)
+                continue;
+            for (auto &u : co->users)
+                if (u.cell->type == ctx->id("CARRY4") && u.port == ctx->id("CIN"))
+                    return u.cell;
+        }
+        return nullptr;
+    };
+
+    // Duplicate the sum (S ^ CIN) into a LUT; the O net keeps only FF sinks.
+    int chain_seq = 0;
+    auto relocate_sum = [&](CellInfo *c4, int off, int bit, NetInfo *cin_net, CellInfo *root) {
+        NetInfo *s = get_net_or_empty(c4, pname("S", bit, off));
+        NetInfo *o = get_net_or_empty(c4, pname("O", bit, off));
+        if (s == nullptr || cin_net == nullptr || o == nullptr)
+            return;
+        std::unique_ptr<NetInfo> sum_copy{new NetInfo};
+        sum_copy->name = ctx->id(o->name.str(ctx) + "$sum$" + std::to_string(++autoidx));
+        std::unique_ptr<CellInfo> lut =
+                create_lut(ctx, o->name.str(ctx) + "$sumLUT$" + std::to_string(++autoidx),
+                           {s, cin_net}, sum_copy.get(), Property(6));
+        // Re-point EVERY user (including any sum-FF: xc7_logic_tile_valid
+        // re-evaluates the carry bits against both slice halves (eighths
+        // 0..3 and 4..7), and a lone FF on the O net claims the output mux
+        // against the other half's null ff1 -- leaving the CARRY4 O pin
+        // with an empty net avoids all claims).  The sum LUT computes the
+        // identical S^CIN value.
+        std::vector<PortRef> users(o->users.begin(), o->users.end());
+        int moved = 0;
+        for (auto &u : users) {
+            disconnect_port(ctx, u.cell, u.port);
+            connect_port(ctx, sum_copy.get(), u.cell, u.port);
+            moved++;
+        }
+        // Leave the sum LUT unconstrained: the general placer puts it in any
+        // slice with a free output mux (the validity check rejects carry
+        // tiles), while a fixed relative row can collide with another chain's
+        // absolute position and displace one of its LUTs.
+        IdString nname = sum_copy->name;
+        ctx->nets[nname] = std::move(sum_copy);
+        new_cells.push_back(std::move(lut));
+        relocated++;
+        if (getenv("DBG_CARRYO"))
+            log_info("CARRO %s.O%d -> sum LUT (S^CIN), %d fabric users moved\n",
+                     ctx->nameOf(c4), bit, moved);
+    };
+
+    // Split c4 (holding global bits off..3) at global bit i: bits i..3 move
+    // to a new CARRY4 whose CIN is the old CO[i-1] net; the old tail passes
+    // the carry through (S=0, DI=0 -> CO3 = CIN).  Moved LUT/FF constraints
+    // are re-anchored onto the new CARRY4 (y fixed by the chain renumber).
+    auto split_at = [&](CellInfo *c4, int off, int i, CellInfo *root) -> CellInfo * {
+        std::unique_ptr<CellInfo> nb{new CellInfo};
+        nb->name = ctx->id(c4->name.str(ctx) + "$split$" + std::to_string(++autoidx));
+        nb->type = ctx->id("CARRY4");
+        int cnt = 4 - i; // global bits i..3 -> local 0..cnt-1
+        auto declare = [&](IdString name, PortType t) {
+            nb->ports[name].name = name;
+            nb->ports[name].type = t;
+        };
+        declare(ctx->id("CIN"), PORT_IN);
+        for (int b = 0; b < cnt; b++) {
+            for (const char *p : {"S", "DI"})
+                declare(ctx->id(std::string(p) + std::to_string(b)), PORT_IN);
+            for (const char *p : {"O", "CO"})
+                declare(ctx->id(std::string(p) + std::to_string(b)), PORT_OUT);
+        }
+        NetInfo *cin = get_net_or_empty(c4, pname("CO", i - 1, off));
+        if (cin != nullptr)
+            connect_port(ctx, cin, nb.get(), ctx->id("CIN"));
+        for (int b = 0; b < cnt; b++) {
+            for (const char *p : {"S", "DI", "O", "CO"}) {
+                IdString op = pname(p, i + b, off);
+                IdString np = ctx->id(std::string(p) + std::to_string(b));
+                NetInfo *net = get_net_or_empty(c4, op);
+                disconnect_port(ctx, c4, op);
+                if (net != nullptr)
+                    connect_port(ctx, net, nb.get(), np);
+            }
+        }
+        // pass-through the trimmed tail (S=0, DI=0 -> CO3 = CIN = old CO[i-1])
+        for (int b = i - off; b < 4 - off; b++) {
+            connect_port(ctx, gnd, c4, ctx->id("S" + std::to_string(b)));
+            connect_port(ctx, gnd, c4, ctx->id("DI" + std::to_string(b)));
+        }
+        // re-anchor the moved LUT/FF constraints onto the new CARRY4
+        for (int b = 0; b < cnt; b++) {
+            for (const char *p : {"S", "DI"}) {
+                NetInfo *net = get_net_or_empty(nb.get(), ctx->id(std::string(p) + std::to_string(b)));
+                if (net == nullptr || net->driver.cell == nullptr)
+                    continue;
+                CellInfo *drv = net->driver.cell;
+                if (drv->constr_parent == nullptr)
+                    continue;
+                drv->constr_z = (b << 4) | (drv->constr_z & 0xF);
+                drv->constr_y = 0;
+            }
+            NetInfo *o = get_net_or_empty(nb.get(), ctx->id("O" + std::to_string(b)));
+            if (o != nullptr) {
+                for (auto &u : o->users) {
+                    if (!(u.port == ctx->id("D") && ff_types.count(u.cell->type)))
+                        continue;
+                    if (u.cell->constr_parent == nullptr)
+                        continue;
+                    // Force the FF slot: the pre-split anchor may carry an
+                    // unrelated low nibble (e.g. a RSTINV slot from an early
+                    // adoption) that must not leak into the new lane.
+                    u.cell->constr_z = (b << 4) | BEL_FF;
+                    u.cell->constr_y = 0;
+                }
+            }
+        }
+        nb->constr_parent = root;
+        root->constr_children.push_back(nb.get());
+        nb->constr_x = 0;
+        nb->constr_abs_z = true;
+        nb->constr_z = BEL_CARRY4;
+        CellInfo *ret = nb.get();
+        new_cells.push_back(std::move(nb));
+        return ret;
+    };
+
+    // Find chain roots (CIN not driven by another CARRY4's CO).
+    std::vector<CellInfo *> roots;
+    for (auto cell : sorted(ctx->cells)) {
+        CellInfo *ci = cell.second;
+        if (ci->type != ctx->id("CARRY4"))
+            continue;
+        NetInfo *cin = get_net_or_empty(ci, ctx->id("CIN"));
+        bool is_root = (cin == nullptr) || (cin->driver.cell == nullptr) ||
+                       (cin->driver.cell->type != ctx->id("CARRY4"));
+        if (is_root)
+            roots.push_back(ci);
+    }
+
+    for (auto *root : roots) {
+        if (root->attrs.count(ctx->id("BEL")))
+            continue; // imported (Vivado-proven) placement: leave alone
+        chain_seq++;
+        // work items: (CARRY4, global bit offset)
+        std::vector<std::pair<CellInfo *, int>> work;
+        for (CellInfo *c = root; c != nullptr; c = next_in_chain(c))
+            work.emplace_back(c, 0);
+        while (!work.empty()) {
+            auto [c4, off] = work.back();
+            work.pop_back();
+            if (c4->attrs.count(ctx->id("BEL")))
+                continue;
+            for (int i = 3; i >= off; i--) {
+                if (!o_has_fabric(c4, off, i) || !co_has_fabric(c4, off, i))
+                    continue;
+                if (i == off) {
+                    NetInfo *cin = get_net_or_empty(c4, ctx->id("CIN"));
+                    if (cin != nullptr)
+                        relocate_sum(c4, off, i, cin, root);
+                } else {
+                    // Includes i == 3: a one-bit split makes bit 3 a new chain
+                    // head whose CIN (the old CO[2]) becomes fabric-reachable.
+                    NetInfo *co_prev = get_net_or_empty(c4, pname("CO", i - 1, off));
+                    if (co_prev == nullptr)
+                        continue;
+                    CellInfo *c4b = split_at(c4, off, i, root);
+                    split_carries++;
+                    relocate_sum(c4b, i, i, co_prev, root);
+                    work.emplace_back(c4b, i);
+                }
+            }
+        }
+        // renumber the chain's row offsets (HCLK-skip formula, as pack_carries)
+        int idx = 0;
+        for (CellInfo *c = root; c != nullptr; c = next_in_chain(c)) {
+            if (c == root) {
+                idx++;
+                continue; // root keeps UNCONSTR x/y (only z is pinned)
+            }
+            if (c->attrs.count(ctx->id("BEL"))) {
+                idx++;
+                continue;
+            }
+            int old_y = c->constr_y;
+            int new_y = -(idx + idx / 25);
+            c->constr_y = new_y;
+            int dy = new_y - old_y;
+            if (dy != 0) {
+                for (auto &child : root->constr_children) {
+                    if (child->constr_parent != root || child->constr_y != old_y)
+                        continue;
+                    if (child->type == ctx->id("CARRY4") && child != c)
+                        continue; // sibling CARRY4s are renumbered here, not shifted
+                    child->constr_y += dy;
+                }
+            }
+            idx++;
+        }
+    }
+
+    if (relocated || split_carries || skipped)
+        log_info("   Carry-O relocation: %d sum(s) duplicated, %d CARRY4 split(s), %d bit(s) skipped (unrelocatable)\n",
+                 relocated, split_carries, skipped);
+
+    flush_cells();
+    if (getenv("DBG_CARRYO")) {
+        for (auto &cell : ctx->cells) {
+            CellInfo *ci = cell.second.get();
+            if (ci->type != ctx->id("CARRY4"))
+                continue;
+            std::string ports;
+            for (int b = 0; b < 4; b++) {
+                NetInfo *o = get_net_or_empty(ci, ctx->id("O" + std::to_string(b)));
+                NetInfo *co = get_net_or_empty(ci, ctx->id("CO" + std::to_string(b)));
+                ports += " [b" + std::to_string(b) + " O=";
+                if (o) {
+                    ports += std::to_string(o->users.size());
+                    for (auto &u : o->users)
+                        ports += u.cell->type.str(ctx) + " ";
+                } else
+                    ports += "-";
+                ports += " CO=";
+                if (co) {
+                    ports += std::to_string(co->users.size());
+                    for (auto &u : co->users)
+                        ports += u.cell->type.str(ctx) + " ";
+                } else
+                    ports += "-";
+                ports += "]";
+            }
+            log_info("CARRO-C4 %s%s\n", ctx->nameOf(ci), ports.c_str());
+            for (int b = 0; b < 4; b++) {
+                NetInfo *o = get_net_or_empty(ci, ctx->id("O" + std::to_string(b)));
+                if (!o) continue;
+                for (auto &u : o->users) {
+                    if (!(u.port == ctx->id("D") && (u.cell->type == ctx->id("FDRE") || u.cell->type == ctx->id("FDSE") ||
+                                                      u.cell->type == ctx->id("FDCE") || u.cell->type == ctx->id("FDPE"))))
+                        continue;
+                    log_info("CARRO-FF %s.O%d -> %s parent=%d y=%d z=%x\n", ctx->nameOf(ci), b, ctx->nameOf(u.cell),
+                             int(u.cell->constr_parent != nullptr), u.cell->constr_y, u.cell->constr_z);
+                }
+            }
+        }
+    }
+
+}
+
 NEXTPNR_NAMESPACE_END

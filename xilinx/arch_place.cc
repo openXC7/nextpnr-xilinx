@@ -711,7 +711,20 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
                 // the XOR path of xFFMUX; only fabric fanout (or feeding
                 // anything else) needs this subslice's output mux.
                 NetInfo *o = carry4->carryInfo.out_sigs[i % 4];
-                bool o_uses_mux = o->users.size() > 1 || ff1 == nullptr || o != ff1->ffInfo.d;
+                // Only fabric fanout (or a single non-local-FF user) needs the
+                // subslice output mux.  A carry O with NO users (yosys keeps
+                // dead sum bits of an ALU chain, e.g. comparison-only $alu
+                // where only CO propagates) needs no mux at all -- claiming it
+                // made every such tile invalid when the LUT in the same
+                // subslice also used O5 (mux_output_used), so ALU chains with
+                // dropped sums could never be placed.
+                // The subslice's FF may live in either eighth of the pair
+                // (the check iterates both: i and i^4); accept either.
+                CellInfo *pair_ff1 = lts.cells[((i ^ 4) << 4) | BEL_FF];
+                bool o_ff_local = (ff1 != nullptr && o == ff1->ffInfo.d) ||
+                                  (pair_ff1 != nullptr && o == pair_ff1->ffInfo.d);
+                bool o_uses_mux = !o->users.empty() && !o_ff_local &&
+                                  (o->users.size() > 1 || ff1 == nullptr || o != ff1->ffInfo.d);
                 if (o_uses_mux) {
                     if (mux_output_used) {
                         DBG();
