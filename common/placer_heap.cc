@@ -1082,7 +1082,19 @@ class HeAPPlacer
                         visit.emplace(ci, loc);
                         while (!visit.empty()) {
                             CellInfo *vc = visit.front().first;
-                            NPNR_ASSERT(vc->bel == BelId());
+                            if (vc->bel != BelId()) {
+                                // A leaf cluster member can already be bound
+                                // when the general flow placed it before this
+                                // chain's BFS runs -- e.g. a LUT shared between
+                                // two chains (one cell drives the S input of
+                                // two CARRY4s; pack_carries adopts it into one
+                                // cluster) and bound by the queue in the
+                                // meantime.  Relocate it with the cluster
+                                // instead of asserting.  A non-leaf member
+                                // being bound is a genuine overlap bug.
+                                NPNR_ASSERT(vc->constr_children.empty());
+                                ctx->unbindBel(vc->bel);
+                            }
                             Loc ploc = visit.front().second;
                             visit.pop();
                             BelId target = ctx->getBelByLocation(ploc);
