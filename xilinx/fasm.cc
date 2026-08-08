@@ -1290,8 +1290,12 @@ struct FasmBackend
             // HP-bank IN_ONLY input-only variant (parallel to the wider one
             // emitted in the is_riob18 branch below).  Vivado emits both
             // for HP-bank input-only sites; the left-HP LVCMOS18 group includes
-            // LVCMOS18.
-            if (is_hp_bank && !is_output && !is_diff) {
+            // LVCMOS18.  Skip when the partner site drives an output: the
+            // IN_ONLY bits are complement encodings of the column
+            // IOB_COL_BANK_ACTIVE field, so emitting them next to the
+            // partner's active output makes fasm2frames refuse the
+            // clear-after-set conflict.
+            if (is_hp_bank && !is_output && !is_diff && !partner_is_output(pad)) {
                 if (is_lefthp_se_in && iostandard == "LVCMOS18")
                     write_bit("LVCMOS12_LVCMOS15_LVCMOS18_SSTL12_SSTL135_SSTL15.IN_ONLY");
                 else
@@ -1385,8 +1389,12 @@ struct FasmBackend
                     write_bit("IN_TERM." + pad->attrs.at(ctx->id("IN_TERM")).as_string());
             }
 
-            // IN_ONLY
-            if (!is_output) {
+            // IN_ONLY.  Same partner-output gate as above, HP banks only:
+            // the HP IN_ONLY bits are the complement of the column
+            // IOB_COL_BANK_ACTIVE field (mixed output+input columns
+            // otherwise trip FasmInconsistentBits); the HR-bank (IOB33)
+            // IN_ONLY encodes independently and must stay.
+            if (!is_output && (!partner_is_output(pad) || !is_hp_bank)) {
                 if (is_riob18) {
                     if (is_diff && (yLoc == 0)) {
                         // golden: master half of a diff input gets BOTH
