@@ -1481,8 +1481,18 @@ struct FasmBackend
         // fasm2frames refuses the conflict.  Vivado's bitgen handles the
         // overlap natively but the FASM round-trip can't.  Keep the SLEW
         // dups (no conflict), skip the PULLDOWN cross-site.  Skip on SING
-        // tiles (only one site) and diff pairs (both halves are active).
-        if (is_hp_bank && !is_sing && !is_diff && slew == "SLOW"
+        // tiles (only one site), on diff pairs (both halves are active),
+        // and when the partner site is itself occupied: the defaults then
+        // collide with the partner's own SLEW bits (FasmInconsistentBits —
+        // e.g. an SSTL15 FAST output on IOB_Y1 next to an SSTL15 SLOW
+        // output on IOB_Y0).
+        bool partner_active = false;
+        if (pads_map_built_) {
+            auto it = pads_by_tile_.find(pad->bel.tile);
+            if (it != pads_by_tile_.end() && it->second[1 - ioLoc.y] != nullptr)
+                partner_active = true;
+        }
+        if (is_hp_bank && !is_sing && !is_diff && !partner_active && slew == "SLOW"
             && iostandard != "LVDS_25" && iostandard != "TMDS_33") {
             std::string other = "IOB_Y" + std::to_string(ioLoc.y) + ".";
             write_bit(other + "LVCMOS12_LVCMOS15_LVCMOS18_LVCMOS25_LVCMOS33_LVTTL_SSTL135_SSTL15.SLEW.SLOW");
