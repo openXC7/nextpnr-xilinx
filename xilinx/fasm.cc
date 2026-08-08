@@ -1359,7 +1359,12 @@ struct FasmBackend
                         write_bit("ZIBUF_LOW_PWR");
                         fasm_ctx.back() = saved;
                     }
-                    write_bit("LVCMOS12_LVCMOS15_LVCMOS18.SLEW.SLOW");
+                    // Pure diff inputs only: a bidirectional IOBUFDS (DDR DQS)
+                    // drives the output SLEW field (e.g. SSTL15.SLEW.FAST), and
+                    // this input-side SLOW bit shares its prjxray bits ->
+                    // FasmInconsistentBits.
+                    if (!is_output)
+                        write_bit("LVCMOS12_LVCMOS15_LVCMOS18.SLEW.SLOW");
                 } else if (is_hp_bank) {
                     // LEFT HP bank (LIOB18): an LVDS input on a High-Performance bank
                     // uses the SSTL differential-input group (Y0 only), NOT the
