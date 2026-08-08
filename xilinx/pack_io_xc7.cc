@@ -1189,6 +1189,17 @@ void XC7Packer::pack_cfg()
             auto bel = "BSCAN_X0Y" + std::to_string(chain - 1) + "/BSCAN";
             ci->attrs[id_BEL] = bel;
             log_info("    Constraining '%s' to site '%s'\n", ci->name.c_str(ctx), bel.c_str());
+        } else if (ci->type == id_STARTUP_STARTUP || ci->type == id_DCIRESET_DCIRESET ||
+                   ci->type == id_DNA_PORT_DNA_PORT || ci->type == id_EFUSE_USR_EFUSE_USR ||
+                   ci->type == id_ICAP_ICAP || ci->type == id_FRAME_ECC_FRAME_ECC ||
+                   ci->type == id_USR_ACCESS_USR_ACCESS) {
+            // These configuration primitives live in a single dedicated site each. The
+            // placer has no way to discover that site on its own, so without an explicit
+            // preplacement it aborts with "Unable to find legal placement for cell". BSCAN
+            // above is the exception only because JTAG_CHAIN already names its site.
+            // Affects any design that instantiates e.g. STARTUPE2 to source a clock from
+            // CFGMCLK, or ICAPE2 / DNA_PORT for configuration access.
+            preplace_unique(ci);
         }
     }
 }
