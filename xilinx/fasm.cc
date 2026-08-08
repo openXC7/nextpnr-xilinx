@@ -1279,7 +1279,12 @@ struct FasmBackend
                     if (yLoc == 0)
                         write_bit(is_riob18 ? "IBUFDS_BANK_GLUE" : "IBUF_HP_BANK_GLUE");
                 } else if (!is_lefthp_se_in) {
-                    write_bit("IBUF_HP_BANK_GLUE");
+                    // The kintex7 RIOB18 db only carries IBUF_HP_BANK_GLUE on the
+                    // slave site (Y1); a single-ended input on the master site
+                    // (Y0) has no key in the fuzzed db, so emitting it trips
+                    // FasmLookupError (genesys2 ULPI clock on RIOB18_X95Y23).
+                    if (!(is_riob18 && yLoc == 0))
+                        write_bit("IBUF_HP_BANK_GLUE");
                 }
             }
             // Additional low-volt LVCMOS input bit on HP banks (not for a left-HP
