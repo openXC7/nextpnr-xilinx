@@ -2063,6 +2063,25 @@ struct FasmBackend
                 write_bit(name.substr(0, name.size() - 1) + "B_18");
             }
         } else {
+            // A 36-bit (SDP) port already emits the _18 bits for BOTH the A and B
+            // halves of its direction — that is how prjxray encodes SDP width.  The
+            // paired port of the same direction is unused in SDP mode and defaults to
+            // width 1 here, which would then emit a conflicting _1 bit for a half that
+            // the SDP branch just set to _18 (prjxray rejects the FASM with
+            // "wanted to clear bit ... but was set by").  Skip it: in SDP mode the
+            // direction's width is fully described by the 36-bit port.
+            bool dir_is_sdp36 = false;
+            {
+                std::string dir = name.substr(0, name.size() - 2); // READ_WIDTH / WRITE_WIDTH
+                for (const char *ab : {"A", "B"}) {
+                    int w = int_or_default(ci->params, ctx->id(dir + "_" + ab), 0);
+                    int aw = (is_36 && w != 1 && w != 0) ? w / 2 : w;
+                    if (aw == 36)
+                        dir_is_sdp36 = true;
+                }
+            }
+            if (dir_is_sdp36 && actual_width == 1)
+                return;
             write_bit(name + "_" + std::to_string(actual_width));
         }
     }
