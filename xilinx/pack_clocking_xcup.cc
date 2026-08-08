@@ -36,7 +36,15 @@ BelId XilinxPacker::find_bel_with_short_route(WireId source, IdString beltype, I
 {
     if (source == WireId())
         return BelId();
-    const size_t max_visit = 50000; // effort/runtime tradeoff
+    // Effort cap on the pip-BFS. This must be large enough to reach the dedicated
+    // clock buffer from a *single-ended* clock-capable input pin: on xc7a200t an
+    // SRCC pin's dedicated route to a BUFGCTRL is ~75k wires away (vs ~6k for an
+    // MRCC/differential pin), so the historical 50000 cap silently failed to
+    // preplace BUFGs driven from SRCC pins — leaving the BUFG unplaceable and
+    // aborting P&R. The BFS runs once per clock-buffer driver over a hash-set, so
+    // a higher bound is cheap; it stays bounded by the (finite) routing graph.
+    size_t max_visit = 1000000;
+    bool dbg_route = getenv("NEXTPNR_DBG_SHORTROUTE") != nullptr;
     std::unordered_set<WireId> visited;
     // Layer-by-layer BFS instead of a single FIFO.  When the original
     // FIFO encountered two reachable target BELs at the same pip-distance
@@ -78,6 +86,9 @@ BelId XilinxPacker::find_bel_with_short_route(WireId source, IdString beltype, I
                           if (la.x != lb.x) return la.x < lb.x;
                           return la.z < lb.z;
                       });
+            if (dbg_route)
+                log_info("  [short-route] FOUND %s %s after visiting %d wires\n", beltype.c_str(ctx),
+                         ctx->nameOfBel(matches.front()), int(visited.size()));
             return matches.front();
         }
         std::vector<WireId> next_frontier;
@@ -92,6 +103,9 @@ BelId XilinxPacker::find_bel_with_short_route(WireId source, IdString beltype, I
         }
         frontier.swap(next_frontier);
     }
+    if (dbg_route)
+        log_info("  [short-route] NO %s reachable from source after visiting %d wires (frontier %s)\n",
+                 beltype.c_str(ctx), int(visited.size()), frontier.empty() ? "EXHAUSTED" : "hit-limit");
     return BelId();
 }
 
