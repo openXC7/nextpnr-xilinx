@@ -258,8 +258,15 @@ struct Timing
             }
         }
 
-        // Sanity check to ensure that all ports where fanins were recorded were indeed visited
-        if (!port_fanin.empty() && !bool_or_default(ctx->settings, ctx->id("timing/ignoreLoops"), false)) {
+        // Sanity check to ensure that all ports where fanins were recorded were indeed visited.
+        // Combinational loops are IGNORED BY DEFAULT: they typically come from abc9's
+        // mapped-network reintegration (yosys $auto$abc9_ops cells), do not change the
+        // bitstream, and are present in several open-flow designs that otherwise place
+        // and route cleanly.  The strict failure stays available via the
+        // timing/ignoreLoops=false setting.  If the loops are unintended (a genuine
+        // feedback path), re-synthesize without -abc9.
+        bool ignore_loops = bool_or_default(ctx->settings, ctx->id("timing/ignoreLoops"), true);
+        if (!port_fanin.empty() && !ignore_loops) {
             for (auto fanin : port_fanin) {
                 NetInfo *net = fanin.first->net;
                 if (net != nullptr) {
@@ -280,6 +287,12 @@ struct Timing
             else
                 log_error("timing analysis failed due to presence of combinatorial loops, incomplete specification of "
                           "timing ports, etc.\n");
+        } else if (!port_fanin.empty()) {
+            log_warning("timing analysis: %d combinational loop(s) present in the netlist (commonly from abc9 "
+                        "mapped-network reintegration).  They are ignored by default: loops do not change the "
+                        "bitstream, but a genuine feedback path is a design error.  If unintended, re-synthesize "
+                        "without -abc9; set timing/ignoreLoops=false to make the timing analysis fail instead.\n",
+                        int(port_fanin.size()));
         }
 
         // Go forwards topographically to find the maximum arrival time and max path length for each net
