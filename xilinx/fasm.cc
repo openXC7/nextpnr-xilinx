@@ -2056,12 +2056,20 @@ struct FasmBackend
         }
         if (actual_width == 36) {
             write_bit("SDP_" + name.substr(0, name.length() - 2) + "_36");
-            if (name.find("WRITE") == 0) {
-                write_bit(name.substr(0, name.size() - 1) + "A_18");
+            // The 36-wide mode lives in the SDP bit plus the marker of the
+            // WIDE side only.  Writing the other side's 18 marker here too
+            // collides with that side's own width field (e.g. a RAMB18E1
+            // with READ_WIDTH_A=36 and an unused B port: the A-side marker
+            // READ_WIDTH_B_18 and the B-side default READ_WIDTH_B_1 encode
+            // the SAME prjxray bit, so fasm2frames aborts with
+            // FasmInconsistentBits).
+            if (name == "WRITE_WIDTH_A" || name == "WRITE_WIDTH_B")
+                write_bit(name.substr(0, name.size() - 1) + ((name == "WRITE_WIDTH_B") ? "B_18" : "A_18"));
+            else if (name == "READ_WIDTH_B")
                 write_bit(name.substr(0, name.size() - 1) + "B_18");
-            } else if (name.find("READ") == 0) {
-                write_bit(name.substr(0, name.size() - 1) + "B_18");
-            }
+            // READ_WIDTH_A=36: SDP bit only; the A-side has no 18 marker of
+            // its own at the RAMB18 half (only Y1 carries one, handled by
+            // the width==72 branch above), and the B field must stay free.
         } else {
             write_bit(name + "_" + std::to_string(actual_width));
         }
