@@ -198,6 +198,58 @@ void Arch::parseXdc(std::istream &in)
                 n->clkconstr->high.delay = n->clkconstr->period.delay / 2;
                 n->clkconstr->low.delay = n->clkconstr->period.delay / 2;
             }
+        } else if (cmd == "set_multicycle_path") {
+            // set_multicycle_path <N> [-setup|-hold] -from [<sel>] -to [<sel>]
+            // Tags the destination (capture) cells with a multicycle factor so the
+            // timing engine can relax the setup requirement on those endpoints.
+            // Previously this command was silently ignored. Supports a NAME glob in the
+            // -to selector, e.g. -to [get_cells -hier -filter {NAME =~ *rf_reg*}]
+            auto glob_match = [](const std::string &name, const std::string &pat) {
+                // simple '*' wildcard match
+                size_t n = 0, p = 0, star = std::string::npos, mark = 0;
+                while (n < name.size()) {
+                    if (p < pat.size() && (pat[p] == name[n] || pat[p] == '?')) { ++n; ++p; }
+                    else if (p < pat.size() && pat[p] == '*') { star = p++; mark = n; }
+                    else if (star != std::string::npos) { p = star + 1; n = ++mark; }
+                    else return false;
+                }
+                while (p < pat.size() && pat[p] == '*') ++p;
+                return p == pat.size();
+            };
+            // group_brackets=true keeps a whole "[get_cells ... {NAME =~ *pat*}]" as ONE argument.
+            int mcp = 1; bool is_hold = false;
+            std::string to_sel;
+            for (int c = 1; c < int(arguments.size()); c++) {
+                const std::string &a = arguments.at(c);
+                if (a == "-hold") is_hold = true;
+                else if (a == "-to" && c + 1 < int(arguments.size())) to_sel = arguments.at(c + 1);
+                else if (!a.empty() && std::all_of(a.begin(), a.end(), ::isdigit)) mcp = std::stoi(a);
+            }
+            // extract the NAME glob from the -to selector (substring after "=~")
+            std::string to_pat;
+            size_t eq = to_sel.find("=~");
+            if (eq != std::string::npos) to_pat = to_sel.substr(eq + 2);
+            // trim whitespace and any leftover braces/brackets around the pattern
+            auto clean = [](std::string s) {
+                std::string o;
+                for (char ch : s) if (ch != '{' && ch != '}' && ch != ']' && ch != '[' && !std::isspace(ch)) o += ch;
+                return o;
+            };
+            to_pat = clean(to_pat);
+            if (!is_hold && !to_pat.empty()) {
+                int tagged = 0;
+                for (auto &kv : cells) {
+                    std::string cn = kv.first.str(this);
+                    if (glob_match(cn, to_pat)) {
+                        kv.second->attrs[id("NEXTPNR_MCP_SETUP")] = std::to_string(mcp);
+                        ++tagged;
+                    }
+                }
+                log_info("set_multicycle_path: setup multicycle %d tagged on %d cells matching '%s' (on line %d)\n",
+                         mcp, tagged, to_pat.c_str(), lineno);
+            } else {
+                log_info("set_multicycle_path: parsed (hold or no -to glob) — no setup tag (on line %d)\n", lineno);
+            }
         } else {
             log_info("ignoring unsupported XDC command '%s' (on line %d)\n", cmd.c_str(), lineno);
         }
