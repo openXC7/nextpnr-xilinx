@@ -879,8 +879,12 @@ struct Context : Arch, DeterministicRNG
 
     // provided by timing.cc; computes timing on the current (routed) design
     // and returns per-clock fmax/target as a JSON string. Exposed to Python
-    // for --post-route report scripts (the fork lacks mainline's --report).
+    // for --post-route report scripts.
     std::string reportClockFmaxJson();
+
+    // provided by timing.cc; the full --report document (mainline nextpnr's
+    // schema: critical_paths / fmax / utilization).
+    std::string reportJson();
 
     // --------------------------------------------------------------
 
