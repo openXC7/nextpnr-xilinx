@@ -515,10 +515,49 @@ void XC7Packer::pack_carries_atomic()
                     // is THIS O[z] (single FF sink).  Leave anything exotic
                     // (multiple FF sinks, pinned, already clustered) to the
                     // generic packer.
+                    //
+                    // Control-set guard: all FFs co-located into one carry
+                    // slice share the slice's LSR (the legaliser rejects a
+                    // half-tile whose FFs carry different clk/sr/ce).  An
+                    // adder whose sum FFs use different resets would make the
+                    // anchor slice permanently invalid and the whole carry
+                    // chain unplaceable; skip such FFs (the generic packer
+                    // then places them in a control-set-compatible slice).
                     if (sum_ff != nullptr && !ambiguous &&
                         !sum_ff->attrs.count(ctx->id("BEL")) &&
                         sum_ff->constr_parent == nullptr &&
                         sum_ff->constr_children.empty()) {
+                        // Full control-set key: FFs sharing a carry slice
+                        // must agree on clk, ce, set/reset nets AND their
+                        // inversion/latch/sync flavours (the legaliser checks
+                        // all of them per half-tile).
+                        auto ctrl_key = [&](CellInfo *ff) {
+                            std::vector<IdString> key;
+                            for (IdString p : {ctx->id("C"), ctx->id("CLK"), ctx->id("CE"), ctx->id("R"),
+                                               ctx->id("S"), ctx->id("CLR"), ctx->id("PRE")}) {
+                                NetInfo *n = get_net_or_empty(ff, p);
+                                key.push_back(n ? n->name : IdString());
+                            }
+                            for (IdString p : {ctx->id("IS_CLK_INVERTED"), ctx->id("IS_R_INVERTED"),
+                                               ctx->id("IS_S_INVERTED"), ctx->id("IS_PRE_INVERTED"),
+                                               ctx->id("IS_CLR_INVERTED")})
+                                key.push_back(bool_or_default(ff->params, p, false) ? ctx->id("$inv") : IdString());
+                            if (ff->attrs.count(ctx->id("X_FF_AS_LATCH")))
+                                key.push_back(ctx->id("$latch"));
+                            if (ff->attrs.count(ctx->id("X_FFSYNC")))
+                                key.push_back(ctx->id("$sync"));
+                            return key;
+                        };
+                        bool sr_ok = true;
+                        auto new_key = ctrl_key(sum_ff);
+                        for (auto child : anchor->constr_children)
+                            if ((child->constr_z & 0xF) == BEL_FF && ctrl_key(child) != new_key)
+                                sr_ok = false;
+                        if (!sr_ok) {
+                            if (getenv("DBG_CARRYFF"))
+                                log_info("CARRYFF SKIP %s for %s.O[%d] ctrlset-mismatch\n",
+                                         ctx->nameOf(sum_ff), ctx->nameOf(prev), z);
+                        } else {
                         anchor->constr_children.push_back(sum_ff);
                         sum_ff->constr_parent = anchor;
                         sum_ff->constr_x = 0;
@@ -528,6 +567,7 @@ void XC7Packer::pack_carries_atomic()
                         if (getenv("DBG_CARRYFF"))
                             log_info("CARRYFF %s -> %s.O[%d] @ lane %d (z<<4|FF)\n",
                                      ctx->nameOf(sum_ff), ctx->nameOf(prev), z, z);
+                        }
                     } else if (getenv("DBG_CARRYFF") && sum_ff != nullptr) {
                         log_info("CARRYFF SKIP %s for %s.O[%d] amb=%d pinned=%d constr=%d\n",
                                  ctx->nameOf(sum_ff), ctx->nameOf(prev), z, ambiguous,

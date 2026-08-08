@@ -828,7 +828,8 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
                         }
                         if (ff->ffInfo.sr != sr) {
                             if (dbg_validity_runtime)
-                                log_info("  invalid-arm: ctrlset sr %s: %s vs %s\n", nameOf(ff),
+                                log_info("  invalid-arm: ctrlset sr %s @%s: %s vs %s\n", nameOf(ff),
+                                         getBelName(ff->bel).c_str(getCtx()),
                                          ff->ffInfo.sr ? nameOf(ff->ffInfo.sr) : "-", sr ? nameOf(sr) : "-");
                             return false;
                         }
