@@ -745,9 +745,14 @@ void assign_budget(Context *ctx, bool quiet)
         log_info("Checksum: 0x%08x\n", ctx->checksum());
 }
 
-std::string Context::reportClockFmaxJson()
+namespace {
+// Per-clock achieved fmax + constraint, keyed by the raw clock net name.
+// Empty on a failed timing walk (combinatorial loops, incomplete timing
+// ports, ...): a failed report must not kill an already successfully
+// routed flow.
+std::map<std::string, std::pair<double, double>> compute_clock_fmax(Context *ctx)
 {
-    Context *ctx = this;
+    std::map<std::string, std::pair<double, double>> out;
     std::map<IdString, double> clock_fmax;
     try {
         CriticalPathMap crit_paths;
@@ -768,31 +773,82 @@ std::string Context::reportClockFmaxJson()
                 clock_fmax[a.clock] = Fmax;
         }
     } catch (log_execution_error_exception &) {
-        // the timing walk can log_error (combinatorial loops, incomplete
-        // timing ports, ...); a failed REPORT must not kill an already
-        // successfully routed flow -> report no clocks instead
-        return "{}";
+        return out;
     }
 
-    std::string json = "{";
-    bool first = true;
     for (auto &clock : clock_fmax) {
         float target = ctx->setting<float>("target_freq") / 1e6;
         auto ni = ctx->nets.find(clock.first);
         if (ni != ctx->nets.end() && ni->second->clkconstr)
             target = 1000 / ctx->getDelayNS(ni->second->clkconstr->period.minDelay());
-        json += first ? "\"" : ", \"";
-        for (char c : clock.first.str(ctx)) {
-            if (c == '"' || c == '\\')
-                json += '\\';
-            json += c;
-        }
+        out[clock.first.str(ctx)] = {clock.second, target};
+    }
+    return out;
+}
+
+std::string json_escape(const std::string &s)
+{
+    std::string r;
+    for (char c : s) {
+        if (c == '"' || c == '\\')
+            r += '\\';
+        r += c;
+    }
+    return r;
+}
+} // namespace
+
+std::string Context::reportClockFmaxJson()
+{
+    std::string json = "{";
+    bool first = true;
+    for (auto &clock : compute_clock_fmax(this)) {
         char buf[80];
-        snprintf(buf, sizeof(buf), "\": {\"achieved\": %.2f, \"constraint\": %.2f}", clock.second, target);
-        json += buf;
+        snprintf(buf, sizeof(buf), "\": {\"achieved\": %.2f, \"constraint\": %.2f}", clock.second.first,
+                 clock.second.second);
+        json += (first ? "\"" : ", \"") + json_escape(clock.first) + buf;
         first = false;
     }
     json += "}";
+    return json;
+}
+
+std::string Context::reportJson()
+{
+    // The document mirrors mainline nextpnr's --report schema
+    // (critical_paths / fmax / utilization), with the clock-name aliasing
+    // apio's report formatter expects: '$iopadmap$<port>' (the net yosys
+    // inserts for a clock input port) shows the port name itself, other
+    // yosys internals show as "(internal) <last-segment>".
+    std::string json = "{\n    \"critical_paths\": [],\n    \"fmax\": {";
+    bool first = true;
+    for (auto &clock : compute_clock_fmax(this)) {
+        std::string name = clock.first;
+        if (name.rfind("$iopadmap$", 0) == 0)
+            name = name.substr(10);
+        else if (!name.empty() && name[0] == '$')
+            name = "(internal) " + name.substr(name.find_last_of('$') + 1);
+        char buf[80];
+        snprintf(buf, sizeof(buf), "\": {\"achieved\": %.2f, \"constraint\": %.2f}", clock.second.first,
+                 clock.second.second);
+        json += (first ? "\"" : ", \"") + json_escape(name) + buf;
+        first = false;
+    }
+    json += "},\n    \"utilization\": {";
+    std::map<std::string, int> avail, used;
+    for (auto bel : getBels())
+        avail[getBelType(bel).str(this)]++;
+    for (auto &cell : cells)
+        used[cell.second->type.str(this)]++;
+    first = true;
+    for (auto &kv : avail) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "\": {\"available\": %d, \"used\": %d}", kv.second,
+                 used.count(kv.first) ? used.at(kv.first) : 0);
+        json += (first ? "\"" : ", \"") + json_escape(kv.first) + buf;
+        first = false;
+    }
+    json += "}\n}\n";
     return json;
 }
 
