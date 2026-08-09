@@ -906,6 +906,25 @@ class HeAPPlacer
             // log_info("   Legalising %s (%s)\n", top.second.c_str(ctx), ci->type.c_str(ctx));
             int bt = std::get<0>(bel_types.at(ci->type));
             auto &fb = fast_bels.at(bt);
+            // Population of this bel type (lazy, cached).  The
+            // eviction-last-resort rule below only applies to SCARCE types
+            // (BRAM: 135 on an a100, DSP, clock buffers, config singletons):
+            // that is where two cells sharing a neighbourhood can evict each
+            // other forever.  For abundant fabric types (tens of thousands
+            // of LUT/FF bels) the evicted cell rehomes trivially and the
+            // greedy commit gives tighter placements -- applying the rule
+            // globally regressed ddr3-test-arty-s7 into a placement with
+            // unroutable output-mux contention (3 overused SITEWIREs).
+            static std::unordered_map<int, int> type_pop_cache;
+            auto tp = type_pop_cache.find(bt);
+            if (tp == type_pop_cache.end()) {
+                int n = 0;
+                for (auto &col : fb)
+                    for (auto &cv : col)
+                        n += int(cv.size());
+                tp = type_pop_cache.emplace(bt, n).first;
+            }
+            const bool scarce_type = tp->second <= 4096;
             int radius = 0;
             int iter = 0;
             int iter_at_radius = 0;
@@ -921,6 +940,14 @@ class HeAPPlacer
             bool tried_full_scan = false;
             BelId bestBel;
             int best_inp_len = std::numeric_limits<int>::max();
+            // Best candidate that needs NO eviction.  Eviction is only ever
+            // allowed when the whole exploration saw no free valid home:
+            // two cells whose solver positions share a neighbourhood
+            // otherwise evict each other forever (litex qmtech-a100:
+            // sram.0.0 and a VexRiscv cache bank ping-ponged with 103
+            // free-and-valid BRAM tiles measured on the die).
+            BelId bestFreeBel;
+            int best_free_inp_len = std::numeric_limits<int>::max();
 
             if (debug_this) std::cerr << "==> placing cell " << ci->name.str(ctx) << std::endl;
 
@@ -1011,22 +1038,21 @@ class HeAPPlacer
                                 if (ci->region != nullptr && ci->region->constr_bels &&
                                     !ci->region->bels.count(sz))
                                     continue;
-                                CellInfo *scan_bound = ctx->getBoundBelCell(sz);
-                                if (scan_bound != nullptr) {
-                                    if (scan_bound->constr_parent != nullptr ||
-                                        !scan_bound->constr_children.empty() || scan_bound->constr_abs_z)
-                                        continue;
-                                    ctx->unbindBel(scan_bound->bel);
-                                }
+                                // FREE bels only: a deterministic sweep that
+                                // evicts always picks the SAME victim, which
+                                // turns two same-type cells into a mutual
+                                // eviction livelock (measured: 29k sweep
+                                // evictions in the qmtech BRAM ping-pong).
+                                // The needle case this sweep exists for
+                                // (DCIRESET: one bel on the die) is always
+                                // free -- nothing else can bind it.
+                                if (ctx->getBoundBelCell(sz) != nullptr)
+                                    continue;
                                 ctx->bindBel(sz, ci, STRENGTH_WEAK);
                                 if (require_validity && !ctx->isBelLocationValid(sz)) {
                                     ctx->unbindBel(sz);
-                                    if (scan_bound != nullptr)
-                                        ctx->bindBel(sz, scan_bound, STRENGTH_WEAK);
                                     continue;
                                 }
-                                if (scan_bound != nullptr)
-                                    remaining.emplace(chain_size[scan_bound->name], scan_bound->name);
                                 placed = true;
                                 Loc loc = ctx->getBelLocation(sz);
                                 cell_locs[ci->name].x = loc.x;
@@ -1055,15 +1081,21 @@ class HeAPPlacer
 
                 int need_to_explore = 2 * radius;
 
-                if (iter_at_radius >= need_to_explore && bestBel != BelId()) {
-                    CellInfo *bound = ctx->getBoundBelCell(bestBel);
+                if (iter_at_radius >= need_to_explore &&
+                    (bestBel != BelId() || (scarce_type && bestFreeBel != BelId()))) {
+                    // Never evict while the exploration saw a free valid
+                    // home -- eviction is the last resort, not a wirelen
+                    // optimisation (see bestFreeBel above).  Scarce types
+                    // only; abundant types keep the greedy commit.
+                    BelId target = (scarce_type && bestFreeBel != BelId()) ? bestFreeBel : bestBel;
+                    CellInfo *bound = ctx->getBoundBelCell(target);
                     if (bound != nullptr) {
                         ctx->unbindBel(bound->bel);
                         remaining.emplace(chain_size[bound->name], bound->name);
                     }
-                    ctx->bindBel(bestBel, ci, STRENGTH_WEAK);
+                    ctx->bindBel(target, ci, STRENGTH_WEAK);
                     placed = true;
-                    Loc loc = ctx->getBelLocation(bestBel);
+                    Loc loc = ctx->getBelLocation(target);
                     cell_locs[ci->name].x = loc.x;
                     cell_locs[ci->name].y = loc.y;
                     break;
@@ -1107,8 +1139,26 @@ class HeAPPlacer
                                     best_inp_len = input_len;
                                     bestBel = sz;
                                 }
+                                if (bound == nullptr && input_len < best_free_inp_len) {
+                                    best_free_inp_len = input_len;
+                                    bestFreeBel = sz;
+                                }
                                 break;
                             } else {
+                                // Post-exploration direct commit: same rule
+                                // as the bestBel commit -- never evict when a
+                                // free valid home was already seen (scarce
+                                // types only).
+                                if (scarce_type && bound != nullptr && bestFreeBel != BelId()) {
+                                    ctx->unbindBel(sz);
+                                    ctx->bindBel(sz, bound, STRENGTH_WEAK);
+                                    ctx->bindBel(bestFreeBel, ci, STRENGTH_WEAK);
+                                    Loc floc = ctx->getBelLocation(bestFreeBel);
+                                    cell_locs[ci->name].x = floc.x;
+                                    cell_locs[ci->name].y = floc.y;
+                                    placed = true;
+                                    break;
+                                }
                                 if (bound != nullptr)
                                     remaining.emplace(chain_size[bound->name], bound->name);
                                 Loc loc = ctx->getBelLocation(sz);
