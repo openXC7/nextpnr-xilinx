@@ -1554,17 +1554,28 @@ struct FasmBackend
             if (srtype == "SYNC") write_bit("IFF.SRTYPE.SYNC"); else write_bit("IFF.SRTYPE.ASYNC");
 
             write_bit("IFF.ZINV_C", !bool_or_default(ci->params, ctx->id("IS_CLK_INVERTED"), false));
+            // NB (issue #114): the ISERDESE2 path below also writes IFF.ZINV_OCLK
+            // and IFFDELMUXE3, which this branch omits. Adding IFF.ZINV_OCLK here
+            // was tested on silicon and changed NOTHING -- the captured bytes were
+            // bit-identical with and without it (Q1 stuck 0, Q2 stuck 1 either way),
+            // so the missing OCLK bit is ruled out as the cause. Left unwritten.
             write_bit("ZINV_D", !bool_or_default(ci->params, ctx->id("IS_D_INVERTED"), false));
 
-            auto init = int_or_default(ci->params, ctx->id("INIT_Q1"), 0);
-            if (init == 0) write_bit("IFF.ZINIT_Q1");
-            init = int_or_default(ci->params, ctx->id("INIT_Q2"), 0);
-            if (init == 0) write_bit("IFF.ZINIT_Q2");
+            // The IFF is physically a four-flop block shared with ISERDESE2, and the
+            // ISERDESE2 path below initialises all four. An IDDR only exposes Q1/Q2, so
+            // Q3/Q4 were left unwritten -- and on silicon that is observable: with Q3/Q4
+            // uninitialised the outputs read Q1=0, Q2=1 despite both being programmed
+            // INIT=0; writing all four makes them read their programmed value. IDDR has
+            // no INIT_Q3/Q4 parameters, so those default to 0.
+            for (int i = 1; i <= 4; i++) {
+                auto init = int_or_default(ci->params, ctx->id("INIT_Q" + std::to_string(i)), 0);
+                if (init == 0) write_bit("IFF.ZINIT_Q" + std::to_string(i));
+            }
 
             auto sr_name = str_or_default(ci->attrs, ctx->id("X_ORIG_PORT_SR"), "R");
             if (sr_name == "R") {
-                write_bit("IFF.ZSRVAL_Q1");
-                write_bit("IFF.ZSRVAL_Q2");
+                for (int i = 1; i <= 4; i++)
+                    write_bit("IFF.ZSRVAL_Q" + std::to_string(i));
             }
         } else if (ci->type == ctx->id("OLOGICE2_OUTFF") || ci->type == ctx->id("OLOGICE3_OUTFF")) {
             std::string edge = str_or_default(ci->params, ctx->id("DDR_CLK_EDGE"), "OPPOSITE_EDGE");
