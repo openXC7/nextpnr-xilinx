@@ -84,6 +84,7 @@ struct CriticalPath
     PortRefVector ports;
     delay_t path_delay;
     delay_t path_period;
+    int mcp = 1; // set_multicycle_path setup factor on the capture register (1 = single-cycle)
 };
 
 typedef std::unordered_map<ClockPair, CriticalPath> CriticalPathMap;
@@ -386,6 +387,15 @@ struct Timing
                                     }
                                 }
                             }
+                            // set_multicycle_path: relax setup by the multicycle factor on the capture reg
+                            int this_mcp = 1;
+                            if (usr.cell && usr.cell->attrs.count(ctx->id("NEXTPNR_MCP_SETUP"))) {
+                                this_mcp = std::atoi(usr.cell->attrs.at(ctx->id("NEXTPNR_MCP_SETUP")).as_string().c_str());
+                                if (this_mcp > 1)
+                                    period *= this_mcp;
+                                else
+                                    this_mcp = 1;
+                            }
                             auto path_budget = period - endpoint_arrival;
 
                             if (update) {
@@ -411,6 +421,7 @@ struct Timing
                                     crit_nets[clockPair] = std::make_pair(endpoint_arrival, net);
                                     (*crit_path)[clockPair].path_delay = endpoint_arrival;
                                     (*crit_path)[clockPair].path_period = period;
+                                    (*crit_path)[clockPair].mcp = this_mcp;
                                     (*crit_path)[clockPair].ports.clear();
                                     (*crit_path)[clockPair].ports.push_back(&usr);
                                 }
@@ -552,6 +563,12 @@ struct Timing
                                             period = ctx->nets.at(clksig)->clkconstr->high.minDelay();
                                         }
                                     }
+                                }
+                                // set_multicycle_path: relax setup by the multicycle factor on the capture reg
+                                if (usr.cell && usr.cell->attrs.count(ctx->id("NEXTPNR_MCP_SETUP"))) {
+                                    int mcp = std::atoi(usr.cell->attrs.at(ctx->id("NEXTPNR_MCP_SETUP")).as_string().c_str());
+                                    if (mcp > 1)
+                                        period *= mcp;
                                 }
                                 nd.min_required.at(i) = std::min(period - setup, nd.min_required.at(i));
                             };
@@ -889,10 +906,13 @@ void timing_analysis(Context *ctx, bool print_histogram, bool print_fmax, bool p
                 continue;
             double Fmax;
             empty_clocks.erase(a.clock);
+            // A set_multicycle_path -setup N endpoint may take N clock cycles, so its
+            // constraining frequency is N/delay (it drops out as the bottleneck).
+            double mcp = path.second.mcp > 1 ? double(path.second.mcp) : 1.0;
             if (a.edge == b.edge)
-                Fmax = 1000 / ctx->getDelayNS(path.second.path_delay);
+                Fmax = mcp * 1000 / ctx->getDelayNS(path.second.path_delay);
             else
-                Fmax = 500 / ctx->getDelayNS(path.second.path_delay);
+                Fmax = mcp * 500 / ctx->getDelayNS(path.second.path_delay);
             if (!clock_fmax.count(a.clock) || Fmax < clock_fmax.at(a.clock)) {
                 clock_reports[a.clock] = path;
                 clock_fmax[a.clock] = Fmax;
