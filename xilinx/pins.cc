@@ -700,6 +700,7 @@ void get_top_level_pins(Context *ctx, std::unordered_map<IdString, std::unordere
     toplevel_pins[ctx->id("IBUFE3")] = {ctx->id("I")};
 
     toplevel_pins[ctx->id("IBUFDS")] = {ctx->id("I"), ctx->id("IB")};
+    toplevel_pins[ctx->id("IBUFGDS")] = {ctx->id("I"), ctx->id("IB")};
     toplevel_pins[ctx->id("IBUFDS_DIFF_OUT")] = {ctx->id("I"), ctx->id("IB")};
     toplevel_pins[ctx->id("IBUFDS_DIFF_OUT_IBUFDISABLE")] = {ctx->id("I"), ctx->id("IB")};
     toplevel_pins[ctx->id("IBUFDS_DIFF_OUT_INTERMDISABLE")] = {ctx->id("I"), ctx->id("IB")};
