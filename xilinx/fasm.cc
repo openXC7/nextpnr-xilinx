@@ -2197,6 +2197,23 @@ struct FasmBackend
                 write_bit("ZINV_" + pn,
                           !bool_or_default(ci->params, ctx->id("IS_" + pn + "_INVERTED"), false));
             }
+            // REGCLKARDRCLK and REGCLKB are SITE pins, not RAMB18E1/RAMB36E1 cell
+            // ports, so they are absent from invertible_pins (pins.cc lists eight
+            // pins for these types and neither of those two).  The `pn ==
+            // "REGCLKARDRCLK"` / `pn == "REGCLKB"` guards above therefore never
+            // fire, and the bits were emitted nowhere at all.
+            //
+            // prjxray's fuzzer states the rule (fuzzers/025-bram-config/generate.py):
+            // with DO*_REG == 1 the output-register clock FOLLOWS the corresponding
+            // data clock, and with DO*_REG == 0 it is always inverted -- i.e. tag 0,
+            // which is the bit clear, which is what emitting nothing already gives.
+            // So only the registered case needs anything written.
+            if (bool_or_default(ci->params, ctx->id("DOA_REG"), false))
+                write_bit("ZINV_REGCLKARDRCLK",
+                          !bool_or_default(ci->params, ctx->id("IS_CLKARDCLK_INVERTED"), false));
+            if (bool_or_default(ci->params, ctx->id("DOB_REG"), false))
+                write_bit("ZINV_REGCLKB",
+                          !bool_or_default(ci->params, ctx->id("IS_CLKBWRCLK_INVERTED"), false));
             // golden per-half defaults (dcp2fasm campaign):
             if (str_or_default(ci->params, ctx->id("RDADDR_COLLISION_HWCONFIG"), "DELAYED_WRITE") == "PERFORMANCE")
                 write_bit("RDADDR_COLLISION_HWCONFIG_PERFORMANCE");
