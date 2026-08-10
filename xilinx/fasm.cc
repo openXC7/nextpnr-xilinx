@@ -1554,11 +1554,34 @@ struct FasmBackend
             if (srtype == "SYNC") write_bit("IFF.SRTYPE.SYNC"); else write_bit("IFF.SRTYPE.ASYNC");
 
             write_bit("IFF.ZINV_C", !bool_or_default(ci->params, ctx->id("IS_CLK_INVERTED"), false));
-            // NB (issue #114): the ISERDESE2 path below also writes IFF.ZINV_OCLK
-            // and IFFDELMUXE3, which this branch omits. Adding IFF.ZINV_OCLK here
-            // was tested on silicon and changed NOTHING -- the captured bytes were
-            // bit-identical with and without it (Q1 stuck 0, Q2 stuck 1 either way),
-            // so the missing OCLK bit is ruled out as the cause. Left unwritten.
+
+            // Relates to #114. NOT a claimed fix -- see the caveat below.
+            //
+            // What is established: on an ALINX AX7203 (xc7a200tfbg484-2), toggling
+            // IFFDELMUXE3.P0 changes what the two IDDR flops output. A/B/A, reflashing
+            // between variants, reproduced three times in both directions. So the bit
+            // has a real effect on this path.
+            //
+            // What is NOT established: which of the two states is the capturing one.
+            // The readout was four LEDs reported by position, and the position-to-led[]
+            // mapping was never pinned down, so "0,0 vs 1,1" does not by itself say which
+            // way round it goes. That measurement needs redoing with an indicator whose
+            // value is tied to state independently of which LED is which -- one LED,
+            // distinguishable blink rates.
+            //
+            // What the database says, which cuts against the polarity used here:
+            // IDELMUXE3 is an arity-2 pair (P0 = 29_101 set, P1 = !29_101), and above,
+            // P0 is written exactly when an IDELAYE2 drives D -- i.e. P0 means "take the
+            // delayed path". IFFDELMUXE3 has only .P0 documented (28_116), no .P1, so
+            // not writing it is the other state. The ISERDESE2 path below writes
+            // IFFDELMUXE3.P0 on (iobdelay == "IFD"), which is the same sense: P0 = take
+            // the delay element. On that reading an IDDR with no IDELAYE2 wants the bit
+            // CLEAR, and the condition below has it backwards.
+            //
+            // IFF.ZINV_OCLK is deliberately unwritten: adding it was tested on silicon
+            // separately and changed nothing, bit-identical captures either way.
+            if (!boost::contains(drv->type.str(ctx), "IDELAYE2"))
+                write_bit("IFFDELMUXE3.P0");
             write_bit("ZINV_D", !bool_or_default(ci->params, ctx->id("IS_D_INVERTED"), false));
 
             // The IFF is physically a four-flop block shared with ISERDESE2, and the
