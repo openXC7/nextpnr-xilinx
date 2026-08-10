@@ -187,8 +187,26 @@ void XC7Packer::pack_gt()
                     ci->setParam(ctx->id("_DRPCLK_USED"), Property(used));
                 } else if (boost::starts_with(port_name, "GTREFCLK")) {
                     CellInfo *driver = port_net->driver.cell;
-                    if (driver == nullptr) log_error("Port %s connected to net %s has no driver!", port_name.c_str(), port_net->name.c_str(ctx));
-                    if (!used || driver->type == ctx->id("PSEUDO_GND") || driver->type == ctx->id("PSEUDO_VCC")) {
+                    // A refclk on a net with NO driver is an UNUSED refclk, not
+                    // an error: a physical netlist ties spare GT clock inputs to
+                    // leftover nets that drive nothing.  The "unused" test below
+                    // already handles that case -- it just could not be reached,
+                    // because this check dereferenced the driver first and
+                    // aborted the whole run ("Port GTREFCLK1 connected to net
+                    // CMT_TOP_WW2A2_12 has no driver!").
+                    if (driver == nullptr) {
+                        disconnect_port(ctx, ci, port.first);
+                        continue;
+                    }
+                    // GND/VCC as well as PSEUDO_GND/PSEUDO_VCC: a netlist
+                    // imported from a Vivado EDIF ties its unused refclks to
+                    // real GND/VCC primitive instances, not to nextpnr's own
+                    // pseudo-constants, so without these the tie reads as a
+                    // genuine clock driver and packing aborts with
+                    // "GTREFCLK connected to unsupported cell type GND".
+                    // Same fix as the CPLLREFCLKSEL site below (line ~362).
+                    if (!used || driver->type == ctx->id("PSEUDO_GND") || driver->type == ctx->id("PSEUDO_VCC")
+                        || driver->type == ctx->id("GND") || driver->type == ctx->id("VCC")) {
                         // refclk input tied to a constant: unused, not a clock
                         disconnect_port(ctx, ci, port.first);
                         continue;
@@ -347,8 +365,21 @@ void XC7Packer::pack_gt()
                             continue;
                         }
                         auto driver = net->driver.cell;
+                        // A driver cell of type GND/VCC is a constant too.  An
+                        // IMPORTED netlist (a Vivado replay via xml2json) carries
+                        // literal GND/VCC cells, and the generic packer that
+                        // rewrites them into $PACKER_GND_NET/$PACKER_VCC_NET runs
+                        // AFTER this one -- so without these two names the GT
+                        // packer sees a "clock" driven by a cell called GND and
+                        // aborts the whole design:
+                        //   The clock port 'CPLLREFCLKSEL[2]' ... can only be
+                        //   driven by ... but not GND
+                        // (CPLLREFCLKSEL is a configuration select bus that is
+                        // SUPPOSED to be tied; it lands here only because the
+                        // port filter above matches any name containing REFCLK.)
                         if (driver == nullptr || driver->type == ctx->id("PSEUDO_GND") ||
-                            driver->type == ctx->id("PSEUDO_VCC")) {
+                            driver->type == ctx->id("PSEUDO_VCC") ||
+                            driver->type == ctx->id("GND") || driver->type == ctx->id("VCC")) {
                             // clock input tied to a constant: unused
                             disconnect_port(ctx, ci, port.first);
                             continue;

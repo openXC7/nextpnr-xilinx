@@ -453,6 +453,23 @@ void XilinxPacker::pack_dram()
                 }
                 create_muxf_tree(base, "O", o_pre, addressw_high, o,
                         m256 ? 4 : (ctx->xc7 ? 2 : 6));
+                // CARRY AN IMPORTED PLACEMENT THROUGH THE REPACK.
+                // The original cell is about to be deleted, taking any BEL
+                // attribute with it, and the RAMS64E/MUXF cells replacing it
+                // are created unplaced -- so a design whose placement came from
+                // outside (a Vivado replay) silently loses it here and the
+                // eight RAM256X1S of one byte-wide buffer end up scattered
+                // across the die.  Measured before this: two ~250-tile hops and
+                // 28 ns of routing on a path whose logic was 0.8 ns.
+                //
+                // The base sub-cell is created first with z = height-1, i.e.
+                // the D lane, which is exactly where Vivado puts the first
+                // RAMS64E of a RAM256X1S ("SLICE_.../D6LUT").  So handing the
+                // parent's BEL to the base lands the whole constrained group --
+                // the other three RAMS64E and the MUXF7/F8 tree are
+                // constr_abs_z children of it -- on the imported slice.
+                if (base != nullptr && ci->attrs.count(ctx->id("BEL")))
+                    base->attrs[ctx->id("BEL")] = ci->attrs.at(ctx->id("BEL"));
                 packed_cells.insert(ci->name);
             }
         } else if (cs.memtype == ctx->id("RAMS32")

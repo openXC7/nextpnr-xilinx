@@ -36,6 +36,7 @@ inline NetInfo *port_or_nullptr(const CellInfo *cell, IdString name)
 
 //#define DEBUG_VALIDITY
 bool dbg_validity_runtime = false;
+static bool packing_oracle();
 #define DBG_RT()                                                                                                       \
     do {                                                                                                               \
         if (dbg_validity_runtime)                                                                                      \
@@ -878,12 +879,112 @@ void Arch::dumpTileStatus(BelId bel) const
     (void)isBelLocationValid(bel);
 }
 
+// PACKING ORACLE (NEXTPNR_PACKING_ORACLE=1) ---------------------------------
+// Treat an EXTERNALLY STAMPED placement as authoritative and skip our own slice
+// legality check for it.
+//
+// The case this exists for: replaying a Vivado placement.  Vivado packs ~5.16
+// primitives per slice where our recognition packer averages 1.82, and it uses
+// intra-slice combinations our checker rejects outright -- e.g. an A5FF whose
+// partner LUT our model does not expect ("post-placement validity check failed
+// for Bel 'SLICE_X210Y29/A5FF' (no cell)").  Those placements are not illegal;
+// they are legal silicon that our model is too conservative to describe, and
+// the design they came from answers ARP on hardware.
+//
+// This is NOT --force.  --force downgrades the check globally, including for
+// cells WE placed, and the result was 12306 violations and a scrambled
+// placement timing 3x worse than Vivado's on the same input.  Here the check is
+// waived ONLY for a tile whose every occupant carries a BEL attribute, i.e. one
+// placed entirely by the external tool; any tile we have touched is still
+// checked exactly as before.
+static bool packing_oracle()
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("NEXTPNR_PACKING_ORACLE");
+        cached = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+// The oracle does TWO separable things: it WAIVES our slice check for a fully
+// stamped tile (above), and it EXCLUDES our own cells from such tiles (below).
+// Both are right for a WHOLE-DESIGN replay.  In a PARTIAL one -- place_lef
+// stamps the fabric, and nextpnr's packer then invents feedthrough and constant
+// LUTs -- nearly every occupied tile is fully stamped, so the exclusion pushes
+// those invented cells out to distant empty tiles and the routes to reach them
+// do not close: measured on ethmin, SKIPS=150 with the exclusion against a
+// placement that is otherwise legal.  NEXTPNR_ORACLE_EXCLUDE=0 keeps the waiver
+// and drops the exclusion.  Default stays ON so the replay flow is unchanged.
+static bool packing_oracle_exclude()
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("NEXTPNR_ORACLE_EXCLUDE");
+        cached = (e == nullptr) ? 1 : ((*e && *e != '0') ? 1 : 0);
+    }
+    return cached == 1;
+}
+
+// A tile counts as externally packed if the cells that came from the DESIGN are
+// all stamped.  Cells the PACKER INVENTED are ignored, because they are exactly
+// the ones that must be allowed into such a tile: GND/VCC const drivers have to
+// sit beside their loads, and route-through LUTs are created for carry S-pins.
+// Requiring a literally untouched tile is the wrong test -- measured, it left
+// one CLBLL_L rejected for holding $PACKER_GND_NET$LUT$106/$108 and a
+// wr_addr[4]$LUT$104 alongside six stamped cells, and that single tile failed
+// the whole run.
+static bool is_packer_invented(const BaseCtx *ctx, const CellInfo *ci)
+{
+    std::string n = ci->name.str(ctx);
+    return n.find("$PACKER_") != std::string::npos || n.find("$LUT$") != std::string::npos ||
+           n.find("$intcell$") != std::string::npos;
+}
+
+bool Arch::tileIsFullyStamped(int tile) const
+{
+    if (!tileStatus[tile].lts)
+        return false;
+    const LogicTileStatus &lts = *(tileStatus[tile].lts);
+    bool any_stamped = false;
+    for (int z = 0; z < 128; z++) {
+        const CellInfo *ci = lts.cells[z];
+        if (ci == nullptr)
+            continue;
+        if (ci->attrs.count(id("BEL"))) {
+            any_stamped = true;
+            continue;
+        }
+        // A cell CONSTRAINED to a stamped one belongs to the imported
+        // placement too: repacking a macro (RAM256X1S -> 4 x RAMS64E + a
+        // MUXF7/F8 tree) creates children that carry no BEL of their own but
+        // are constr_abs_z children of a base that does.  Treating them as
+        // foreign would make every repacked tile fail the waiver.
+        bool derived = false;
+        for (const CellInfo *p = ci->constr_parent; p != nullptr; p = p->constr_parent)
+            if (p->attrs.count(id("BEL"))) {
+                derived = true;
+                break;
+            }
+        if (derived) {
+            any_stamped = true;
+            continue;
+        }
+        if (is_packer_invented(this, ci))
+            continue; // ours by necessity, not a foreign packing decision
+        return false; // a real design cell we placed -- check the tile normally
+    }
+    return any_stamped;
+}
+
 bool Arch::isBelLocationValid(BelId bel) const
 {
     IdString belTileType = getBelTileType(bel);
     if (isLogicTile(bel)) {
         // Logic Tile
         if (!tileStatus[bel.tile].lts)
+            return true;
+        if (packing_oracle() && tileIsFullyStamped(bel.tile))
             return true;
         LogicTileStatus &lts = *(tileStatus[bel.tile].lts);
         if (xc7) {
@@ -993,6 +1094,22 @@ bool Arch::isValidBelForCell(CellInfo *cell, BelId bel) const
         }
         if (in_used == 6 || cell->lutInfo.output_count == 2 || drives_o6 ||
             get_net_or_empty(cell, id_A6) != nullptr)
+            return false;
+    }
+    // NEXTPNR_PACKING_ORACLE: keep OUR cells out of a tile the external tool
+    // has already packed.  The oracle waives our slice check for a fully
+    // stamped tile, but only while it STAYS fully stamped -- drop one of our
+    // own cells into a Vivado-packed slice and the tile is mixed, the waiver
+    // correctly no longer applies, and the run dies on that single tile
+    // ("post-placement validity check failed for Bel 'SLICE_X206Y21/A5FF'").
+    // The bbox exclusion above cannot do this job here: in a whole-design
+    // replay the stamped cells span the entire die, so its bounding box leaves
+    // nowhere at all for the handful of cells the packer invents.  This is
+    // per-TILE instead, which leaves every untouched tile free.
+    if (packing_oracle() && packing_oracle_exclude() && !cell->attrs.count(id("BEL")) &&
+        cell->name.str(this).find("$PACKER_") == std::string::npos) {
+        // packer const drivers must stay placeable beside their loads
+        if (isLogicTile(bel) && tileIsFullyStamped(bel.tile))
             return false;
     }
     // NEXTPNR_EXCLUDE_STAMPED_BBOX: keep unstamped cells out of the bounding
@@ -1506,6 +1623,72 @@ void Arch::fixupPlacement()
     }
 }
 
+void Arch::bindDedicatedPads()
+{
+    // DEDICATED PAD CONNECTIONS ARE IMPLICIT -- recognise them from the routing
+    // graph, not from a list of cell or pin names.
+    //
+    // A transceiver's serial pins (GTXRXP/N, GTXTXP/N) and its refclk pair reach
+    // the package directly: there is no fabric path between the GT site wire and
+    // the IPAD/OPAD site wire, so the chipdb gives those wires NO PIPS AT ALL,
+    // uphill or downhill.  A wire outside the routing graph cannot be routed to,
+    // and the router should not try -- left alone it burns a full search and then
+    // reports
+    //   SKIP_FAILED_ARCS: failed to route arc 0 of net 'sgmii_txn'
+    //     (SITEWIRE/GTXE2_CHANNEL_X1Y1/GTXTXN -> SITEWIRE/OPAD_X1Y2/OPAD_O)
+    // which is noise that raises the floor under NEXTPNR_SKIP_FAILED_ARCS and
+    // makes a REAL failure easy to miss.
+    //
+    // "No pips on the wire" is the device model stating the connection is
+    // dedicated, so bind it at STRENGTH_LOCKED.  router2 already honours that:
+    // its "arcs that were pre-routed strongly (e.g. clocks)" test returns
+    // ARC_SUCCESS for a sink wire bound above STRENGTH_STRONG.
+    auto wire_is_dedicated = [&](WireId w) {
+        if (w == WireId())
+            return false;
+        // Uphill/DownhillPipRange are iterator ranges, not containers.
+        for (auto p : getPipsUphill(w)) {
+            (void)p;
+            return false;
+        }
+        for (auto p : getPipsDownhill(w)) {
+            (void)p;
+            return false;
+        }
+        return true;
+    };
+    int n_implicit = 0;
+    for (auto cell : sorted(cells)) {
+        CellInfo *ci = cell.second;
+        if (ci->type != id("PAD") && ci->type != id("IOB_PAD"))
+            continue;
+        if (ci->bel == BelId())
+            continue;
+        WireId pad_wire = getBelPinWire(ci->bel, id("PAD"));
+        if (!wire_is_dedicated(pad_wire))
+            continue;               // ordinary IOB: fall through to the BFS below
+        NetInfo *pad_net = ci->ports.count(id("PAD")) ? ci->ports[id("PAD")].net : nullptr;
+        if (pad_net == nullptr)
+            continue;
+        if (!getBoundWireNet(pad_wire))
+            bindWire(pad_wire, pad_net, STRENGTH_LOCKED);
+        // and the far end, so the arc in EITHER direction counts as pre-routed
+        if (pad_net->driver.cell != nullptr) {
+            WireId drv = getCtx()->getNetinfoSourceWire(pad_net);
+            if (drv != WireId() && drv != pad_wire && !getBoundWireNet(drv))
+                bindWire(drv, pad_net, STRENGTH_LOCKED);
+        }
+        for (auto &usr : pad_net->users) {
+            WireId snk = getCtx()->getNetinfoSinkWire(pad_net, usr);
+            if (snk != WireId() && snk != pad_wire && !getBoundWireNet(snk))
+                bindWire(snk, pad_net, STRENGTH_LOCKED);
+        }
+        ++n_implicit;
+    }
+    if (n_implicit > 0)
+        log_info("    %d dedicated pad net(s) pre-bound as implicit (no pips on the pad wire)\n", n_implicit);
+}
+
 void Arch::fixupRouting()
 {
     log_info("Running post-routing legalisation...\n");
@@ -1670,6 +1853,7 @@ void Arch::fixupRouting()
             bindPip(uh, net, STRENGTH_STRONG);
         }
     };
+
     for (auto cell : sorted(cells)) {
         CellInfo *ci = cell.second;
         if (ci->type == id("IOB_PAD")) {

@@ -282,8 +282,26 @@ struct Timing
                     // been visited
                     auto it = port_fanin.find(&port.second);
                     if (it == port_fanin.end()) {
-                        log_error("Internal timing error (negative fanin count) for %s.%s\n", ctx->nameOf(usr.cell),
-                                  ctx->nameOf(port.first));
+                        // A port reached by the traversal that was never given a
+                        // fanin count.  It happens on the pass-through LUTs the
+                        // carry packer inserts for CONSTANT-driven S/DI pins:
+                        // their input is a constant net, which the counting pass
+                        // classifies as ignorable, so the port is never counted
+                        // -- yet it is still reachable here.  Aborting the whole
+                        // run over it throws away a placement and routing that
+                        // are otherwise complete, which matters most when the
+                        // routing was IMPORTED and the timing numbers are not
+                        // the point.  Report it and leave the port out of the
+                        // topological order instead.
+                        static int reported = 0;
+                        if (reported < 5)
+                            log_warning("timing: no fanin count for %s.%s (constant-fed feedthrough?); "
+                                        "excluded from the topological order\n",
+                                        ctx->nameOf(usr.cell), ctx->nameOf(port.first));
+                        else if (reported == 5)
+                            log_warning("timing: further no-fanin-count ports not listed\n");
+                        ++reported;
+                        continue;
                     }
                     if (--it->second == 0) {
                         topographical_order.emplace_back(port.second.net);

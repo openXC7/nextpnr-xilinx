@@ -1595,6 +1595,9 @@ struct Arch : BaseCtx
 
     // Return true whether all Bels at a given location are valid
     bool isBelLocationValid(BelId bel) const;
+    // true when every cell in the tile carries a BEL attribute, i.e. the tile
+    // was placed entirely by an external tool (see NEXTPNR_PACKING_ORACLE)
+    bool tileIsFullyStamped(int tile) const;
     void dumpTileStatus(BelId bel) const;
 
     bool xcu_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const;
@@ -1679,6 +1682,7 @@ struct Arch : BaseCtx
     void assignCellInfo(CellInfo *cell);
 
     void fixupPlacement();
+    void bindDedicatedPads();
     void fixupRouting();
 
     void routeVcc();

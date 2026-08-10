@@ -127,10 +127,34 @@ void XilinxPacker::generic_xform(const std::unordered_map<IdString, XFormRule> &
 
 std::unique_ptr<CellInfo> XilinxPacker::feed_through_lut(NetInfo *net, const std::vector<PortRef> &feed_users)
 {
+    // The feedthrough net name MUST be unique.  ctx->nets[netname] = ... below
+    // silently OVERWRITES an existing entry (unlike create_internal_net, which
+    // asserts), so a repeated name destroys the earlier net while the cells
+    // wired to it keep their pointers.  On this design 398 of 569 feedthroughs
+    // collapsed onto a single name, "$legal$1", leaving a LUT driving the very
+    // net it was feeding through; timing analysis then reported the impossible
+    // "negative fanin count for $legal$1$LUT$2.O6" with nothing to point at.
+    // Bump the counter until both the net and the cell names are free.
+    std::string base = net->name.str(ctx);
+    // A feedthrough on a net still driven by a design GND/VCC CELL means
+    // constant packing never claimed it -- the symptom that hid the
+    // use-after-free in pack_constants.  PSEUDO_GND/PSEUDO_VCC are excluded on
+    // purpose: feeding those through is deliberate (a constant CARRY4 DI must
+    // come from a local LUT, see pack_carry_xc7), and warning on it would bury
+    // the real case in 28 false alarms.
+    if (net->driver.cell != nullptr &&
+        (net->driver.cell->type == ctx->id("GND") || net->driver.cell->type == ctx->id("VCC")))
+        log_warning("feeding through net '%s', still driven by a %s cell with %d users -- "
+                    "constant packing did not claim it\n",
+                    base.c_str(), net->driver.cell->type.c_str(ctx), int(net->users.size()));
+    std::string nn, cn;
+    do {
+        nn = base + "$legal$" + std::to_string(++autoidx);
+        cn = base + "$LUT$" + std::to_string(++autoidx);
+    } while (ctx->nets.count(ctx->id(nn)) || ctx->cells.count(ctx->id(cn)));
     std::unique_ptr<NetInfo> feedthru_net{new NetInfo};
-    feedthru_net->name = ctx->id(net->name.str(ctx) + "$legal$" + std::to_string(++autoidx));
-    std::unique_ptr<CellInfo> lut = create_lut(ctx, net->name.str(ctx) + "$LUT$" + std::to_string(++autoidx), {net},
-                                               feedthru_net.get(), Property(2));
+    feedthru_net->name = ctx->id(nn);
+    std::unique_ptr<CellInfo> lut = create_lut(ctx, cn, {net}, feedthru_net.get(), Property(2));
 
     for (auto &usr : feed_users) {
         disconnect_port(ctx, usr.cell, usr.port);
@@ -145,8 +169,15 @@ std::unique_ptr<CellInfo> XilinxPacker::feed_through_lut(NetInfo *net, const std
 std::unique_ptr<CellInfo> XilinxPacker::feed_through_muxf(NetInfo *net, IdString type,
                                                           const std::vector<PortRef> &feed_users)
 {
+    // Same uniqueness requirement as feed_through_lut above.
     std::unique_ptr<NetInfo> feedthru_net{new NetInfo};
-    feedthru_net->name = ctx->id(net->name.str(ctx) + "$legal$" + std::to_string(++autoidx));
+    {
+        std::string base = net->name.str(ctx), nn;
+        do {
+            nn = base + "$legal$" + std::to_string(++autoidx);
+        } while (ctx->nets.count(ctx->id(nn)));
+        feedthru_net->name = ctx->id(nn);
+    }
     std::unique_ptr<CellInfo> mux =
             create_cell(ctx, type, ctx->id(net->name.str(ctx) + "$MUX$" + std::to_string(++autoidx)));
     connect_port(ctx, net, mux.get(), ctx->id("I0"));
@@ -588,6 +619,32 @@ void XilinxPacker::pack_constants()
     if (invertible_pins.empty())
         get_invertible_pins(ctx, invertible_pins);
     if (!ctx->cells.count(ctx->id("$PACKER_GND_DRV"))) {
+        // The IMPORTED design may already carry nets with these names: a
+        // netlist replayed out of a Vivado DCP has GLOBAL_LOGIC0/1, which our
+        // importer emits as $PACKER_GND_NET/$PACKER_VCC_NET precisely so the
+        // constant handling below recognises them.
+        //
+        // "ctx->nets[name] = std::move(...)" OVERWRITES an existing map entry
+        // rather than asserting, so creating the packer's own constants on top
+        // of them FREES the imported NetInfo while every user cell still holds
+        // a pointer to it.  The freed object keeps a plausible driver and user
+        // list but its name reads back as a stale index -- on this design the
+        // ground net (2869 users) came back named "F9MUX", a cell-type
+        // constid.  Nothing then matched `name == "$PACKER_GND_NET"`, so the
+        // carry and mux packers treated ground as ordinary signal and fed it
+        // through legalisation LUTs until two cells claimed one net.
+        //
+        // Move any pre-existing net aside instead.  Its driver is a GND/VCC
+        // cell, so the loop further down reties its users to the packer's own
+        // constants in the normal way and erases it.
+        for (const char *cn : {"$PACKER_GND_NET", "$PACKER_VCC_NET"}) {
+            IdString id = ctx->id(cn);
+            if (ctx->nets.count(id)) {
+                log_info("    adopting imported constant net %s (%d user(s))\n", cn,
+                         int(ctx->nets.at(id)->users.size()));
+                rename_net(id, ctx->id(std::string(cn) + "$imported"));
+            }
+        }
         std::unique_ptr<CellInfo> gnd_cell{new CellInfo};
         gnd_cell->name = ctx->id("$PACKER_GND_DRV");
         gnd_cell->type = id_PSEUDO_GND;

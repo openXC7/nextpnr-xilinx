@@ -491,6 +491,19 @@ void Context::check() const
             if (net != nullptr) {
                 NPNR_ASSERT(nets.find(net->name) != nets.end());
                 if (port.second.type == PORT_OUT) {
+                    // Name the offender: "two cells claim one net" is the whole
+                    // content of this failure, and the assertion alone prints
+                    // neither the net nor either claimant.
+                    if (!(net->driver.cell == c.second.get() && net->driver.port == port.first)) {
+                        log_error("net '%s' is driven by port %s of cell '%s', but cell '%s' port %s "
+                                  "also claims to drive it (cell type %s vs %s)\n",
+                                  net->name.c_str(this),
+                                  net->driver.cell ? net->driver.port.c_str(this) : "<none>",
+                                  net->driver.cell ? net->driver.cell->name.c_str(this) : "<none>",
+                                  ci->name.c_str(this), port.first.c_str(this),
+                                  net->driver.cell ? net->driver.cell->type.c_str(this) : "<none>",
+                                  ci->type.c_str(this));
+                    }
                     NPNR_ASSERT(net->driver.cell == c.second.get() && net->driver.port == port.first);
                 } else if (port.second.type == PORT_IN) {
 #if 0
@@ -617,7 +630,23 @@ void BaseCtx::attributesToArchInfo()
                 strength = (PlaceStrength)str->second.as_int64();
 
             BelId b = getCtx()->getBelByName(id(val->second.as_string()));
-            getCtx()->bindBel(b, ci, strength);
+            if (b == BelId()) {
+                // An unresolvable placement hint is ADVISORY, not fatal.  A
+                // physical netlist names an IO bel by its site-type variant
+                // ("IOB_X0Y31/IOB18/INBUF_DCIEN") -- the same spelling this
+                // arch's own IO packer emits -- and that bel exists only in the
+                // site's alternate type, which getBelByName does not interpret.
+                // The packer places those cells itself from the pin
+                // constraints, so leave the cell unplaced and let it; refusing
+                // the whole design over a hint we cannot use is worse than
+                // ignoring the hint.
+                log_warning("cell '%s' (type %s): ignoring NEXTPNR_BEL '%s' -- not resolvable here; "
+                            "leaving placement to the packer\n",
+                            ci->name.c_str(this), ci->type.c_str(this),
+                            val->second.as_string().c_str());
+            } else {
+                getCtx()->bindBel(b, ci, strength);
+            }
         }
 
         val = ci->attrs.find(id("CONSTR_PARENT"));
@@ -669,15 +698,37 @@ void BaseCtx::attributesToArchInfo()
             std::vector<std::string> strs;
             auto routing = val->second.as_string();
             boost::split(strs, routing, boost::is_any_of(";"));
+            // Skip what will not resolve, rather than assert inside bind*.
+            // A name that the chipdb does not know is a data problem in the
+            // file, and aborting the whole import over one of ~73k entries
+            // tells you nothing about which one; applyFixedRoutes already takes
+            // the warn-and-continue line for exactly this reason.  Counted and
+            // reported per net so a lossy import is visible instead of silent.
+            int bound = 0, skipped = 0;
             for (size_t i = 0; i < strs.size() / 3; i++) {
                 std::string wire = strs[i * 3];
                 std::string pip = strs[i * 3 + 1];
                 PlaceStrength strength = (PlaceStrength)std::stoi(strs[i * 3 + 2]);
-                if (pip.empty())
-                    getCtx()->bindWire(getCtx()->getWireByName(id(wire)), ni, strength);
-                else
-                    getCtx()->bindPip(getCtx()->getPipByName(id(pip)), ni, strength);
+                if (pip.empty()) {
+                    WireId w = getCtx()->getWireByName(id(wire));
+                    if (w == WireId()) {
+                        ++skipped;
+                        continue;
+                    }
+                    getCtx()->bindWire(w, ni, strength);
+                } else {
+                    PipId p = getCtx()->getPipByName(id(pip));
+                    if (p == PipId()) {
+                        ++skipped;
+                        continue;
+                    }
+                    getCtx()->bindPip(p, ni, strength);
+                }
+                ++bound;
             }
+            if (skipped)
+                log_warning("ROUTING for net '%s': bound %d, skipped %d unresolvable name(s)\n",
+                            ni->name.c_str(this), bound, skipped);
         }
     }
     getCtx()->assignArchInfo();

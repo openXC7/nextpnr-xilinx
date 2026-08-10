@@ -220,6 +220,11 @@ void CommandHandler::setupContext(Context *ctx)
             log_error("Placer algorithm '%s' is not supported (available options: %s)\n", placer.c_str(),
                       boost::algorithm::join(Arch::availablePlacers, ", ").c_str());
         ctx->settings[ctx->id("placer")] = placer;
+        // Remember that placement was ASKED FOR.  The default is written into
+        // settings further down, so by the time an arch reads it the two are
+        // indistinguishable -- and an arch that only wants to place on request
+        // (see Arch::place for xc7) needs to tell them apart.
+        ctx->settings[ctx->id("placer_explicit")] = true;
     }
 
     if (vm.count("router")) {

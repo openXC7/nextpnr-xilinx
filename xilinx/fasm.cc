@@ -1175,6 +1175,24 @@ struct FasmBackend
             // is_riob18 branch only emitted one or the other; this restructure
             // emits both on HP banks.
             if (slew == "SLOW") {
+                // HP banks (LIOB18/RIOB18) DO NOT HAVE A ".SLEW.SLOW" FEATURE.
+                // The database models slew there as ONE SHARED BIT named
+                // "...SLEW.FAST_SLOW"; segbits_liob18_sing.db offers exactly
+                // LVCMOS12_LVCMOS15_LVCMOS18.SLEW.FAST_SLOW and
+                // LVCMOS15.SLEW.FAST, and nothing else.  Emitting .SLEW.SLOW
+                // here produced a name no segbit matches, so fasm2frames
+                // dropped it -- visibly only as a "key not found" line that
+                // XRAY_ALLOW_MISSING_FEATURES=1 downgrades to a warning, and
+                // the pad came out misconfigured.  Confirmed against a WORKING
+                // Vivado bitstream read back with bit2fasm: it carries
+                // LIOB18_SING_X81Y51.IOB_Y1.LVCMOS12_LVCMOS15_LVCMOS18.SLEW.FAST_SLOW
+                // and no .SLEW.SLOW anywhere.
+                // The wide family bit IS valid on plain LIOB18/LIOB33 -- it is
+                // in segbits_liob18.db.  Gating it on !is_hp_bank stripped it
+                // from every HP output pad (48 -> 28 SLEW lines) and the board
+                // went from RX-alive to completely blank.  Only the _SING tile
+                // variant lacks it, which is the single "key not found" line
+                // that started this; do NOT generalise from that one tile.
                 if (iostandard != "LVDS_25" && iostandard != "TMDS_33")
                     write_bit("LVCMOS12_LVCMOS15_LVCMOS18_LVCMOS25_LVCMOS33_LVTTL_SSTL135_SSTL15.SLEW.SLOW");
                 if (is_hp_bank) {
@@ -1196,6 +1214,7 @@ struct FasmBackend
             // HP-bank OBUF "glue" — fires once per active output site.
             if (is_hp_bank)
                 write_bit("OBUF_HP_BANK_GLUE");
+
         }
 
         if (is_input) {

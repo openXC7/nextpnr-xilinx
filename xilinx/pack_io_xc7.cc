@@ -72,10 +72,29 @@ void XC7Packer::decompose_iob(CellInfo *xil_iob, bool is_hr, const std::string &
                        xil_iob->type == ctx->id("IOBUF_INTERMDISABLE");
     bool is_se_obuf = xil_iob->type == ctx->id("OBUF") || xil_iob->type == ctx->id("OBUFT");
 
-    auto pad_site = [&](NetInfo *n) {
+    auto pad_site = [&](NetInfo *n) -> std::string {
         for (auto user : n->users)
-            if (user.cell->type == ctx->id("PAD"))
-                return ctx->getBelSite(ctx->getBelByName(ctx->id(user.cell->attrs[ctx->id("BEL")].as_string())));
+            if (user.cell->type == ctx->id("PAD")) {
+                // getBelSite() on an EMPTY BelId indexes the chipdb out of
+                // range and hands back a garbage site name, which is then
+                // concatenated into the buffer's own BEL attribute -- the
+                // failure surfaces much later as an unprintable name in the
+                // placer ("No Bel named '\325<\265/IOB33/OUTBUF'") with no way
+                // back to the pad that caused it.  Resolve first, complain here.
+                std::string belattr = user.cell->attrs[ctx->id("BEL")].as_string();
+                BelId b = ctx->getBelByName(ctx->id(belattr));
+                if (b == BelId()) {
+                    std::string sitename = belattr.substr(0, belattr.find('/'));
+                    log_error("PAD cell '%s' carries BEL attribute '%s' which does not resolve "
+                              "(site '%s' is %s in this chipdb) -- cannot derive the site for "
+                              "net '%s'\n",
+                              user.cell->name.c_str(ctx), belattr.c_str(), sitename.c_str(),
+                              ctx->site_by_name.count(sitename) ? "PRESENT, so it is the BEL within it that is unknown"
+                                                                : "ABSENT",
+                              n->name.c_str(ctx));
+                }
+                return ctx->getBelSite(b);
+            }
         NPNR_ASSERT_FALSE(("can't find PAD for net " + n->name.str(ctx)).c_str());
     };
 

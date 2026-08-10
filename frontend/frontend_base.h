@@ -556,9 +556,19 @@ template <typename FrontendType> struct GenericFrontend
         if (ctx->settings.count(ctx->id("synth")))
             return nullptr;
         IdString name_id = ctx->id(name);
-        if (ctx->cells.count(name_id))
+        if (ctx->cells.count(name_id)) {
+            // A PAD cell named after the port IS the checkpoint case the early
+            // return above anticipates: the design already carries its own IO,
+            // and the pad is how a physical netlist names the package pin (it is
+            // also what RapidWright's json2dcp reads to stitch the top-level
+            // port).  Leave it alone rather than refusing the design; only a
+            // genuine collision with ordinary logic is an error.
+            CellInfo *existing = ctx->cells.at(name_id).get();
+            if (existing->type == ctx->id("PAD") || existing->type == ctx->id("IOB_PAD"))
+                return nullptr;
             log_error("Cell '%s' of type '%s' with the same name as a top-level IO is not allowed.\n", name.c_str(),
-                      ctx->cells.at(name_id)->type.c_str(ctx));
+                      existing->type.c_str(ctx));
+        }
         CellInfo *iobuf = ctx->createCell(name_id, ctx->id("unknown_iob"));
         // Copy attributes from net to IOB
         for (auto &attr : net->attrs)

@@ -134,31 +134,58 @@ BelId Arch::getBelByName(IdString name) const
 
     setup_byname();
 
+    // Accept BOTH spellings: "SITE/BEL" and the three-part "SITE/SITETYPE/BEL"
+    // that a physical netlist uses for IO.
+    //
+    // ORDER MATTERS.  This chipdb names an IO bel WITH its site-type prefix --
+    // "IOB18/PAD", "IOB18M/DCITERMDISABLE_GND" -- so for "IOB_X1Y276/IOB18/PAD"
+    // the bel to look up is "IOB18/PAD", not "PAD".  Dropping the middle
+    // component unconditionally therefore failed to resolve every IO pad, and
+    // the empty BelId it returned was fed to getBelSite(), which indexes the
+    // chipdb out of range and hands back a GARBAGE site name -- that name was
+    // then concatenated into the buffer's own BEL attribute and only surfaced
+    // in the placer as an unprintable "No Bel named '\325<\265/IOB33/OUTBUF'".
+    // Try the full remainder first and only then the stripped form, so both
+    // spellings resolve and neither shadows the other.
     auto split = split_identifier_name(name.str(this));
-    if (site_by_name.count(split.first)) {
-        int tile, site;
-        std::tie(tile, site) = site_by_name.at(split.first);
-        auto &tile_info = chip_info->tile_types[chip_info->tile_insts[tile].type];
-        IdString belname = id(split.second);
-        for (int i = 0; i < tile_info.num_bels; i++) {
-            if (tile_info.bel_data[i].site == site && tile_info.bel_data[i].name == belname.index) {
-                ret.tile = tile;
-                ret.index = i;
-                break;
-            }
-        }
-    } else {
-        int tile = tile_by_name.at(split.first);
-        auto &tile_info = chip_info->tile_types[chip_info->tile_insts[tile].type];
-        IdString belname = id(split.second);
-        for (int i = 0; i < tile_info.num_bels; i++) {
-            if (tile_info.bel_data[i].name == belname.index) {
-                ret.tile = tile;
-                ret.index = i;
-                break;
-            }
-        }
+    std::vector<std::string> candidates{split.second};
+    {
+        size_t slash = split.second.find('/');
+        if (slash != std::string::npos)
+            candidates.push_back(split.second.substr(slash + 1));
     }
+    for (const auto &cand : candidates) {
+        IdString belname = id(cand);
+        if (site_by_name.count(split.first)) {
+            int tile, site;
+            std::tie(tile, site) = site_by_name.at(split.first);
+            auto &tile_info = chip_info->tile_types[chip_info->tile_insts[tile].type];
+            for (int i = 0; i < tile_info.num_bels; i++) {
+                if (tile_info.bel_data[i].site == site && tile_info.bel_data[i].name == belname.index) {
+                    ret.tile = tile;
+                    ret.index = i;
+                    break;
+                }
+            }
+        } else if (tile_by_name.count(split.first)) {
+            int tile = tile_by_name.at(split.first);
+            auto &tile_info = chip_info->tile_types[chip_info->tile_insts[tile].type];
+            for (int i = 0; i < tile_info.num_bels; i++) {
+                if (tile_info.bel_data[i].name == belname.index) {
+                    ret.tile = tile;
+                    ret.index = i;
+                    break;
+                }
+            }
+        }
+        if (ret != BelId())
+            break;
+    }
+    // An unknown site/tile returns an EMPTY BelId, which every caller already
+    // handles -- placer1 answers with "No Bel named 'X' ... on cell 'Y'".
+    // tile_by_name.at() instead threw std::out_of_range out of the placer,
+    // reporting neither the name nor the cell, and the name it was given was
+    // unprintable anyway.
 
     return ret;
 }
@@ -296,6 +323,27 @@ PipId Arch::getPipByName(IdString name) const
                 ret.tile = tile;
                 ret.index = i;
                 break;
+            }
+        }
+    } else if (s.find("->") != std::string::npos) {
+        // "SRCWIRE->DSTWIRE", which is the form getPipName() PRINTS for a
+        // fabric pip.  Without this branch the printer and the parser are not
+        // inverses: getPipName writes wire NAMES joined by "->", while the code
+        // below expects "TILE/<src_index>.<dst_index>" with numeric indices, so
+        // nextpnr could not read back routing it had written itself.  That made
+        // the ROUTING net attribute (common/nextpnr.cc, bindPip on load) unusable
+        // for xc7 -- it asserted in split_identifier_name_dot on the first pip.
+        // applyFixedRoutes already resolves this same spelling by name; do the
+        // same here so a routed JSON round-trips.
+        size_t arrow = s.find("->");
+        WireId src = getWireByName(id(s.substr(0, arrow)));
+        WireId dst = getWireByName(id(s.substr(arrow + 2)));
+        if (src != WireId() && dst != WireId()) {
+            for (auto pip : getPipsDownhill(src)) {
+                if (getPipDstWire(pip) == dst) {
+                    ret = pip;
+                    break;
+                }
             }
         }
     } else {
@@ -846,6 +894,45 @@ bool Arch::getBudgetOverride(const NetInfo *net_info, const PortRef &sink, delay
 bool Arch::place()
 {
     std::string placer = str_or_default(settings, id("placer"), defaultPlacer);
+
+    // PLACEMENT IS OPT-IN ON THIS ARCH.  Designs here arrive fully placed --
+    // place_lef stamps a BEL on every cell and hands over --fixed-routes -- so
+    // an unplaced cell is a DEFECT in whatever produced the netlist, not work
+    // for a placer to absorb.  Silently placing the remainder is how a run
+    // spent 51 minutes inside HeAP on ~23 cells nobody knew were unstamped.
+    //
+    // So unless --placer was given explicitly, refuse to place and NAME the
+    // cells.  Pass "--placer sa" to opt in when placement really is wanted.
+    if (!bool_or_default(settings, id("placer_explicit"), false)) {
+        std::vector<CellInfo *> unplaced;
+        for (auto &cell : cells) {
+            CellInfo *ci = cell.second.get();
+            // Pseudo constant drivers are bound by the constant router, never
+            // by a placer, so they are legitimately without a bel here.
+            if (ci->type == id_PSEUDO_GND || ci->type == id_PSEUDO_VCC)
+                continue;
+            // A cell CONSTRAINED to another is positioned by its parent, not by
+            // a placer: the dist-RAM expansion of a stamped RAM256X1S is four
+            // RAMS64E plus an F7/F7/F8 tree, all constr_abs_z children of a
+            // base that inherited the macro's BEL.  Demanding a BEL attribute
+            // on each of them would reject a design that is in fact fully
+            // determined.
+            if (ci->constr_parent != nullptr)
+                continue;
+            if (ci->bel == BelId() && !ci->attrs.count(id("BEL")))
+                unplaced.push_back(ci);
+        }
+        if (!unplaced.empty()) {
+            log_info("Unplaced cells (showing up to 20 of %d):\n", int(unplaced.size()));
+            for (size_t i = 0; i < std::min<size_t>(20, unplaced.size()); i++)
+                log_info("    %s (%s)\n", unplaced[i]->name.c_str(this), unplaced[i]->type.c_str(this));
+            log_error("%d cell(s) have no BEL and no placement was requested.  This flow expects a "
+                      "FULLY PLACED design (place_lef stamps every cell); an unplaced cell means the "
+                      "netlist and the placement disagree.  Re-run with '--placer sa' if placing them "
+                      "here is genuinely what you want.\n",
+                      int(unplaced.size()));
+        }
+    }
 
     if (placer == "heap") {
         PlacerHeapCfg cfg(getCtx());
@@ -2309,7 +2396,13 @@ bool Arch::route()
     // dedicated-resource search and the GT refclk arc falls to (and fails
     // in) router2.  Safe now that fixed-routes carries DATA nets only
     // (SIGNAL-typed); the macro clock trees are (re)built by routeClock.
-    routeClock();
+    // Skip routeClock when the imported routing IS the routing: it builds a
+    // clock tree that competes with the one being imported, and the two
+    // disagree on which BUFG input to select.
+    if (getenv("NEXTPNR_ROUTE_FIXED_ONLY") == nullptr)
+        routeClock();
+    else
+        log_info("    route-fixed-only: skipping routeClock (import supplies the clock nets)\n");
     {
         std::string fixed = str_or_default(settings, id("fixed-routes"), "");
         if (!fixed.empty())
@@ -2329,7 +2422,19 @@ bool Arch::route()
     // FASM is complete.
     if (getenv("NEXTPNR_ROUTE_FIXED_ONLY") != nullptr) {
         findSourceSinkLocations();
-        routeVcc();
+        // routeVcc() is SKIPPED here, not worked around.  A complete imported
+        // route already carries the constant nets; running our own pass over
+        // them puts two selections on one mux (fasm2frames dies with "wanted to
+        // clear bit ... but was set by", naming a BUFG input), and the previous
+        // fix -- filtering those nets out of the import -- threw away 542 real
+        // clock features to dodge the clash.  Skipping the pass keeps the
+        // import whole, which is the point of a replay.
+        // NEXTPNR_FIXED_ROUTE_VCC=1 restores it for an import that genuinely
+        // omits the constant nets.
+        if (getenv("NEXTPNR_FIXED_ROUTE_VCC") != nullptr)
+            routeVcc();
+        else
+            log_info("    route-fixed-only: skipping routeVcc (import supplies the constant nets)\n");
         fixupRouting();
         getCtx()->settings[getCtx()->id("route")] = 1;
         archInfoToAttributes();
@@ -2345,6 +2450,11 @@ bool Arch::route()
         archInfoToAttributes();
         return true;
     }
+    // Dedicated pad connections (GT serial pins, refclk) have no pips in the
+    // chipdb, so the router cannot reach them.  Declare them pre-routed BEFORE
+    // it runs -- doing it in fixupRouting() is too late, the arcs have already
+    // been attempted and skipped.
+    bindDedicatedPads();
     findSourceSinkLocations();
 
     bool result;
@@ -2731,17 +2841,24 @@ bool Arch::xc7_cell_timing_lookup(int tt_id, int inst_id, IdString variant, IdSt
     return true;
 }
 
-#ifdef WITH_HEAP
-const std::string Arch::defaultPlacer = "heap";
-#else
+// HeAP IS RETIRED ON THIS ARCH.  Everything here arrives PLACED -- place_lef
+// stamps a BEL on every cell and hands nextpnr --fixed-routes -- so there is
+// nothing for an analytic placer to solve, and measured it does not merely add
+// no value: it spent 51 MINUTES on the ~23 unstamped cells of the ethmin core
+// before being killed, because the constrained majority gives its solver
+// nothing to spread against.
+//
+// It used to be the DEFAULT, so any invocation that forgot "--placer sa" got it
+// silently -- which is exactly how that 51-minute run happened
+// (build_hardmacro_ethmin.sh passes no --placer).  Defaulting to sa makes the
+// flow's real placer the one you get when you say nothing.
+//
+// The implementation is still compiled and still selectable on the other
+// arches; only this arch's default and menu change.  To put it back, add "heap"
+// to availablePlacers below.
 const std::string Arch::defaultPlacer = "sa";
-#endif
 
-const std::vector<std::string> Arch::availablePlacers = {"sa",
-#ifdef WITH_HEAP
-                                                         "heap"
-#endif
-};
+const std::vector<std::string> Arch::availablePlacers = {"sa"};
 
 const std::string Arch::defaultRouter = "router2";
 const std::vector<std::string> Arch::availableRouters = {"router1", "router2"};
