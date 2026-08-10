@@ -2149,6 +2149,15 @@ bool Arch::route()
     // exited 255; as a post-router fill it only consumes leftover resources.
     routeVcc();
     fixupRouting();
+    // router1 runs its own final timing analysis; the router2 flow
+    // historically ended without one, so the last "Max frequency" lines the
+    // user saw were the placer's pre-route ESTIMATES (printed mid-flow by
+    // placer1's refinement pass) presented as the result.  Analyse the
+    // actually-routed design: real net delays, per-clock Fmax, and the
+    // critical path breakdown.
+    if (router == "router2")
+        timing_analysis(getCtx(), true /* slack_histogram */, true /* print_fmax */, true /* print_path */,
+                        false /* warn_on_failure */);
     getCtx()->settings[getCtx()->id("route")] = 1;
     archInfoToAttributes();
     return result;
