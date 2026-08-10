@@ -1,0 +1,134 @@
+# Regression gate: build a representative demo-project subset against
+# THIS PR's nextpnr-xilinx code + prjxray-db, and compare the produced
+# bitstreams against the goldens committed in demo-projects.
+#
+# Why it exists: the demo-projects CI builds against the toolchain-nix
+# pin, so a nextpnr-xilinx PR never exercises the demos.  This workflow
+# closes that gap for the PR itself:
+#
+#   1. builds nextpnr-xilinx from the PR (ARCH=xilinx)
+#   2. builds the chipdb for just the parts the demo subset needs,
+#      from the PR's own prjxray-db submodule
+#   3. runs the demos with the PR binary + db
+#   4. compares the blinkies against the committed golden bitstreams
+#
+# The full demo matrix stays on the nightly heavy run / the merge
+# pin-bump path; this is the fast per-PR smoke.
+#
+# Known-failing projects (BRAM/LUTFF legaliser spiral on artix7,
+# missing xc7z035 tilegrid) are intentionally not part of the subset.
+
+name: demos
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: demos-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  TOOLCHAIN_NIX_REPO: openXC7/toolchain-nix
+  DEMO_PROJECTS_REPO: openXC7/demo-projects
+
+jobs:
+  demos:
+    name: ${{ matrix.part }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - family: spartan7
+            upper: SPARTAN7
+            part: xc7s50csga324-1
+            projects: ddr3-test-arty-s7 litex-ddr-arty-s7
+          - family: artix7
+            upper: ARTIX7
+            part: xc7a35tcsg324-1
+            projects: blinky-digilent-arty
+          - family: kintex7
+            upper: KINTEX7
+            part: xc7k325tffg676-1
+            projects: blinky-qmtech litex-ddr-qmtech-kintex7
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: nextpnr-xilinx
+
+      - name: Checkout db + metadata submodules
+        run: |
+          git -C nextpnr-xilinx submodule update --init --depth 1 \
+            xilinx/external/prjxray-db xilinx/external/nextpnr-xilinx-meta
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ env.DEMO_PROJECTS_REPO }}
+          path: demo-projects
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ env.TOOLCHAIN_NIX_REPO }}
+          path: toolchain-nix
+
+      - uses: DeterminateSystems/nix-installer-action@da36cb69b1c3247ad7a1f931ebfd954a1105ef14 # v14
+      # v6: native GitHub Actions cache, no FlakeHub token required.
+      - uses: DeterminateSystems/magic-nix-cache-action@87e8236f46702ab0ce5a058b605a173ec88d618e # v6
+
+      - name: Build nextpnr-xilinx from this PR
+        run: |
+          nix develop ./toolchain-nix --command bash -euxo pipefail -c '
+            cmake -S nextpnr-xilinx -B build-pr \
+              -DARCH=xilinx -DBUILD_GUI=OFF -DBUILD_PYTHON=OFF \
+              -DUSE_OPENMP=ON -DCMAKE_BUILD_TYPE=Release \
+              -DCURRENT_GIT_VERSION=0.9.2
+            cmake --build build-pr --parallel 4
+          '
+
+      - name: Build chipdb (${{ matrix.part }})
+        run: |
+          nix develop ./toolchain-nix --command bash -euxo pipefail -c '
+            mkdir -p chipdb
+            python3 nextpnr-xilinx/xilinx/python/bbaexport.py \
+              --device ${{ matrix.part }} \
+              --xray nextpnr-xilinx/xilinx/external/prjxray-db/${{ matrix.family }} \
+              --bba ${{ matrix.part }}.bba
+            build-pr/bbasm -l ${{ matrix.part }}.bba chipdb/${{ matrix.part }}.bin
+            rm -f ${{ matrix.part }}.bba
+          '
+
+      - name: Build demos and compare goldens
+        env:
+          UPPER: ${{ matrix.upper }}
+          PROJECTS: ${{ matrix.projects }}
+        run: |
+          export ${UPPER}_CHIPDB="$GITHUB_WORKSPACE/chipdb"
+          # the PR's db, not the devshell's pinned one
+          export PRJXRAY_DB_DIR="$GITHUB_WORKSPACE/nextpnr-xilinx/xilinx/external/prjxray-db"
+          export PATH="$GITHUB_WORKSPACE/build-pr:$PATH"
+          nix develop ./toolchain-nix --command bash -euxo pipefail <<'EOF'
+            normhash() { python3 demo-projects/.github/scripts/normbit.py "$1"; }
+            for p in $PROJECTS; do
+              if ls "demo-projects/$p"/*.bit >/dev/null 2>&1; then
+                cp "demo-projects/$p"/*.bit /tmp/golden-$p
+              fi
+              echo "=== building $p ==="
+              make -C "demo-projects/$p"
+              if [ -f /tmp/golden-$p ]; then
+                new=$(normhash "demo-projects/$p"/*.bit)
+                old=$(normhash /tmp/golden-$p)
+                if [ "$new" != "$old" ]; then
+                  echo "::error::$p: bitstream differs from committed golden (normalized sha256 $old vs $new)"
+                  exit 1
+                fi
+                echo "golden ok: $p ($new)"
+              else
+                echo "no golden for $p, build-only"
+              fi
+            done
+          EOF
