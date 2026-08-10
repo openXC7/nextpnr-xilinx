@@ -1543,11 +1543,38 @@ struct FasmBackend
             else
                 write_bit("IDELMUXE3.P1");
 
-            // clock edge
+            // Clock edge.  DDR_CLK_EDGE is a three-valued parameter encoded in two bits
+            // (26_99 / 27_98 for LIOI3.ILOGIC_Y0), and the third value is the state where
+            // BOTH bits are clear:
+            //
+            //     OPPOSITE_EDGE         !26_99   27_98
+            //     SAME_EDGE              26_99  !27_98
+            //     SAME_EDGE_PIPELINED   !26_99  !27_98
+            //
+            // So SAME_EDGE_PIPELINED is expressed by writing NEITHER of the other two --
+            // there is no third feature to write, and adding one (e.g. IFF.PIPELINED) only
+            // produces a FasmLookupError, because no such key exists in any database.
+            //
+            // Our copy of prjxray-db has only the first two rows. That is not because the
+            // silicon lacks the mode but because of an omission in the fuzzer: prjxray
+            // sweeps all three values (fuzzers/035-iob-ilogic/top.py:285,
+            // fuzzers/035b-iob-iserdes/generate.py:217 emits the
+            // IFF.DDR_CLK_EDGE.SAME_EDGE_PIPELINED tag), yet
+            // fuzzers/035-iob-ilogic/tag_groups.txt lists only OPPOSITE_EDGE and
+            // SAME_EDGE in the group.  An all-bits-clear member of a group that is
+            // declared with one value missing cannot be resolved, so the row never lands
+            // in segbits.  The third row is present in the freshmakerzhao/prjxray-db fork
+            // (branch dev, artix7/segbits_lioi3.db) and agrees with the table above.
+            //
+            // Emitting nothing is safe against our own database too: no other feature on
+            // the IDDR path touches 26_99, and the ISERDES modes that set 27_98 do not
+            // apply to a plain IDDR.
             std::string edge = str_or_default(ci->params, ctx->id("DDR_CLK_EDGE"), "OPPOSITE_EDGE");
-            if (edge == "SAME_EDGE")          write_bit("IFF.DDR_CLK_EDGE.SAME_EDGE");
-            else if (edge == "OPPOSITE_EDGE") write_bit("IFF.DDR_CLK_EDGE.OPPOSITE_EDGE");
-            else log_error("unsupported clock edge parameter for cell '%s' at %s: %s. Supported are: SAME_EDGE and OPPOSITE_EDGE",
+            if (edge == "SAME_EDGE")               write_bit("IFF.DDR_CLK_EDGE.SAME_EDGE");
+            else if (edge == "OPPOSITE_EDGE")      write_bit("IFF.DDR_CLK_EDGE.OPPOSITE_EDGE");
+            else if (edge == "SAME_EDGE_PIPELINED") { /* both bits clear: write nothing */ }
+            else log_error("unsupported clock edge parameter for cell '%s' at %s: %s. Supported are: "
+                           "SAME_EDGE, OPPOSITE_EDGE and SAME_EDGE_PIPELINED",
                             ci->name.c_str(ctx), site.c_str(), edge.c_str());
 
             std::string srtype = str_or_default(ci->params, ctx->id("SRTYPE"), "SYNC");
