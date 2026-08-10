@@ -116,6 +116,17 @@ jobs:
           export PRJXRAY_DB_DIR="$GITHUB_WORKSPACE/nextpnr-xilinx/xilinx/external/prjxray-db"
           export PATH="$GITHUB_WORKSPACE/build-pr:$PATH"
           nix develop ./toolchain-nix --command bash -euxo pipefail <<'EOF'
+            # nix develop prepends the devshell's own store paths, so the
+            # toolchain's pinned nextpnr-xilinx shadows the one we just built
+            # from this PR -- the export above is undone the moment we enter
+            # the shell.  Re-prepend it here, inside, and prove which binary
+            # is actually being used.
+            export PATH="$GITHUB_WORKSPACE/build-pr:$PATH"
+            command -v nextpnr-xilinx
+            case "$(command -v nextpnr-xilinx)" in
+              "$GITHUB_WORKSPACE/build-pr/"*) ;;
+              *) echo "::error::demos gate is not using this PR's nextpnr-xilinx"; exit 1 ;;
+            esac
             normhash() { python3 demo-projects/.github/scripts/normbit.py "$1"; }
             for p in $PROJECTS; do
               if ls "demo-projects/$p"/*.bit >/dev/null 2>&1; then
