@@ -256,9 +256,48 @@ void XC7Packer::pack_gbs()
         // aborts with "Unable to find legal placement for cell". Bind it to any
         // free buffer BEL of its type; its fabric input reaches the buffer through
         // the BUFGCTRL input mux, exactly as Vivado routes it.
+        //
+        // PLL/MMCM-driven BUFGs get an extra rule on top of that fallback: the
+        // chipdb's SOLVED dedicated PLL->BUFG exits are the BOTTOM-region ones
+        // (HCLK_CMT MUX_CLK_PLL* -> CK_IN pips in the lower HCLK_CMT tile).  The
+        // top-region numbered muxes (MUX_CLK_<m> -> CK_IN) have no prjxray
+        // segbits except three GT-validated combos (see setup_pip_blacklist in
+        // arch.cc), so a TOP-region BUFG can only ever receive 3 PLL clocks and
+        // the 4th+ starves -- litex-ddr-arty-s7: "Failed to route arc 0 of net
+        // 'main_crg_clkout4'" (PLLE2_ADV_X1Y0/CLKOUT4 -> BUFGCTRL_X0Y19/I0).
+        // preplace_unique() walks getBels() in chipdb order and lands these on
+        // TOP-region sites first, so pin PLL/MMCM-driven buffers to the lowest
+        // free BOTTOM-region site (CLK_BUFG_BOT_R), whose dedicated exits are
+        // fully solved (matches the working golden path via CLK_HROW_BOT_R +
+        // CK_BUFG_CASCO into the bottom BUFG tile).
         if ((ci->type == id_BUFGCTRL || ci->type == id_BUFG_BUFG || ci->type == id_BUFHCE_BUFHCE) &&
-            !ci->attrs.count(ctx->id("BEL")))
-            preplace_unique(ci);
+            !ci->attrs.count(ctx->id("BEL"))) {
+            bool pll_driven = false;
+            if (ci->type == id_BUFGCTRL) {
+                NetInfo *n = get_net_or_empty(ci, id_I0);
+                if (n != nullptr && n->driver.cell != nullptr) {
+                    IdString dt = n->driver.cell->type;
+                    pll_driven = dt == id_PLLE2_ADV_PLLE2_ADV || dt == id_MMCME2_ADV_MMCME2_ADV;
+                }
+            }
+            if (pll_driven) {
+                for (auto bel : ctx->getBels()) {
+                    if (ctx->getBelType(bel) != id_BUFGCTRL || used_bels.count(bel))
+                        continue;
+                    if (ctx->getBelTileType(bel) != ctx->id("CLK_BUFG_BOT_R"))
+                        continue;
+                    if (!ctx->checkBelAvail(bel))
+                        continue;
+                    used_bels.insert(bel);
+                    ci->attrs[ctx->id("BEL")] = std::string(ctx->nameOfBel(bel));
+                    log_info("    Constrained BUFGCTRL '%s' to bel '%s' (PLL-driven, bottom region)\n", ctx->nameOf(ci),
+                             ctx->nameOfBel(bel));
+                    break;
+                }
+            }
+            if (!ci->attrs.count(ctx->id("BEL")))
+                preplace_unique(ci);
+        }
     }
 
     // pack_gbs() runs in the XC7 pack() sequence AFTER the final pack_constants, so
