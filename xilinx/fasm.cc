@@ -1683,6 +1683,14 @@ struct FasmBackend
 #endif
             write_bit("SRTYPE.SYNC");
             write_bit("TSRTYPE.SYNC");
+            // TRISTATE_WIDTH is a two-valued parameter whose W1 state is encoded as the
+            // absence of bits, so only W4 appears in segbits (32_90 on OLOGIC_Y0).  The
+            // fuzzer sweeps both (036-iob-ologic/generate.py:106-110) and 036-iob-ologic/
+            // top.py:71-79 picks 4 exactly when DATA_WIDTH==4 with both rates DDR.  Never
+            // writing it left every OSERDESE2 programmed as TRISTATE_WIDTH=1, silently
+            // overriding the cell's own parameter -- which defaults to 4 in the library.
+            if (int_or_default(ci->params, ctx->id("TRISTATE_WIDTH"), 4) == 4)
+                write_bit("TRISTATE_WIDTH.W4");
             if (is_slave) write_bit("SERDES_MODE.SLAVE");
 
             pop();
@@ -1699,7 +1707,17 @@ struct FasmBackend
                           !bool_or_default(ci->params, ctx->id("SRVAL_Q" + std::to_string(i)), false));
             }
             write_bit("IFF.ZINV_C", !bool_or_default(ci->params, ctx->id("IS_CLK_INVERTED"), false));
-            write_bit("IFF.ZINV_OCLK", !bool_or_default(ci->params, ctx->id("IS_OCLK_INVERTED"), false));
+            // INV_OCLK (28_124) and ZINV_OCLK (28_64) are two DISTINCT physical bits, not
+            // one bit and its complement -- they are absent from
+            // fuzzers/035-iob-ilogic/tag_groups.txt, so dbfixup never collapsed them.
+            // The fuzzer sets them as exact complements (035-iob-ilogic/generate.py:180-184:
+            // INV_OCLK = IS_OCLK_INVERTED, ZINV_OCLK = !IS_OCLK_INVERTED), so exactly one
+            // of the two must always be set.  Writing only the Z half meant that
+            // IS_OCLK_INVERTED=TRUE emitted NEITHER bit, leaving the OCLK inverter in an
+            // unprogrammed state that corresponds to no value of the parameter.
+            bool oclk_inv = bool_or_default(ci->params, ctx->id("IS_OCLK_INVERTED"), false);
+            write_bit("IFF.INV_OCLK", oclk_inv);
+            write_bit("IFF.ZINV_OCLK", !oclk_inv);
 
             std::string iobdelay = str_or_default(ci->params, ctx->id("IOBDELAY"), "NONE");
             write_bit("IFFDELMUXE3.P0", (iobdelay == "IFD"));
