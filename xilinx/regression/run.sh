@@ -13,7 +13,9 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 : "${CHIPDB:?set CHIPDB to a generated chipdb .bin (e.g. xc7a200t.bin)}"
 
-cases=("$@"); [ ${#cases[@]} -eq 0 ] && cases=(clock-srcc-bufg bram-sdp-unused-port)
+cases=("$@"); [ ${#cases[@]} -eq 0 ] && cases=(clock-srcc-bufg bram-sdp-unused-port \
+                                              bufg-fabric-driven config-primitive-startupe2 \
+                                              iddr-four-iff-flops)
 fail=0
 for c in "${cases[@]}"; do
   d="$HERE/$c"
@@ -28,6 +30,16 @@ for c in "${cases[@]}"; do
     printf '  %-26s FAIL (place/route/fasm) - %s\n' "$c" "$d/nextpnr.log"; fail=1; continue; fi
   # An existing but empty target is how a failed stage reports success. Check content.
   [ -s "$d/top.fasm" ] || { printf '  %-26s FAIL (empty .fasm)\n' "$c"; fail=1; continue; }
+  # Some fixes changed which bits are emitted, not whether the flow completes. Those
+  # cases carry an expect.txt of regexes that must all appear in the FASM.
+  if [ -f "$d/expect.txt" ]; then
+    miss=0
+    while read -r pat; do
+      [ -z "$pat" ] && continue
+      grep -qE -- "$pat" "$d/top.fasm" || { printf '  %-26s FAIL (fasm missing: %s)\n' "$c" "$pat"; miss=1; }
+    done < "$d/expect.txt"
+    [ "$miss" -eq 0 ] || { fail=1; continue; }
+  fi
   printf '  %-26s ok  (%s)\n' "$c" "$(du -h "$d/top.fasm" | cut -f1)"
 done
 exit $fail
