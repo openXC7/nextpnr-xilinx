@@ -20,6 +20,7 @@
 
 #include "timing.h"
 #include <algorithm>
+#include <cstdio>
 #include <boost/range/adaptor/reversed.hpp>
 #include <deque>
 #include <map>
@@ -83,6 +84,7 @@ struct CriticalPath
     PortRefVector ports;
     delay_t path_delay;
     delay_t path_period;
+    int mcp = 1; // set_multicycle_path setup factor on the capture register (1 = single-cycle)
 };
 
 typedef std::unordered_map<ClockPair, CriticalPath> CriticalPathMap;
@@ -176,6 +178,15 @@ struct Timing
                     // Otherwise, for all driven input ports on this cell, if a timing arc exists between the input and
                     // the current output port, increment fanin counter
                     for (auto i : input_ports) {
+                        // A cell input pin can end up bound to the cell's own
+                        // output net (e.g. the xc7 post-route LUT pin fixup
+                        // when the router feeds the output back through an
+                        // unused input pin of the same site). Such an arc can
+                        // never be a real timing path, but counting it here
+                        // deadlocks the topological sort below as a false
+                        // combinational loop.
+                        if (cell.second->ports.at(i).net == o->net)
+                            continue;
                         DelayInfo comb_delay;
                         bool is_path = ctx->getCellDelay(cell.second.get(), i, o->name, comb_delay);
                         if (is_path)
@@ -223,6 +234,11 @@ struct Timing
                     if (portClass == TMG_REGISTER_OUTPUT || portClass == TMG_STARTPOINT || portClass == TMG_IGNORE ||
                         portClass == TMG_GEN_CLOCK)
                         continue;
+                    // Skip the same self-net arcs that were skipped when
+                    // counting fanin above (input bound to the same net as
+                    // the output), keeping both sides symmetrical.
+                    if (port.second.net == net)
+                        continue;
                     DelayInfo comb_delay;
                     bool is_path = ctx->getCellDelay(usr.cell, usr.port, port.first, comb_delay);
                     if (!is_path)
@@ -243,8 +259,15 @@ struct Timing
             }
         }
 
-        // Sanity check to ensure that all ports where fanins were recorded were indeed visited
-        if (!port_fanin.empty() && !bool_or_default(ctx->settings, ctx->id("timing/ignoreLoops"), false)) {
+        // Sanity check to ensure that all ports where fanins were recorded were indeed visited.
+        // Combinational loops are IGNORED BY DEFAULT: they typically come from abc9's
+        // mapped-network reintegration (yosys $auto$abc9_ops cells), do not change the
+        // bitstream, and are present in several open-flow designs that otherwise place
+        // and route cleanly.  The strict failure stays available via the
+        // timing/ignoreLoops=false setting.  If the loops are unintended (a genuine
+        // feedback path), re-synthesize without -abc9.
+        bool ignore_loops = bool_or_default(ctx->settings, ctx->id("timing/ignoreLoops"), true);
+        if (!port_fanin.empty() && !ignore_loops) {
             for (auto fanin : port_fanin) {
                 NetInfo *net = fanin.first->net;
                 if (net != nullptr) {
@@ -265,6 +288,12 @@ struct Timing
             else
                 log_error("timing analysis failed due to presence of combinatorial loops, incomplete specification of "
                           "timing ports, etc.\n");
+        } else if (!port_fanin.empty()) {
+            log_warning("timing analysis: %d combinational loop(s) present in the netlist (commonly from abc9 "
+                        "mapped-network reintegration).  They are ignored by default: loops do not change the "
+                        "bitstream, but a genuine feedback path is a design error.  If unintended, re-synthesize "
+                        "without -abc9; set timing/ignoreLoops=false to make the timing analysis fail instead.\n",
+                        int(port_fanin.size()));
         }
 
         // Go forwards topographically to find the maximum arrival time and max path length for each net
@@ -358,6 +387,15 @@ struct Timing
                                     }
                                 }
                             }
+                            // set_multicycle_path: relax setup by the multicycle factor on the capture reg
+                            int this_mcp = 1;
+                            if (usr.cell && usr.cell->attrs.count(ctx->id("NEXTPNR_MCP_SETUP"))) {
+                                this_mcp = std::atoi(usr.cell->attrs.at(ctx->id("NEXTPNR_MCP_SETUP")).as_string().c_str());
+                                if (this_mcp > 1)
+                                    period *= this_mcp;
+                                else
+                                    this_mcp = 1;
+                            }
                             auto path_budget = period - endpoint_arrival;
 
                             if (update) {
@@ -383,6 +421,7 @@ struct Timing
                                     crit_nets[clockPair] = std::make_pair(endpoint_arrival, net);
                                     (*crit_path)[clockPair].path_delay = endpoint_arrival;
                                     (*crit_path)[clockPair].path_period = period;
+                                    (*crit_path)[clockPair].mcp = this_mcp;
                                     (*crit_path)[clockPair].ports.clear();
                                     (*crit_path)[clockPair].ports.push_back(&usr);
                                 }
@@ -524,6 +563,12 @@ struct Timing
                                             period = ctx->nets.at(clksig)->clkconstr->high.minDelay();
                                         }
                                     }
+                                }
+                                // set_multicycle_path: relax setup by the multicycle factor on the capture reg
+                                if (usr.cell && usr.cell->attrs.count(ctx->id("NEXTPNR_MCP_SETUP"))) {
+                                    int mcp = std::atoi(usr.cell->attrs.at(ctx->id("NEXTPNR_MCP_SETUP")).as_string().c_str());
+                                    if (mcp > 1)
+                                        period *= mcp;
                                 }
                                 nd.min_required.at(i) = std::min(period - setup, nd.min_required.at(i));
                             };
@@ -717,6 +762,113 @@ void assign_budget(Context *ctx, bool quiet)
         log_info("Checksum: 0x%08x\n", ctx->checksum());
 }
 
+namespace {
+// Per-clock achieved fmax + constraint, keyed by the raw clock net name.
+// Empty on a failed timing walk (combinatorial loops, incomplete timing
+// ports, ...): a failed report must not kill an already successfully
+// routed flow.
+std::map<std::string, std::pair<double, double>> compute_clock_fmax(Context *ctx)
+{
+    std::map<std::string, std::pair<double, double>> out;
+    std::map<IdString, double> clock_fmax;
+    try {
+        CriticalPathMap crit_paths;
+        Timing timing(ctx, true /* net_delays */, false /* update */, &crit_paths, nullptr);
+        timing.walk_paths();
+
+        for (auto &path : crit_paths) {
+            const ClockEvent &a = path.first.start;
+            const ClockEvent &b = path.first.end;
+            if (a.clock != b.clock || a.clock == ctx->id("$async$"))
+                continue;
+            double Fmax;
+            if (a.edge == b.edge)
+                Fmax = 1000 / ctx->getDelayNS(path.second.path_delay);
+            else
+                Fmax = 500 / ctx->getDelayNS(path.second.path_delay);
+            if (!clock_fmax.count(a.clock) || Fmax < clock_fmax.at(a.clock))
+                clock_fmax[a.clock] = Fmax;
+        }
+    } catch (log_execution_error_exception &) {
+        return out;
+    }
+
+    for (auto &clock : clock_fmax) {
+        float target = ctx->setting<float>("target_freq") / 1e6;
+        auto ni = ctx->nets.find(clock.first);
+        if (ni != ctx->nets.end() && ni->second->clkconstr)
+            target = 1000 / ctx->getDelayNS(ni->second->clkconstr->period.minDelay());
+        out[clock.first.str(ctx)] = {clock.second, target};
+    }
+    return out;
+}
+
+std::string json_escape(const std::string &s)
+{
+    std::string r;
+    for (char c : s) {
+        if (c == '"' || c == '\\')
+            r += '\\';
+        r += c;
+    }
+    return r;
+}
+} // namespace
+
+std::string Context::reportClockFmaxJson()
+{
+    std::string json = "{";
+    bool first = true;
+    for (auto &clock : compute_clock_fmax(this)) {
+        char buf[80];
+        snprintf(buf, sizeof(buf), "\": {\"achieved\": %.2f, \"constraint\": %.2f}", clock.second.first,
+                 clock.second.second);
+        json += (first ? "\"" : ", \"") + json_escape(clock.first) + buf;
+        first = false;
+    }
+    json += "}";
+    return json;
+}
+
+std::string Context::reportJson()
+{
+    // The document mirrors mainline nextpnr's --report schema
+    // (critical_paths / fmax / utilization), with the clock-name aliasing
+    // apio's report formatter expects: '$iopadmap$<port>' (the net yosys
+    // inserts for a clock input port) shows the port name itself, other
+    // yosys internals show as "(internal) <last-segment>".
+    std::string json = "{\n    \"critical_paths\": [],\n    \"fmax\": {";
+    bool first = true;
+    for (auto &clock : compute_clock_fmax(this)) {
+        std::string name = clock.first;
+        if (name.rfind("$iopadmap$", 0) == 0)
+            name = name.substr(10);
+        else if (!name.empty() && name[0] == '$')
+            name = "(internal) " + name.substr(name.find_last_of('$') + 1);
+        char buf[80];
+        snprintf(buf, sizeof(buf), "\": {\"achieved\": %.2f, \"constraint\": %.2f}", clock.second.first,
+                 clock.second.second);
+        json += (first ? "\"" : ", \"") + json_escape(name) + buf;
+        first = false;
+    }
+    json += "},\n    \"utilization\": {";
+    std::map<std::string, int> avail, used;
+    for (auto bel : getBels())
+        avail[getBelType(bel).str(this)]++;
+    for (auto &cell : cells)
+        used[cell.second->type.str(this)]++;
+    first = true;
+    for (auto &kv : avail) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "\": {\"available\": %d, \"used\": %d}", kv.second,
+                 used.count(kv.first) ? used.at(kv.first) : 0);
+        json += (first ? "\"" : ", \"") + json_escape(kv.first) + buf;
+        first = false;
+    }
+    json += "}\n}\n";
+    return json;
+}
+
 void timing_analysis(Context *ctx, bool print_histogram, bool print_fmax, bool print_path, bool warn_on_failure)
 {
     auto format_event = [ctx](const ClockEvent &e, int field_width = 0) {
@@ -754,10 +906,13 @@ void timing_analysis(Context *ctx, bool print_histogram, bool print_fmax, bool p
                 continue;
             double Fmax;
             empty_clocks.erase(a.clock);
+            // A set_multicycle_path -setup N endpoint may take N clock cycles, so its
+            // constraining frequency is N/delay (it drops out as the bottleneck).
+            double mcp = path.second.mcp > 1 ? double(path.second.mcp) : 1.0;
             if (a.edge == b.edge)
-                Fmax = 1000 / ctx->getDelayNS(path.second.path_delay);
+                Fmax = mcp * 1000 / ctx->getDelayNS(path.second.path_delay);
             else
-                Fmax = 500 / ctx->getDelayNS(path.second.path_delay);
+                Fmax = mcp * 500 / ctx->getDelayNS(path.second.path_delay);
             if (!clock_fmax.count(a.clock) || Fmax < clock_fmax.at(a.clock)) {
                 clock_reports[a.clock] = path;
                 clock_fmax[a.clock] = Fmax;

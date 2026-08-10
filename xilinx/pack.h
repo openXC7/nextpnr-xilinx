@@ -117,6 +117,8 @@ struct XilinxPacker
 
     // LUTs & FFs
     void pack_inverters();
+    std::vector<std::pair<IdString, IdString>> split_lut6_2();
+    void constrain_lut6_2_pairs(const std::vector<std::pair<IdString, IdString>> &pairs);
     void pack_luts();
     void pack_ffs();
     void pack_lutffs();
@@ -131,6 +133,7 @@ struct XilinxPacker
                           const std::vector<NetInfo *> &select, NetInfo *out, int zoffset);
 
     void pack_srls();
+    void constrain_srl_cascades();
 
     void split_carry4s();
 
@@ -146,6 +149,7 @@ struct XilinxPacker
     std::unordered_map<IdString, std::unordered_map<IdString, bool>> tied_pins;
     std::unordered_map<IdString, std::unordered_set<IdString>> invertible_pins;
     void pack_constants();
+    void disconnect_constant_port(CellInfo *ci,IdString port);
 
     // IO
     std::unordered_map<IdString, std::unordered_set<IdString>> toplevel_ports;
@@ -209,6 +213,9 @@ struct XC7Packer : public XilinxPacker
     // Carries
     bool has_illegal_fanout(NetInfo *carry);
     void pack_carries();
+    void pack_carries_atomic();   // Vivado-compatible direct CARRY4 packer
+    // Carry-O fabric-fanout relocation (ALU chains: O and CO both tapped)
+    void relocate_carry_o_fabric();
 
     // IO
     CellInfo *insert_ibuf(IdString name, IdString type, NetInfo *i, NetInfo *o);
@@ -251,9 +258,9 @@ struct XC7Packer : public XilinxPacker
     void pack_dsps();
 
     // High speed transceivers
-    std::string get_gtp_site(const std::string &io_bel);
-    void constrain_gtp(CellInfo *pad_cell, CellInfo *gtp_cell);
-    void constrain_ibufds_gtp_site(CellInfo *buf_cell, const std::string &io_bel);
+    std::string get_gt_site(const std::string &io_bel);
+    void constrain_gt(CellInfo *pad_cell, CellInfo *gt_cell);
+    void constrain_ibufds_gt_site(CellInfo *buf_cell, const std::string &io_bel);
     void constrain_bufhce_gtp_common(CellInfo *bufhce_cell, CellInfo *gtp_common);
     void pack_gt();
 

@@ -1128,12 +1128,23 @@ struct Arch : BaseCtx
     }
 
     dict<int, pool<int>> blacklist_pips;
+    // Per-tile-INSTANCE pip blacklist (keyed by tile index -> pip indices), for
+    // reserving a pip in ONE specific tile only -- e.g. an INT pip whose config
+    // bit overlaps a live IOB config bit (IOB config piggybacks on the adjacent
+    // INT column's frames), which must be avoided at that tile but stays usable
+    // everywhere else.  Loaded from NEXTPNR_PIP_BLACKLIST_TILE (TILENAME.DST.SRC).
+    dict<int, pool<int>> blacklist_pip_instances;
     void setup_pip_blacklist();
 
     bool usp_pip_hard_unavail(PipId pip) const
     {
         if (blacklist_pips.count(locInfo(pip).type) && blacklist_pips.at(locInfo(pip).type).count(pip.index))
             return true;
+        if (!blacklist_pip_instances.empty()) {
+            auto it = blacklist_pip_instances.find(pip.tile);
+            if (it != blacklist_pip_instances.end() && it->second.count(pip.index))
+                return true;
+        }
         if (locInfo(pip).pip_data[pip.index].flags == PIP_SITE_ENTRY) {
             WireId dst = getPipDstWire(pip);
             if (dst.tile != -1) {
@@ -1146,9 +1157,20 @@ struct Arch : BaseCtx
             }
         } else if (locInfo(pip).pip_data[pip.index].flags == PIP_CONST_DRIVER) {
             WireId dst = getPipDstWire(pip);
-            LogicTileStatus *lts = tileStatus[xc7 ? dst.tile : pip.tile].lts;
-            if (lts != nullptr && (lts->cells[BEL_5LUT] != nullptr || lts->cells[BEL_6LUT] != nullptr))
-                return true; // Ground driver only available if lowest 5LUT and 6LUT not used
+            // virtex7 clock-routing fan-out reaches PIP_CONST_DRIVER pips
+            // whose getPipDstWire returns dst.tile == -1 (the pseudo-tile
+            // for the const-driver wire).  The matching PIP_SITE_ENTRY
+            // branch above already guards with `if (dst.tile != -1)` —
+            // we do the same here to avoid tileStatus[-1] (caught by
+            // ASan as a 64-byte-before-allocation read).  When dst.tile
+            // is the pseudo-tile we conservatively report the pip
+            // available (return false at the bottom of the function),
+            // since there's no LogicTileStatus to consult anyway.
+            if (dst.tile != -1) {
+                LogicTileStatus *lts = tileStatus[xc7 ? dst.tile : pip.tile].lts;
+                if (lts != nullptr && (lts->cells[BEL_5LUT] != nullptr || lts->cells[BEL_6LUT] != nullptr))
+                    return true; // Ground driver only available if lowest 5LUT and 6LUT not used
+            }
         } else if (locInfo(pip).pip_data[pip.index].flags == PIP_SITE_INTERNAL) {
             auto &pd = locInfo(pip).pip_data[pip.index];
             if (pd.bel == ID_TRIBUF)
@@ -1366,12 +1388,24 @@ struct Arch : BaseCtx
                 src_intent == ID_NODE_GLOBAL_VROUTE || src_intent == ID_NODE_GLOBAL_HDISTR ||
                 src_intent == ID_NODE_GLOBAL_LEAF || src_intent == ID_NODE_GLOBAL_BUFG) {
 
+                // Global clock-network per-hop delays, CALIBRATED to the golden
+                // Vivado write_sdf on the VC707 ethloop design (see
+                // ethsoc/openflow/opentimer/globalchar.{py,json}).  The BUFG->sink
+                // insertion delay of the 994-fanout userclk2/eth_clk global net is
+                // 2.05 ns median (tight, p95 2.09 -- low skew).  A BUFG->leaf path
+                // = a few dedicated spine hops (global->global, shared low-R clock
+                // metal) + exactly ONE leaf tap (global->local) into the sink's
+                // fabric tile, and that once-per-path tap carries the bulk of the
+                // insertion delay.  Loading the exit (fires once/sink) makes the
+                // total robust to the spine hop-count the SDF can't resolve.
+                // Old flat values were 100/250 ps -> ~650 ps total, 3x under Vivado.
+                const delay_t GLOBAL_SPINE_HOP = 70;   // global->global dedicated spine
+                const delay_t GLOBAL_EXIT_HOP = 1697;  // global->local/long leaf tap
                 if (dst_intent == ID_NODE_LOCAL || dst_intent == ID_NODE_HLONG || dst_intent == ID_NODE_VLONG ||
                     dst_intent == ID_NODE_VQUAD || dst_intent == ID_NODE_HQUAD) {
-                    // Assign a high penalty from global to local
-                    delay.delay = 250;
+                    delay.delay = GLOBAL_EXIT_HOP;
                 } else {
-                    delay.delay = 100;
+                    delay.delay = GLOBAL_SPINE_HOP;
                 }
             } else if (dst_intent == ID_NODE_LAGUNA_DATA) {
                 delay.delay = 5000;
@@ -1503,6 +1537,13 @@ struct Arch : BaseCtx
     bool getCellDelay(const CellInfo *cell, IdString fromPort, IdString toPort, DelayInfo &delay) const;
     // Get the port class, also setting clockInfoCount to the number of TimingClockingInfos associated with a port
     TimingPortClass getPortTimingClass(const CellInfo *cell, IdString port, int &clockInfoCount) const;
+
+    // DSP48E1 combinational timing helpers (see arch.cc). Phase 1: model the
+    // fully-combinational DSP48E1; registered configs stay TMG_IGNORE.
+    IdString dspStripBusIndex(IdString port) const;
+    bool dsp48e1IsCombinational(const CellInfo *cell) const;
+    double dsp48e1CombInputDelayNS(IdString base) const;
+    bool dsp48e1IsTimedOutput(IdString base) const;
     // Get the TimingClockingInfo of a port
     TimingClockingInfo getPortClockingInfo(const CellInfo *cell, IdString port, int index) const;
 
@@ -1521,6 +1562,7 @@ struct Arch : BaseCtx
 
     // Return true whether all Bels at a given location are valid
     bool isBelLocationValid(BelId bel) const;
+    void dumpTileStatus(BelId bel) const;
 
     bool xcu_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const;
     bool xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const;
@@ -1611,6 +1653,9 @@ struct Arch : BaseCtx
 
     void routeVcc();
     void routeClock();
+    void applyFixedRoutes(const std::string &filename);
+    void writeFixedRoutes(const std::string &filename) const;
+    bool gtClockTemplateRoute(NetInfo *clk_net, PortRef &usr);
     void findSourceSinkLocations();
     std::unordered_map<WireId, Loc> sink_locs, source_locs;
     // -------------------------------------------------

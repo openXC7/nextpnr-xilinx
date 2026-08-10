@@ -282,11 +282,20 @@ class NextpnrTileType:
 		self.pips = []
 		self.sitewire_to_tilewire_idx = {}
 		# Import tile wires
+		# Track GND_WIRE / VCC_WIRE tile-wire indices for the pseudo-pip bridges below.
+		# (prjxray tags those with intent HVCCGNDOUT, not PSEUDO_GND, so the constant-
+		# net router's walk-up cannot traverse them without an explicit bridging pip.)
+		gnd_tile_wire_idx = None
+		vcc_tile_wire_idx = None
 		for wire in tile.wires():
 			idx = len(self.wires)
 			timing_class = self.timing.get_wire_class(r=wire.resistance(), c=wire.capacitance())
 			self.wires.append(NextpnrWire(name=wire.name(), index=idx, intent=constid.make(wire.intent()),
 										  timing_class=timing_class))
+			if wire.name() == "GND_WIRE":
+				gnd_tile_wire_idx = idx
+			elif wire.name() == "VCC_WIRE":
+				vcc_tile_wire_idx = idx
 		null_timing_class = self.timing.get_wire_class(r=0, c=0)
 		self.row_gnd_wire_index = len(self.wires)
 		self.wires.append(NextpnrWire(name="PSEUDO_GND_WIRE_ROW", index=self.row_gnd_wire_index,
@@ -301,6 +310,17 @@ class NextpnrTileType:
 		self.wires.append(NextpnrWire(name="PSEUDO_VCC_WIRE_GLBL", index=self.global_vcc_wire_index,
 			intent=constid.make("PSEUDO_VCC"), timing_class=null_timing_class))
 		self.tile_wire_count = len(self.wires)
+		# Bridge the row pseudo-GND/VCC wires (intent PSEUDO_GND/PSEUDO_VCC) to this
+		# tile's actual GND_WIRE/VCC_WIRE so the router's constant-net walk-up can
+		# always find a PSEUDO_GND/PSEUDO_VCC-intent source uphill. Restrict to INT
+		# tile types (which is where prjxray puts the row-GND/VCC backbone).
+		if tile.tile_type() in ("INT_L", "INT_R", "INT"):
+			if gnd_tile_wire_idx is not None:
+				self.add_pseudo_pip(self.row_gnd_wire_index, gnd_tile_wire_idx,
+					pip_type=NextpnrPipType.CONST_DRIVER)
+			if vcc_tile_wire_idx is not None:
+				self.add_pseudo_pip(self.row_vcc_wire_index, vcc_tile_wire_idx,
+					pip_type=NextpnrPipType.CONST_DRIVER)
 		# Import sites
 		for s in tile.sites():
 			seen_pins = set() # set of (pinname, sitewire name)

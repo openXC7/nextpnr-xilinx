@@ -1,7 +1,7 @@
-cmake_minimum_required(VERSION 3.5)
+cmake_minimum_required(VERSION 3.10)
 project(nextpnr CXX C)
 
-option(BUILD_GUI "Build GUI" ON)
+option(BUILD_GUI "Build GUI" OFF)
 option(BUILD_PYTHON "Build Python Integration" ON)
 option(BUILD_TESTS "Build tests" OFF)
 option(BUILD_HEAP "Build HeAP analytic placer" ON)
@@ -71,7 +71,7 @@ foreach(item ${ARCH})
     endif()
 endforeach()
 
-set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD 17)
 if (MSVC)
     set(CMAKE_CONFIGURATION_TYPES "Debug;Release" CACHE STRING "" FORCE)
     set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /D_DEBUG /W4 /wd4100 /wd4244 /wd4125 /wd4800 /wd4456 /wd4458 /wd4305 /wd4459 /wd4121 /wd4996")
@@ -99,7 +99,7 @@ endif()
 find_package(Sanitizers)
 
 # List of Boost libraries to include
-set(boost_libs filesystem thread program_options iostreams system)
+set(boost_libs filesystem thread program_options iostreams)
 
 if (BUILD_GUI AND NOT BUILD_PYTHON)
     message(FATAL_ERROR "GUI requires Python to build")
@@ -177,7 +177,7 @@ if (BUILD_PYTHON)
     endwhile ()
 
     if (NOT Boost_PYTHON_FOUND)
-        foreach (PyVer 3 36 37 38 39 310 311 312)
+        foreach (PyVer 3 36 37 38 39 310 311 312 313 314)
             find_package(Boost QUIET COMPONENTS python${PyVer} ${boost_libs})
             if ("${Boost_LIBRARIES}" MATCHES ".*(python|PYTHON).*" )
                 set(Boost_PYTHON_FOUND TRUE)
@@ -202,9 +202,9 @@ endif()
 include_directories(common/ json/ frontend/ 3rdparty/json11/ ${Boost_INCLUDE_DIRS} ${Python3_INCLUDE_DIRS})
 
 if(BUILD_HEAP)
-    find_package (Eigen3 REQUIRED NO_MODULE)
+    find_package(PkgConfig)
+    pkg_check_modules(EIGEN3 REQUIRED eigen3)
     include_directories(${EIGEN3_INCLUDE_DIRS})
-    add_definitions(${EIGEN3_DEFINITIONS})
     add_definitions(-DWITH_HEAP)
 endif()
 

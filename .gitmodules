@@ -3,7 +3,7 @@
 	url = https://github.com/YosysHQ/nextpnr-tests
 [submodule "xilinx/external/prjxray-db"]
 	path = xilinx/external/prjxray-db
-	url = https://github.com/SymbiFlow/prjxray-db
+	url = https://github.com/openxc7/prjxray-db
 [submodule "xilinx/external/nextpnr-xilinx-meta"]
 	path = xilinx/external/nextpnr-xilinx-meta
 	url = https://github.com/openxc7/nextpnr-xilinx-meta

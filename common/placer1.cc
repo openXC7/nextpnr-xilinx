@@ -196,7 +196,77 @@ class SAPlacer
             }
             int constr_placed_cells = placed_cells;
             log_info("Placed %d cells based on constraints.\n", int(placed_cells));
+            setup_exclusion_bbox();
             ctx->yield();
+
+            // Bind packer-created chain children of BEL-pinned roots before
+            // building the autoplace set, so SA doesn't scatter them
+            // (imported Vivado placements: carry feed-through LUTs etc.)
+            int chain_children_placed = 0;
+            std::function<void(CellInfo *)> bind_children = [&](CellInfo *root) {
+                Loc rootLoc = ctx->getBelLocation(root->bel);
+                for (auto child : root->constr_children) {
+                    if (getenv("DBG_SFEED") && std::string(ctx->nameOf(child)).find("$LUT$") != std::string::npos)
+                        log_info("BINDCH child=%s root=%s childBel=%s\n", ctx->nameOf(child),
+                                 ctx->getBelName(root->bel).c_str(ctx),
+                                 child->bel == BelId() ? "UNBOUND" : ctx->getBelName(child->bel).c_str(ctx));
+                    if (child->bel == BelId()) {
+                        Loc cl;
+                        cl.x = rootLoc.x + (child->constr_x == child->UNCONSTR ? 0 : child->constr_x);
+                        cl.y = rootLoc.y + (child->constr_y == child->UNCONSTR ? 0 : child->constr_y);
+                        // xc7: an "absolute" chain z encodes the slot within
+                        // one slice half; chains never cross halves, so the
+                        // root's half (z bit 6) is ALWAYS imposed on children
+                        cl.z = child->constr_abs_z
+                                       ? (child->constr_z | (rootLoc.z & ~0x3F))
+                                       : rootLoc.z + (child->constr_z == child->UNCONSTR ? 0 : child->constr_z);
+                        BelId target = ctx->getBelByLocation(cl);
+                        if (target != BelId() && ctx->checkBelAvail(target)) {
+                            ctx->bindBel(target, child, STRENGTH_STRONG);
+                            chain_children_placed++;
+                        } else {
+                            log_warning("chain child '%s' pre-bind failed: root=%s loc=(%d,%d,%d) target=%s bound=%s\n",
+                                        ctx->nameOf(child), ctx->getBelName(root->bel).c_str(ctx), cl.x, cl.y, cl.z,
+                                        target == BelId() ? "none" : ctx->getBelName(target).c_str(ctx),
+                                        target == BelId() ? "-" : ctx->nameOf(ctx->getBoundBelCell(target)));
+                        }
+                    }
+                    if (child->bel != BelId())
+                        bind_children(child);
+                }
+            };
+            std::function<void(CellInfo *)> clear_constrs = [&](CellInfo *c) {
+                c->constr_x = c->UNCONSTR;
+                c->constr_y = c->UNCONSTR;
+                c->constr_z = c->UNCONSTR;
+                c->constr_abs_z = false;
+                for (auto ch : c->constr_children) {
+                    if (ch->bel == BelId())
+                        log_warning("chain child '%s' of pinned root '%s' is still unbound\n", ctx->nameOf(ch),
+                                    ctx->nameOf(c));
+                    clear_constrs(ch);
+                }
+            };
+            for (auto &cell : ctx->cells) {
+                CellInfo *ci = cell.second.get();
+                if (ci->constr_parent == nullptr && !ci->constr_children.empty() && ci->bel != BelId() &&
+                    ci->attrs.count(ctx->id("BEL"))) {
+                    bind_children(ci);
+                    // constraints have served their purpose; the xc7 half-bit
+                    // z encoding would otherwise trip the final distance sweep
+                    clear_constrs(ci);
+                }
+            }
+            // pinned chain SEGMENTS with no children (skipped from chaining)
+            // may still carry the root abs-z constraint from pack_carries
+            for (auto &cell : ctx->cells) {
+                CellInfo *ci = cell.second.get();
+                if (ci->constr_parent == nullptr && ci->bel != BelId() && ci->attrs.count(ctx->id("BEL")) &&
+                    ci->constr_abs_z)
+                    clear_constrs(ci);
+            }
+            if (chain_children_placed > 0)
+                log_info("Bound %d chain children of BEL-pinned roots.\n", chain_children_placed);
 
             // Sort to-place cells for deterministic initial placement
 
@@ -407,6 +477,9 @@ class SAPlacer
         log_info("SA placement time %.02fs\n", std::chrono::duration<float>(saplace_end - saplace_start).count());
 
         // Final post-pacement validitiy check
+        extern bool dbg_validity_runtime;
+        if (getenv("NEXTPNR_DUMP_INVALID_TILE") != nullptr)
+            dbg_validity_runtime = true;
         ctx->yield();
         for (auto bel : ctx->getBels()) {
             CellInfo *cell = ctx->getBoundBelCell(bel);
@@ -414,6 +487,17 @@ class SAPlacer
                 std::string cell_text = "no cell";
                 if (cell != nullptr)
                     cell_text = std::string("cell '") + ctx->nameOf(cell) + "'";
+                if (getenv("NEXTPNR_DUMP_INVALID_TILE") != nullptr) {
+                    Loc l = ctx->getBelLocation(bel);
+                    for (auto tb : ctx->getBelsByTile(l.x, l.y)) {
+                        CellInfo *tc = ctx->getBoundBelCell(tb);
+                        if (tc != nullptr)
+                            log_info("  tile occupant: %s = %s (%s)%s\n", ctx->getBelName(tb).c_str(ctx),
+                                     ctx->nameOf(tc), tc->type.c_str(ctx),
+                                     tc->attrs.count(ctx->id("BEL")) ? " [stamped]" : "");
+                    }
+                    ctx->dumpTileStatus(bel);
+                }
                 if (ctx->force) {
                     log_warning("post-placement validity check failed for Bel '%s' "
                                 "(%s)\n",
@@ -426,9 +510,25 @@ class SAPlacer
             }
         }
         for (auto cell : sorted(ctx->cells))
-            if (get_constraints_distance(ctx, cell.second) != 0)
-                log_error("constraint satisfaction check failed for cell '%s' at Bel '%s'\n", cell.first.c_str(ctx),
-                          ctx->getBelName(cell.second->bel).c_str(ctx));
+            if (get_constraints_distance(ctx, cell.second) != 0) {
+                Loc cl = ctx->getBelLocation(cell.second->bel);
+                if (getenv("NEXTPNR_DBG_CONSTR")) {
+                    std::function<void(const CellInfo *, int)> dump = [&](const CellInfo *c, int depth) {
+                        for (auto child : c->constr_children) {
+                            int d = get_constraints_distance(ctx, child);
+                            Loc ccl = ctx->getBelLocation(child->bel);
+                            log_info("   %*schild %s at (%d,%d,%d) constr x=%d y=%d z=%d abs=%d dist=%d\n",
+                                      depth, "", ctx->nameOf(child), ccl.x, ccl.y, ccl.z, child->constr_x,
+                                      child->constr_y, child->constr_z, int(child->constr_abs_z), d);
+                            dump(child, depth + 1);
+                        }
+                    };
+                    dump(cell.second, 1);
+                }
+                log_error("constraint satisfaction check failed for cell '%s' at Bel '%s' (z=%d cz=%d cy=%d cx=%d loc=%d,%d,%d)\n",
+                          cell.first.c_str(ctx), ctx->getBelName(cell.second->bel).c_str(ctx), cl.z,
+                          cell.second->constr_z, cell.second->constr_y, cell.second->constr_x, cl.x, cl.y, cl.z);
+            }
         timing_analysis(ctx);
         ctx->unlock();
         return true;
@@ -675,12 +775,13 @@ class SAPlacer
                 add_move_cell(moveChange, bound, db.second);
         }
         for (const auto &mm : moves_made) {
-            if (!ctx->isBelLocationValid(mm.first->bel) || !check_cell_bel_region(mm.first, mm.first->bel))
+            if (!ctx->isBelLocationValid(mm.first->bel) || !check_cell_bel_region(mm.first, mm.first->bel) ||
+                bel_excluded(mm.first, mm.first->bel))
                 goto swap_fail;
             if (!ctx->isBelLocationValid(mm.second))
                 goto swap_fail;
             CellInfo *bound = ctx->getBoundBelCell(mm.second);
-            if (bound && !check_cell_bel_region(bound, bound->bel))
+            if (bound && (!check_cell_bel_region(bound, bound->bel) || bel_excluded(bound, bound->bel)))
                 goto swap_fail;
         }
         compute_cost_changes(moveChange);
@@ -711,6 +812,47 @@ class SAPlacer
 
     // Find a random Bel of the correct type for a cell, within the specified
     // diameter
+    // Exclusion bbox (NEXTPNR_EXCLUDE_STAMPED_BBOX=1): unstamped cells stay
+    // out of the bounding box of pre-placed (BEL-attr) fabric cells -- i.e.
+    // the frozen macro's region, whose routing is LOCKED so densely that
+    // arcs into it are unroutable for foreign logic.
+    int excl_x0 = -1, excl_y0 = -1, excl_x1 = -1, excl_y1 = -1;
+    void setup_exclusion_bbox()
+    {
+        if (getenv("NEXTPNR_EXCLUDE_STAMPED_BBOX") == nullptr)
+            return;
+        for (auto &cell : ctx->cells) {
+            CellInfo *ci = cell.second.get();
+            if (ci->bel == BelId() || !ci->attrs.count(ctx->id("BEL")))
+                continue;
+            std::string t = ci->type.str(ctx);
+            if (t.substr(0, 6) != "SLICE_" && t.substr(0, 4) != "RAMD" && t != "CARRY4")
+                continue;
+            Loc l = ctx->getBelLocation(ci->bel);
+            if (excl_x0 < 0) {
+                excl_x0 = excl_x1 = l.x;
+                excl_y0 = excl_y1 = l.y;
+            } else {
+                excl_x0 = std::min(excl_x0, l.x);
+                excl_x1 = std::max(excl_x1, l.x);
+                excl_y0 = std::min(excl_y0, l.y);
+                excl_y1 = std::max(excl_y1, l.y);
+            }
+        }
+        if (excl_x0 >= 0)
+            log_info("Excluding unstamped cells from stamped bbox (%d,%d)-(%d,%d)\n", excl_x0, excl_y0, excl_x1,
+                     excl_y1);
+    }
+    bool bel_excluded(const CellInfo *cell, BelId bel) const
+    {
+        if (excl_x0 < 0 || bel == BelId())
+            return false;
+        if (cell->attrs.count(ctx->id("BEL")))
+            return false; // stamped cells belong there
+        Loc l = ctx->getBelLocation(bel);
+        return l.x >= excl_x0 && l.x <= excl_x1 && l.y >= excl_y0 && l.y <= excl_y1;
+    }
+
     BelId random_bel_for_cell(CellInfo *cell, int force_z = -1)
     {
         IdString targetType = cell->type;
@@ -751,6 +893,8 @@ class SAPlacer
                     continue;
             }
             if (!check_cell_bel_region(cell, bel))
+                continue;
+            if (bel_excluded(cell, bel))
                 continue;
             if (locked_bels.find(bel) != locked_bels.end())
                 continue;

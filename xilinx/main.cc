@@ -50,6 +50,10 @@ po::options_description UspCommandHandler::getArchOptions()
     specific.add_options()("chipdb", po::value<std::string>(), "name of chip database binary");
     specific.add_options()("xdc", po::value<std::vector<std::string>>(), "XDC-style constraints file");
     specific.add_options()("fasm", po::value<std::string>(), "fasm bitstream file to write");
+    specific.add_options()("fixed-routes", po::value<std::string>(),
+                           "frozen hard-macro routing to LOCK before routing (net + src->dst pips)");
+    specific.add_options()("write-fixed-routes", po::value<std::string>(),
+                           "after routing, dump fabric routing in --fixed-routes format");
 
     return specific;
 }
@@ -60,6 +64,8 @@ void UspCommandHandler::customBitstream(Context *ctx)
         std::string filename = vm["fasm"].as<std::string>();
         ctx->writeFasm(filename);
     }
+    if (vm.count("write-fixed-routes"))
+        ctx->writeFixedRoutes(vm["write-fixed-routes"].as<std::string>());
 }
 
 std::unique_ptr<Context> UspCommandHandler::createContext(std::unordered_map<std::string, Property> &values)
@@ -83,6 +89,8 @@ void UspCommandHandler::customAfterLoad(Context *ctx)
             ctx->parseXdc(in);
         }
     }
+    if (vm.count("fixed-routes"))
+        ctx->settings[ctx->id("fixed-routes")] = vm["fixed-routes"].as<std::string>();
 }
 
 int main(int argc, char *argv[])

@@ -43,6 +43,8 @@
 #include <fstream>
 #include <numeric>
 #include <queue>
+#include <random>
+#include <limits>
 #include <tuple>
 #include <unordered_map>
 #include "log.h"
@@ -281,6 +283,11 @@ class HeAPPlacer
             BelId bel;
             PlaceStrength strength;
             std::tie(cell, bel, strength) = sc;
+            if (bel == BelId()) {
+                log_warning("HeAP: cell '%s' (type %s) has no bel in solution\n",
+                            cell->name.c_str(ctx), cell->type.c_str(ctx));
+                continue;
+            }
             ctx->bindBel(bel, cell, strength);
         }
 
@@ -403,6 +410,47 @@ class HeAPPlacer
                 ctx->bindBel(bel, cell, STRENGTH_USER);
                 placed_cells++;
             }
+        }
+        // Bind chain children the packer created relative to a BEL-pinned
+        // parent (e.g. carry S/DI feed-through LUTs under a stamped CARRY4).
+        // They are excluded from place_cells (constr_parent != nullptr) and
+        // strict legalisation never visits the already-bound parent, so
+        // without this they end the placer unbound ("Found unbound cell").
+        // placer1 handles this via legalise_relative_constraints /
+        // bind_unplaced_children; this is the HeAP-path equivalent.
+        std::function<void(CellInfo *)> bind_children = [&](CellInfo *parent) {
+            if (parent->bel == BelId())
+                return;
+            Loc ploc = ctx->getBelLocation(parent->bel);
+            for (auto child : parent->constr_children) {
+                if (child->bel == BelId()) {
+                    Loc cl;
+                    cl.x = ploc.x + (child->constr_x == child->UNCONSTR ? 0 : child->constr_x);
+                    cl.y = ploc.y + (child->constr_y == child->UNCONSTR ? 0 : child->constr_y);
+                    // xc7: chains never cross slice halves -- impose the
+                    // parent's half (z bit 6) on absolute chain z values
+                    cl.z = child->constr_abs_z
+                                   ? (child->constr_z | (ploc.z & ~0x3F))
+                                   : ploc.z + (child->constr_z == child->UNCONSTR ? 0 : child->constr_z);
+                    BelId target = ctx->getBelByLocation(cl);
+                    if (target != BelId() && ctx->checkBelAvail(target)) {
+                        ctx->bindBel(target, child, STRENGTH_USER);
+                        placed_cells++;
+                    } else {
+                        log_warning("HeAP: cannot bind chain child '%s' (type %s) of pinned parent '%s' at "
+                                    "(%d,%d,%d): %s\n",
+                                    child->name.c_str(ctx), child->type.c_str(ctx), parent->name.c_str(ctx), cl.x,
+                                    cl.y, cl.z,
+                                    target == BelId() ? "no bel at location" : "bel not available");
+                    }
+                }
+                bind_children(child);
+            }
+        };
+        for (auto &cell_entry : ctx->cells) {
+            CellInfo *ci = cell_entry.second.get();
+            if (ci->constr_parent == nullptr && ci->bel != BelId() && !ci->constr_children.empty())
+                bind_children(ci);
         }
         log_info("Placed %d cells based on constraints.\n", int(placed_cells));
         ctx->yield();
@@ -527,8 +575,25 @@ class HeAPPlacer
                 continue;
             available_bels[ctx->getBelType(bel)].push_back(bel);
         }
-        for (auto &t : available_bels) {
-            std::random_shuffle(t.second.begin(), t.second.end(), [&](size_t n) { return ctx->rng(int(n)); });
+        // Shuffle each bel-type's pool deterministically and *identically on
+        // every platform*.  Two things here were implementation-defined and
+        // made Linux (libstdc++) and macOS (libc++) diverge into different
+        // initial placements — the butterfly that flips a routable placement
+        // into an unroutable one:
+        //   (a) std::default_random_engine is a different algorithm per STL;
+        //   (b) iterating available_bels (an unordered_map) fed the per-type
+        //       RNG seeds in a different, hash-dependent order.
+        // Fix both: iterate bel types in name-sorted order, and shuffle with
+        // std::mt19937 (a fixed, standardised PRNG).
+        std::vector<IdString> bel_type_order;
+        bel_type_order.reserve(available_bels.size());
+        for (auto &t : available_bels)
+            bel_type_order.push_back(t.first);
+        std::sort(bel_type_order.begin(), bel_type_order.end(),
+                  [&](IdString a, IdString b) { return a.str(ctx) < b.str(ctx); });
+        for (auto type : bel_type_order) {
+            auto &bels = available_bels[type];
+            std::shuffle(bels.begin(), bels.end(), std::mt19937(ctx->rng(std::numeric_limits<int>::max())));
         }
         for (auto cell : sorted(ctx->cells)) {
             CellInfo *ci = cell.second;
@@ -619,6 +684,24 @@ class HeAPPlacer
             chain_size[cell->name] = 1;
             if (!cell->constr_children.empty())
                 update_chain(cell, cell);
+        }
+        // Hybrid Vivado-place/nextpnr-route flow: chain roots that are absolutely
+        // BEL-locked are NOT in place_cells, so their children would never get a
+        // cell_locs entry (-> out_of_range in build_equations/total_hpwl/legalise).
+        // Process locked chain roots here too so every chained child is located.
+        // Collect first to avoid invalidating the cell_locs iterator (update_chain
+        // inserts into it).
+        std::vector<CellInfo *> locked_roots;
+        for (auto &cl : cell_locs) {
+            if (!cl.second.locked)
+                continue;
+            CellInfo *ci = ctx->cells.at(cl.first).get();
+            if (ci->constr_parent == nullptr && !ci->constr_children.empty())
+                locked_roots.push_back(ci);
+        }
+        for (auto ci : locked_roots) {
+            chain_size[ci->name] = 1;
+            update_chain(ci, ci);
         }
     }
 
@@ -761,12 +844,23 @@ class HeAPPlacer
             NetInfo *ni = net.second;
             if (ni->driver.cell == nullptr)
                 continue;
-            CellLocation &drvloc = cell_locs.at(ni->driver.cell->name);
+            // Cells constrained relative to a parent (e.g. CARRY4 chain members,
+            // or any externally BEL-locked cell whose name the solver doesn't
+            // track) may not have a cell_locs entry; skip them rather than
+            // throwing out_of_range (needed for the Vivado-place/nextpnr-route
+            // hybrid flow, where most cells are absolutely BEL-locked).
+            auto dit = cell_locs.find(ni->driver.cell->name);
+            if (dit == cell_locs.end())
+                continue;
+            CellLocation &drvloc = dit->second;
             if (drvloc.global)
                 continue;
             int xmin = drvloc.x, xmax = drvloc.x, ymin = drvloc.y, ymax = drvloc.y;
             for (auto &user : ni->users) {
-                CellLocation &usrloc = cell_locs.at(user.cell->name);
+                auto uit = cell_locs.find(user.cell->name);
+                if (uit == cell_locs.end())
+                    continue;
+                CellLocation &usrloc = uit->second;
                 xmin = std::min(xmin, usrloc.x);
                 xmax = std::max(xmax, usrloc.x);
                 ymin = std::min(ymin, usrloc.y);
@@ -812,12 +906,48 @@ class HeAPPlacer
             // log_info("   Legalising %s (%s)\n", top.second.c_str(ctx), ci->type.c_str(ctx));
             int bt = std::get<0>(bel_types.at(ci->type));
             auto &fb = fast_bels.at(bt);
+            // Population of this bel type (lazy, cached).  The
+            // eviction-last-resort rule below only applies to SCARCE types
+            // (BRAM: 135 on an a100, DSP, clock buffers, config singletons):
+            // that is where two cells sharing a neighbourhood can evict each
+            // other forever.  For abundant fabric types (tens of thousands
+            // of LUT/FF bels) the evicted cell rehomes trivially and the
+            // greedy commit gives tighter placements -- applying the rule
+            // globally regressed ddr3-test-arty-s7 into a placement with
+            // unroutable output-mux contention (3 overused SITEWIREs).
+            static std::unordered_map<int, int> type_pop_cache;
+            auto tp = type_pop_cache.find(bt);
+            if (tp == type_pop_cache.end()) {
+                int n = 0;
+                for (auto &col : fb)
+                    for (auto &cv : col)
+                        n += int(cv.size());
+                tp = type_pop_cache.emplace(bt, n).first;
+            }
+            const bool scarce_type = tp->second <= 4096;
             int radius = 0;
             int iter = 0;
             int iter_at_radius = 0;
+            // Total attempts for this cell, never reset (unlike iter, which
+            // the radius-expansion branch resets).  Without this the
+            // per-cell timeout below can never fire: once radius is capped at
+            // max(max_x,max_y), iter oscillates in [0, 10*(radius+1)] forever
+            // and an unplaceable cell (e.g. validity-rejected carry/mux
+            // conflict) spins the legaliser in an endless loop instead of
+            // failing fast.
+            int attempts = 0;
             bool placed = false;
+            bool tried_full_scan = false;
             BelId bestBel;
             int best_inp_len = std::numeric_limits<int>::max();
+            // Best candidate that needs NO eviction.  Eviction is only ever
+            // allowed when the whole exploration saw no free valid home:
+            // two cells whose solver positions share a neighbourhood
+            // otherwise evict each other forever (litex qmtech-a100:
+            // sram.0.0 and a VexRiscv cache bank ping-ponged with 103
+            // free-and-valid BRAM tiles measured on the die).
+            BelId bestFreeBel;
+            int best_free_inp_len = std::numeric_limits<int>::max();
 
             if (debug_this) std::cerr << "==> placing cell " << ci->name.str(ctx) << std::endl;
 
@@ -834,8 +964,16 @@ class HeAPPlacer
 
             while (!placed) {
 
-                // Set a conservative timeout
-                if (iter > std::max(10000, 3 * int(ctx->cells.size())))
+                // Set a conservative timeout.  The radius-expansion branch
+                // resets iter every ~10*(radius+1) attempts, so reaching the
+                // full-grid radius cap costs ~5*max(max_x,max_y)^2 attempts
+                // before the search can even see sparse site types (e.g.
+                // BUFGCTRL: 32 sites on a ~160x100 die).  A plain
+                // max(10000, 3*cells) guard fires before that, making every
+                // unpinned BUFG/BUFH unplaceable (regression from
+                // 369038ed).  Budget the radius growth plus a full-grid
+                // search pass on top of the cell-count term.
+                if (attempts > std::max(10000, 3 * int(ctx->cells.size())) + 10 * max_x * max_y)
                     log_error("Unable to find legal placement for cell '%s', check constraints and utilisation.\n",
                               ctx->nameOf(ci));
 
@@ -857,6 +995,7 @@ class HeAPPlacer
 
                 iter++;
                 iter_at_radius++;
+                attempts++;
                 if (iter >= (10 * (radius + 1))) {
                     radius = std::min(std::max(max_x, max_y), radius + 1);
                     while (radius < std::max(max_x, max_y)) {
@@ -878,6 +1017,53 @@ class HeAPPlacer
                     iter_at_radius = 0;
                     iter = 0;
                 }
+                // Deterministic last resort for sparse site types: with a
+                // singleton bel (DCIRESET: ONE site on the die) the uniform
+                // random draw above can exhaust the whole attempts budget
+                // without ever sampling the site's coordinates (~15% miss
+                // probability per legalise pass on an xc7s50 grid), killing
+                // an otherwise placeable design a few solver iterations in.
+                // Once the walk has burnt a healthy budget without seeing a
+                // single candidate, scan the type's bel grid directly --
+                // single-cell case only, once per cell, same acceptance
+                // rules as the random path below.  (Ordinary cells find a
+                // candidate within tens of attempts; only needle-in-haystack
+                // types ever get here.)
+                if (!tried_full_scan && bestBel == BelId() && attempts >= 5000 &&
+                    ci->constr_children.empty() && !ci->constr_abs_z) {
+                    tried_full_scan = true;
+                    for (int x = 0; x < int(fb.size()) && !placed; x++) {
+                        for (int y = 0; y < int(fb.at(x).size()) && !placed; y++) {
+                            for (auto sz : fb.at(x).at(y)) {
+                                if (ci->region != nullptr && ci->region->constr_bels &&
+                                    !ci->region->bels.count(sz))
+                                    continue;
+                                // FREE bels only: a deterministic sweep that
+                                // evicts always picks the SAME victim, which
+                                // turns two same-type cells into a mutual
+                                // eviction livelock (measured: 29k sweep
+                                // evictions in the qmtech BRAM ping-pong).
+                                // The needle case this sweep exists for
+                                // (DCIRESET: one bel on the die) is always
+                                // free -- nothing else can bind it.
+                                if (ctx->getBoundBelCell(sz) != nullptr)
+                                    continue;
+                                ctx->bindBel(sz, ci, STRENGTH_WEAK);
+                                if (require_validity && !ctx->isBelLocationValid(sz)) {
+                                    ctx->unbindBel(sz);
+                                    continue;
+                                }
+                                placed = true;
+                                Loc loc = ctx->getBelLocation(sz);
+                                cell_locs[ci->name].x = loc.x;
+                                cell_locs[ci->name].y = loc.y;
+                                break;
+                            }
+                        }
+                    }
+                    if (placed)
+                        break;
+                }
                 if (nx < 0 || nx > max_x)
                     continue;
                 if (ny < 0 || ny > max_y)
@@ -895,15 +1081,21 @@ class HeAPPlacer
 
                 int need_to_explore = 2 * radius;
 
-                if (iter_at_radius >= need_to_explore && bestBel != BelId()) {
-                    CellInfo *bound = ctx->getBoundBelCell(bestBel);
+                if (iter_at_radius >= need_to_explore &&
+                    (bestBel != BelId() || (scarce_type && bestFreeBel != BelId()))) {
+                    // Never evict while the exploration saw a free valid
+                    // home -- eviction is the last resort, not a wirelen
+                    // optimisation (see bestFreeBel above).  Scarce types
+                    // only; abundant types keep the greedy commit.
+                    BelId target = (scarce_type && bestFreeBel != BelId()) ? bestFreeBel : bestBel;
+                    CellInfo *bound = ctx->getBoundBelCell(target);
                     if (bound != nullptr) {
                         ctx->unbindBel(bound->bel);
                         remaining.emplace(chain_size[bound->name], bound->name);
                     }
-                    ctx->bindBel(bestBel, ci, STRENGTH_WEAK);
+                    ctx->bindBel(target, ci, STRENGTH_WEAK);
                     placed = true;
-                    Loc loc = ctx->getBelLocation(bestBel);
+                    Loc loc = ctx->getBelLocation(target);
                     cell_locs[ci->name].x = loc.x;
                     cell_locs[ci->name].y = loc.y;
                     break;
@@ -947,8 +1139,26 @@ class HeAPPlacer
                                     best_inp_len = input_len;
                                     bestBel = sz;
                                 }
+                                if (bound == nullptr && input_len < best_free_inp_len) {
+                                    best_free_inp_len = input_len;
+                                    bestFreeBel = sz;
+                                }
                                 break;
                             } else {
+                                // Post-exploration direct commit: same rule
+                                // as the bestBel commit -- never evict when a
+                                // free valid home was already seen (scarce
+                                // types only).
+                                if (scarce_type && bound != nullptr && bestFreeBel != BelId()) {
+                                    ctx->unbindBel(sz);
+                                    ctx->bindBel(sz, bound, STRENGTH_WEAK);
+                                    ctx->bindBel(bestFreeBel, ci, STRENGTH_WEAK);
+                                    Loc floc = ctx->getBelLocation(bestFreeBel);
+                                    cell_locs[ci->name].x = floc.x;
+                                    cell_locs[ci->name].y = floc.y;
+                                    placed = true;
+                                    break;
+                                }
                                 if (bound != nullptr)
                                     remaining.emplace(chain_size[bound->name], bound->name);
                                 Loc loc = ctx->getBelLocation(sz);
@@ -971,7 +1181,19 @@ class HeAPPlacer
                         visit.emplace(ci, loc);
                         while (!visit.empty()) {
                             CellInfo *vc = visit.front().first;
-                            NPNR_ASSERT(vc->bel == BelId());
+                            if (vc->bel != BelId()) {
+                                // A leaf cluster member can already be bound
+                                // when the general flow placed it before this
+                                // chain's BFS runs -- e.g. a LUT shared between
+                                // two chains (one cell drives the S input of
+                                // two CARRY4s; pack_carries adopts it into one
+                                // cluster) and bound by the queue in the
+                                // meantime.  Relocate it with the cluster
+                                // instead of asserting.  A non-leaf member
+                                // being bound is a genuine overlap bug.
+                                NPNR_ASSERT(vc->constr_children.empty());
+                                ctx->unbindBel(vc->bel);
+                            }
                             Loc ploc = visit.front().second;
                             visit.pop();
                             BelId target = ctx->getBelByLocation(ploc);
@@ -1241,12 +1463,31 @@ class HeAPPlacer
             for (auto &cell : p->cell_locs) {
                 if (!beltype.count(ctx->cells.at(cell.first)->type))
                     continue;
+                // Skip locked cells, mirroring the extent-recording loop above.
+                // A fully BEL-locked constraint chain (e.g. a carry-stamped
+                // CARRY4 chain, strength STRENGTH_USER) records NO extent there;
+                // looking its root up here would throw a bare std::out_of_range.
+                // Locked cells are never spread, so they contribute no extent.
+                if (ctx->cells.at(cell.first)->belStrength > STRENGTH_STRONG)
+                    continue;
                 // Transfer chain extents to the actual chaines structure
                 ChainExtent *ce = nullptr;
+                IdString ext_key;
                 if (p->chain_root.count(cell.first))
-                    ce = &(cell_extents.at(p->chain_root.at(cell.first)->name));
+                    ext_key = p->chain_root.at(cell.first)->name;
                 else if (!ctx->cells.at(cell.first)->constr_children.empty())
-                    ce = &(cell_extents.at(cell.first));
+                    ext_key = cell.first;
+                if (ext_key != IdString()) {
+                    auto ext = cell_extents.find(ext_key);
+                    if (ext == cell_extents.end())
+                        log_error("HeAP spreader: no chain extent recorded for chain root '%s' "
+                                  "(reached via cell '%s' of type '%s', strength %d) — placer "
+                                  "invariant violated\n",
+                                  ext_key.c_str(ctx), cell.first.c_str(ctx),
+                                  ctx->cells.at(cell.first)->type.c_str(ctx),
+                                  int(ctx->cells.at(cell.first)->belStrength));
+                    ce = &ext->second;
+                }
                 if (ce) {
                     auto &lce = chaines.at(cell.second.x).at(cell.second.y);
                     lce.x0 = std::min(lce.x0, ce->x0);

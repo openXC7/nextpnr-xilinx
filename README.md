@@ -13,7 +13,7 @@ Currently two flows are supported:
 
 ## Prerequisites - UltraScale+
 
- - Follow the [RapidWright manual install instructions](https://www.rapidwright.io/docs/Manual_Install.html)
+ - Follow the [RapidWright manual install instructions](https://www.rapidwright.io/docs/Install.html?highlight=install)
  - Make sure `$RAPIDWRIGHT_PATH` is set correctly for all further steps
  - Download a JAR of recent [GSON](https://repo1.maven.org/maven2/com/google/code/gson/gson/2.8.5/)
  - Download and build [Project Xray](https://github.com/SymbiFlow/prjxray)

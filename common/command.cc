@@ -121,6 +121,8 @@ po::options_description CommandHandler::getGeneralOptions()
     general.add_options()("post-route", po::value<std::vector<std::string>>(), "python file to run after routing");
 
 #endif
+    general.add_options()("report", po::value<std::string>(),
+                          "write timing and utilization report in JSON format");
     general.add_options()("json", po::value<std::string>(), "JSON design file to ingest");
     general.add_options()("write", po::value<std::string>(), "JSON design file to write");
     general.add_options()("seed", po::value<int>(), "seed value for random number generator");
@@ -145,6 +147,8 @@ po::options_description CommandHandler::getGeneralOptions()
 
     general.add_options()("pack-only", "pack design only without placement or routing");
     general.add_options()("no-route", "process design without routing");
+    general.add_options()("route-clock-only",
+                          "route only the dedicated clock network, leaving general nets for an external router");
     general.add_options()("no-place", "process design without placement");
     general.add_options()("no-pack", "process design without packing");
 
@@ -321,7 +325,11 @@ int CommandHandler::executeMain(std::unique_ptr<Context> ctx)
     if (vm.count("json")) {
         bool do_pack = vm.count("pack-only") != 0 || vm.count("no-pack") == 0;
         bool do_place = vm.count("pack-only") == 0 && vm.count("no-place") == 0;
-        bool do_route = vm.count("pack-only") == 0 && vm.count("no-route") == 0;
+        bool route_clock_only = vm.count("route-clock-only") != 0;
+        bool do_route =
+                vm.count("pack-only") == 0 && (vm.count("no-route") == 0 || route_clock_only);
+        if (route_clock_only)
+            ctx->settings[ctx->id("route-clock-only")] = 1;
 
         if (do_pack) {
             run_script_hook("pre-pack");
@@ -347,6 +355,15 @@ int CommandHandler::executeMain(std::unique_ptr<Context> ctx)
         }
 
         customBitstream(ctx.get());
+    }
+
+    if (vm.count("report")) {
+        std::string filename = vm["report"].as<std::string>();
+        std::ofstream f(filename);
+        if (!f)
+            log_error("Failed to open report file %s for writing.\n", filename.c_str());
+        f << ctx->reportJson();
+        log_info("Report written to %s.\n", filename.c_str());
     }
 
     if (vm.count("write")) {

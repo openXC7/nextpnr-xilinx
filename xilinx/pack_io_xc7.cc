@@ -124,7 +124,7 @@ void XC7Packer::decompose_iob(CellInfo *xil_iob, bool is_hr, const std::string &
 
         CellInfo *inbuf = insert_ibuf(int_name(xil_iob->name, "IBUF", is_se_iobuf), ibuf_type, pad_net, top_out);
         std::string tile = get_tilename_by_sitename(ctx, site);
-        if (boost::starts_with(tile, "RIOB18_"))
+        if ((boost::starts_with(tile, "RIOB18_") || boost::starts_with(tile, "LIOB18_")))
             inbuf->attrs[ctx->id("BEL")] = site + "/IOB18/INBUF_DCIEN";
         else
             inbuf->attrs[ctx->id("BEL")] = site + "/IOB33/INBUF_EN";
@@ -153,7 +153,7 @@ void XC7Packer::decompose_iob(CellInfo *xil_iob, bool is_hr, const std::string &
                 is_se_iobuf ? (has_dci ? ctx->id("OBUFT_DCIEN") : ctx->id("OBUFT")) : xil_iob->type,
                 get_net_or_empty(xil_iob, ctx->id("I")), pad_net, get_net_or_empty(xil_iob, ctx->id("T")));
         std::string tile = get_tilename_by_sitename(ctx, site);
-        if (boost::starts_with(tile, "RIOB18_"))
+        if ((boost::starts_with(tile, "RIOB18_") || boost::starts_with(tile, "LIOB18_")))
             obuf->attrs[ctx->id("BEL")] = site + "/IOB18/OUTBUF_DCIEN";
         else
             obuf->attrs[ctx->id("BEL")] = site + "/IOB33/OUTBUF";
@@ -182,7 +182,7 @@ void XC7Packer::decompose_iob(CellInfo *xil_iob, bool is_hr, const std::string &
         NPNR_ASSERT(pad_n_net != nullptr);
         std::string site_n = pad_site(pad_n_net);
         std::string tile_p = get_tilename_by_sitename(ctx, site_p);
-        bool is_riob18 = boost::starts_with(tile_p, "RIOB18_");
+        bool is_riob18 = (boost::starts_with(tile_p, "RIOB18_") || boost::starts_with(tile_p, "LIOB18_"));
 
         if (!is_diff_iobuf && !is_diff_out_iobuf) {
             disconnect_port(ctx, xil_iob, ctx->id("I"));
@@ -229,7 +229,7 @@ void XC7Packer::decompose_iob(CellInfo *xil_iob, bool is_hr, const std::string &
         NPNR_ASSERT(pad_n_net != nullptr);
         std::string site_n = pad_site(pad_n_net);
         std::string tile_p = get_tilename_by_sitename(ctx, site_p);
-        bool is_riob18 = boost::starts_with(tile_p, "RIOB18_");
+        bool is_riob18 = (boost::starts_with(tile_p, "RIOB18_") || boost::starts_with(tile_p, "LIOB18_"));
 
         disconnect_port(ctx, xil_iob, (is_diff_iobuf || is_diff_out_iobuf) ? ctx->id("IO") : ctx->id("O"));
         disconnect_port(ctx, xil_iob, (is_diff_iobuf || is_diff_out_iobuf) ? ctx->id("IOB") : ctx->id("OB"));
@@ -503,11 +503,12 @@ void XC7Packer::pack_io()
             log_info("    Constraining '%s' to site '%s'\n", pad->name.c_str(ctx), site.c_str());
             std::string tile = get_tilename_by_sitename(ctx, site);
             log_info("    Tile '%s'\n", tile.c_str());
-            if (boost::starts_with(tile, "GTP_COMMON") || boost::starts_with(tile, "GTP_CHANNEL")) {
+            if (boost::starts_with(tile, "GTP_COMMON") || boost::starts_with(tile, "GTP_CHANNEL") ||
+                boost::starts_with(tile, "GTX_COMMON") || boost::starts_with(tile, "GTX_CHANNEL")) {
                 auto pad_bel = std::string(site + "/PAD");
                 pad->attrs[id_BEL] = pad_bel;
             } else {
-                if (boost::starts_with(tile, "RIOB18_"))
+                if ((boost::starts_with(tile, "RIOB18_") || boost::starts_with(tile, "LIOB18_")))
                     pad->attrs[id_BEL] = std::string(site + "/IOB18/PAD");
                 else
                     pad->attrs[id_BEL] = std::string(site + "/IOB33/PAD");
@@ -558,38 +559,65 @@ void XC7Packer::pack_io()
             continue;
 
         if (buf_cell->type == ctx->id("IBUFDS_GTE2")) {
-            constrain_ibufds_gtp_site(buf_cell, pad_cell->attrs[id_BEL].as_string());
+            constrain_ibufds_gt_site(buf_cell, pad_cell->attrs[id_BEL].as_string());
             auto net = buf_cell->ports[ctx->id("O")].net;
-            if (net != nullptr && net->users.size() == 1) {
-                auto user_cell = net->users[0].cell;
-                if (user_cell->type != id_GTPE2_COMMON)
-                    log_error("IBUFDS_GTE2 instance %s output port must be connected to a GTPE2_COMMON instance, but is instead connected to an instance %s of type %s\n",
-                        buf_cell->name.c_str(ctx), user_cell->name.c_str(ctx), user_cell->type.c_str(ctx));
-                constrain_gtp(pad_cell, user_cell);
+            if (net == nullptr)
+                log_error("IBUFDS_GTE2 instance %s output port is not connected\n", buf_cell->name.c_str(ctx));
+            // Scan users of IBUFDS_GTE2.O.  Accepted silicon-legal patterns:
+            //   - GTXE2_COMMON / GTPE2_COMMON (QPLL clustering)
+            //   - GTXE2_CHANNEL direct (CPLL mode)
+            //   - BUFG / BUFH / BUFHCE / BUFR (MGT REFCLK routed straight
+            //     into a fabric clock buffer — used by the VC707 telegraph
+            //     SGMIICLK path: IBUFDS_GTE2 -> BUFG -> 125 MHz fabric clock)
+            CellInfo *gt_common = nullptr;
+            bool has_gtxe2_channel_direct = false;
+            bool has_bufg_direct = false;
+            for (auto &usr : net->users) {
+                if (usr.cell->type == id_GTPE2_COMMON || usr.cell->type == id_GTXE2_COMMON)
+                    gt_common = usr.cell;
+                else if (usr.cell->type == id_GTXE2_CHANNEL)
+                    has_gtxe2_channel_direct = true;
+                else if (usr.cell->type == ctx->id("BUFG")
+                      || usr.cell->type == ctx->id("BUFH")
+                      || usr.cell->type == ctx->id("BUFHCE")
+                      || usr.cell->type == ctx->id("BUFR"))
+                    has_bufg_direct = true;
+            }
+            if (gt_common) {
+                constrain_gt(pad_cell, gt_common);
                 continue;
-            } else log_error("IBUFDS_GTE2 instance %s output port is not connected, or connected to multiple cells\n", buf_cell->name.c_str(ctx));
+            }
+            // GTX CPLL mode: GTXE2_CHANNEL already directly connected (second pad pass).
+            if (has_gtxe2_channel_direct)
+                continue;
+            // Direct fabric clock buffer — no GT* clustering needed.
+            if (has_bufg_direct)
+                continue;
+            log_error("IBUFDS_GTE2 instance %s output port must be connected to "
+                      "a GTPE2_COMMON, GTXE2_COMMON, GTXE2_CHANNEL, or BUFG/BUFH/BUFR\n",
+                buf_cell->name.c_str(ctx));
         }
 
-        // This OBUF is integrated into the GTP channel pad and does not need placing
+        // This OBUF is integrated into the GTP/GTX channel pad and does not need placing
         if (buf_cell->type == ctx->id("OBUF")) {
             auto net = buf_cell->ports[ctx->id("I")].net;
             if (net != nullptr) {
                 auto driver_cell = net->driver.cell;
-                if (driver_cell != nullptr && driver_cell->type == ctx->id("GTPE2_CHANNEL")) {
+                if (driver_cell != nullptr && (driver_cell->type == id_GTPE2_CHANNEL || driver_cell->type == id_GTXE2_CHANNEL)) {
                     packed_cells.insert(buf_cell->name);
-                    constrain_gtp(pad_cell, driver_cell);
+                    constrain_gt(pad_cell, driver_cell);
                     continue;
                 }
             }
         }
-        // This IBUF is integrated into the GTP channel pad and does not need placing
+        // This IBUF is integrated into the GTP/GTX channel pad and does not need placing
         if (buf_cell->type == ctx->id("IBUF")) {
             auto net = buf_cell->ports[ctx->id("O")].net;
             if (net != nullptr && net->users.size() == 1) {
                 auto user_cell = net->users[0].cell;
-                if (user_cell->type == ctx->id("GTPE2_CHANNEL")) {
+                if (user_cell->type == id_GTPE2_CHANNEL || user_cell->type == id_GTXE2_CHANNEL) {
                     packed_cells.insert(buf_cell->name);
-                    constrain_gtp(pad_cell, user_cell);
+                    constrain_gt(pad_cell, user_cell);
                     continue;
                 }
             }
@@ -653,6 +681,7 @@ void XC7Packer::pack_io()
         CellInfo *ci = cell.second;
         // GTP bufs don't need transforming, they are hardwired
         if (boost::starts_with(ci->type.str(ctx), "GTP")) continue;
+        if (boost::starts_with(ci->type.str(ctx), "GTX")) continue;
         if (boost::starts_with(ci->type.str(ctx), "IBUFDS_GTE2")) continue;
         if (!ci->attrs.count(ctx->id("BEL")))
             continue;
@@ -665,7 +694,10 @@ void XC7Packer::pack_io()
         else if (belname.substr(pos+1, 5) == "IOB33")
             rules = hriobuf_rules;
         else
-            log_error("Unexpected IOBUF BEL %s\n", belname.c_str());
+            // Cell has a BEL attribute that isn't an IOB — most likely a
+            // SLICE/CLB/etc. cell that was pinned via JSON.  Skip it; the
+            // SLICE-bound BEL is enforced later by the placer.
+            continue;
         if (rules.count(ci->type)) {
             xform_cell(rules, ci);
         }
@@ -679,6 +711,7 @@ void XC7Packer::pack_io()
     hrio_rules[ctx->id("INV")].port_xform[ctx->id("O")] = ctx->id("OUT");
 
     hrio_rules[ctx->id("PS7")].new_type = ctx->id("PS7_PS7");
+    hrio_rules[ctx->id("PCIE_2_1")].new_type = ctx->id("PCIE_2_1_PCIE_2_1");
 
     generic_xform(hrio_rules, true);
 
@@ -1032,37 +1065,96 @@ void XC7Packer::pack_iologic()
             fold_inverter(ci, "CLK");
 
             ci->attrs[ctx->id("BEL")] = ol_site + (is_tristate ? "/TFF" : "/OUTFF");
-        } else if (ci->type == ctx->id("OSERDESE2")) {
+        } else if (ci->type == id_OSERDESE2) {
             // according to ug953 they should be left unconnected or connected to ground
             // when not in slave mode, which is the same, since there are no wire routes to GND
             NetInfo *shiftin1 = get_net_or_empty(ci, ctx->id("SHIFTIN1"));
-            if (shiftin1 != nullptr && shiftin1->name == ctx->id("$PACKER_GND_NET")) disconnect_port(ctx, ci, ctx->id("SHIFTIN1"));
+            if (shiftin1 != nullptr && shiftin1->name == ctx->id("$PACKER_GND_NET")) { disconnect_port(ctx, ci, ctx->id("SHIFTIN1")); shiftin1 = nullptr; }
             NetInfo *shiftin2 = get_net_or_empty(ci, ctx->id("SHIFTIN2"));
-            if (shiftin2 != nullptr && shiftin2->name == ctx->id("$PACKER_GND_NET")) disconnect_port(ctx, ci, ctx->id("SHIFTIN2"));
-
+            if (shiftin2 != nullptr && shiftin2->name == ctx->id("$PACKER_GND_NET")) { disconnect_port(ctx, ci, ctx->id("SHIFTIN2")); shiftin2 = nullptr; }
             // If this is tied to GND it's just unused. This does not have a route to GND anyway.
             NetInfo *tbytein = get_net_or_empty(ci, ctx->id("TBYTEIN"));
             if (tbytein != nullptr && tbytein->name == ctx->id("$PACKER_GND_NET")) disconnect_port(ctx, ci, ctx->id("TBYTEIN"));
+            
+            std::string serdes_mode = str_or_default(ci->params, ctx->id("SERDES_MODE"), "MASTER");
+            if (serdes_mode == "MASTER") {
+                NetInfo *q = get_net_or_empty(ci, ctx->id("OQ"));
+                NetInfo *ofb = get_net_or_empty(ci, ctx->id("OFB"));
+                bool q_disconnected = q == nullptr || q->users.empty();
+                bool ofb_disconnected = ofb == nullptr || ofb->users.empty();
+                if (q_disconnected && ofb_disconnected) {
+                    log_error("%s '%s' has disconnected OQ/OFB output ports\n", ci->type.c_str(ctx), ctx->nameOf(ci));
+                }
+                BelId io_bel;
+                CellInfo *ob = !q_disconnected ? find_p_outbuf(q) : find_p_outbuf(ofb);
+                if (ob != nullptr) {
+                    io_bel = ctx->getBelByName(ctx->id(ob->attrs.at(id_BEL).as_string()));
+                    std::string ol_site = get_ologic_site(ctx->getBelName(io_bel).str(ctx));
+                    auto bel_name = ol_site + "/OSERDESE2";
+                    ci->attrs[id_BEL] = bel_name;
+                    used_oserdes_bels.insert(ctx->getBelByName(ctx->id(bel_name)));
 
-            NetInfo *q = get_net_or_empty(ci, ctx->id("OQ"));
-            NetInfo *ofb = get_net_or_empty(ci, ctx->id("OFB"));
-            bool q_disconnected = q == nullptr || q->users.empty();
-            bool ofb_disconnected = ofb == nullptr || ofb->users.empty();
-            if (q_disconnected && ofb_disconnected) {
-                log_error("%s '%s' has disconnected OQ/OFB output ports\n", ci->type.c_str(ctx), ctx->nameOf(ci));
-            }
-            BelId io_bel;
-            CellInfo *ob = !q_disconnected ? find_p_outbuf(q) : find_p_outbuf(ofb);
-            if (ob != nullptr) {
-                io_bel = ctx->getBelByName(ctx->id(ob->attrs.at(ctx->id("BEL")).as_string()));
-                std::string ol_site = get_ologic_site(ctx->getBelName(io_bel).str(ctx));
-                auto bel_name = ol_site + "/OSERDESE2";
-                ci->attrs[ctx->id("BEL")] = bel_name;
-                used_oserdes_bels.insert(ctx->getBelByName(ctx->id(bel_name)));
-            } else if (ofb->users.size() == 1 && ofb->users.at(0).cell->type == ctx->id("ISERDESE2")) {
-                unconstrained_oserdes.insert(ci);
+                    if (shiftin1 != nullptr || shiftin2 != nullptr) {
+                        // slave location is one below master, so place the slave there
+                        std::vector<std::string> parts;
+                        boost::split(parts, bel_name, boost::is_any_of("Y"));
+                        auto y_coord_slave = std::stoi(parts.back()) - 1;
+                        auto slave_bel_name = parts.front() + "Y" + std::to_string(y_coord_slave) + "/OSERDESE2";
+
+                        CellInfo *slave_cell;
+                        if (shiftin1 != nullptr) slave_cell = shiftin1->driver.cell;
+                        else slave_cell = shiftin2->driver.cell;
+                        slave_cell->attrs[id_BEL] = slave_bel_name;
+                        used_oserdes_bels.insert(ctx->getBelByName(ctx->id(slave_bel_name)));
+                    }
+                } else if (ofb->users.size() == 1 && ofb->users.at(0).cell->type == ctx->id("ISERDESE2")) {
+                    unconstrained_oserdes.insert(ci);
+                } else {
+                    log_error("%s '%s' has illegal fanout on OQ or OFB output. This means that it is not connected to a corresponding OLOGIC BEL.\n", 
+                              ci->type.c_str(ctx), ctx->nameOf(ci));
+                }
+                auto check_shiftin = [&] (NetInfo *shiftin) {
+                    if (shiftin != nullptr) {
+                        auto driver = shiftin->driver.cell;
+                        auto driver_mode = str_or_default(driver->params, ctx->id("SERDES_MODE"), "MASTER");
+                        if (driver_mode != "SLAVE")
+                            log_error("%s '%s' can only be connected to the SHIFTOUT port of another slave OSERDESE2, but is connected to this master: '%s'\n",
+                                      ci->type.c_str(ctx), ctx->nameOf(ci), driver->name.c_str(ctx));
+                        if (!boost::starts_with(shiftin->driver.port.str(ctx), "SHIFTOUT")) {
+                            log_error("%s '%s' can only be connected to the SHIFTOUT port of another OSERDESE2, but is connected to port: '%s'\n",
+                                      ci->type.c_str(ctx), ctx->nameOf(ci), shiftin->driver.port.c_str(ctx));
+                        }
+                    }
+                };
+                check_shiftin(shiftin1);
+                check_shiftin(shiftin2);
             } else {
-                log_error("%s '%s' has illegal fanout on OQ or OFB output\n", ci->type.c_str(ctx), ctx->nameOf(ci));
+                if (serdes_mode != "SLAVE")
+                    log_error("%s '%s' has invalid SERDES_MODE '%s'. Valid modes are: MASTER, SLAVE.'\n",
+                              ci->type.c_str(ctx), ctx->nameOf(ci), serdes_mode.c_str());
+
+                NetInfo *shiftout1 = get_net_or_empty(ci, ctx->id("SHIFTOUT1"));
+                NetInfo *shiftout2 = get_net_or_empty(ci, ctx->id("SHIFTOUT2"));
+                auto check_shiftout = [&] (NetInfo *shiftout) {
+                    if (shiftout == nullptr)
+                        log_warning("%s '%s' is in slave mode, but has unconnected SHIFTOUT1 or SHIFTOUT2 port\n",
+                                    ci->type.c_str(ctx), ctx->nameOf(ci));
+                    else if (shiftout->users.size() == 1) {
+                            auto user = shiftout->users.at(0);
+                            auto user_mode = str_or_default(user.cell->params, ctx->id("SERDES_MODE"), "MASTER");
+                            if (user_mode != "MASTER")
+                                log_error("%s '%s' can only be connected to the SHIFTIN port of another master OSERDESE2, but is connected to this slave: '%s'\n",
+                                          ci->type.c_str(ctx), ctx->nameOf(ci), user.cell->name.c_str(ctx));
+                            if (!boost::starts_with(user.port.str(ctx), "SHIFTIN"))
+                                log_error("%s '%s' can only be connected to the SHIFTIN port of another OSERDESE2, but is connected to port: '%s'\n",
+                                          ci->type.c_str(ctx), ctx->nameOf(ci), user.port.c_str(ctx));
+                    } else {
+                        log_error("%s '%s' has multiple fanout on a SHIFTOUT port, which is not allowed.\n",
+                                  ci->type.c_str(ctx), ctx->nameOf(ci));
+                    }
+                };
+                check_shiftout(shiftout1);
+                check_shiftout(shiftout2);
             }
         } else if (ci->type == ctx->id("IDDR") || ci->type == ctx->id("IDDR_2CLK")) {
             fold_inverter(ci, "C");
@@ -1091,20 +1183,20 @@ void XC7Packer::pack_iologic()
 
             std::string iol_site = get_ilogic_site(ctx->getBelName(io_bel).str(ctx));
             ci->attrs[ctx->id("BEL")] = iol_site + "/IFF";
-        } else if (ci->type == ctx->id("ISERDESE2")) {
+        } else if (ci->type == id_ISERDESE2) {
             fold_inverter(ci, "CLKB");
             fold_inverter(ci, "OCLKB");
 
-            bool ofb_used = str_or_default(ci->params, ctx->id("OFB_USED"), "FALSE") == "TRUE";
-            std::string iobdelay = str_or_default(ci->params, ctx->id("IOBDELAY"), "NONE");
+            bool ofb_used = str_or_default(ci->params, id_OFB_USED, "FALSE") == "TRUE";
+            std::string iobdelay = str_or_default(ci->params, id_IOBDELAY, "NONE");
 
             if (ofb_used) {
                 BelId bel;
-                NetInfo *d = get_net_or_empty(ci, ctx->id("OFB"));
+                NetInfo *d = get_net_or_empty(ci, id_OFB);
                 if (d == nullptr || d->driver.cell == nullptr)
                     log_error("%s '%s' has disconnected OFB input\n", ci->type.c_str(ctx), ctx->nameOf(ci));
                 CellInfo *drv = d->driver.cell;
-                if (boost::contains(drv->type.str(ctx), "OSERDESE2") && d->driver.port == ctx->id("OFB")) {
+                if (boost::contains(drv->type.str(ctx), "OSERDESE2") && d->driver.port == id_OFB) {
                     // We place this later, when we place the OSERDESE2, see below
                 } else
                     log_error("%s '%s' has OFB input connected to illegal cell type %s\n", ci->type.c_str(ctx),
@@ -1112,23 +1204,28 @@ void XC7Packer::pack_iologic()
             } else {
                 BelId io_bel;
                 if (iobdelay == "IFD") {
-                    NetInfo *d = get_net_or_empty(ci, ctx->id("DDLY"));
+                    // disconnect constant D/SHIFTIN1/2 ports, if DDLY is used, as vivado does
+                    disconnect_constant_port(ci, id_D);
+                    disconnect_constant_port(ci, ctx->id("SHIFTIN1"));
+                    disconnect_constant_port(ci, ctx->id("SHIFTIN2"));
+
+                    NetInfo *d = get_net_or_empty(ci, id_DDLY);
                     if (d == nullptr || d->driver.cell == nullptr)
                         log_error("%s '%s' has disconnected DDLY input\n", ci->type.c_str(ctx), ctx->nameOf(ci));
                     CellInfo *drv = d->driver.cell;
-                    if (boost::contains(drv->type.str(ctx), "IDELAYE2") && d->driver.port == ctx->id("DATAOUT"))
+                    if (boost::contains(drv->type.str(ctx), "IDELAYE2") && d->driver.port == id_DATAOUT)
                         io_bel = iodelay_to_io.at(drv->name);
                     else
                         log_error("%s '%s' has DDLY input connected to illegal cell type %s\n", ci->type.c_str(ctx),
                                 ctx->nameOf(ci), drv->type.c_str(ctx));
                 } else if (iobdelay == "NONE") {
-                    NetInfo *d = get_net_or_empty(ci, ctx->id("D"));
+                    NetInfo *d = get_net_or_empty(ci, id_D);
                     if (d == nullptr || d->driver.cell == nullptr)
                         log_error("%s '%s' has disconnected D input\n", ci->type.c_str(ctx), ctx->nameOf(ci));
                     CellInfo *drv = d->driver.cell;
                     if (   boost::contains(drv->type.str(ctx), "INBUF_EN")
                         || boost::contains(drv->type.str(ctx), "INBUF_DCIEN"))
-                        io_bel = ctx->getBelByName(ctx->id(drv->attrs.at(ctx->id("BEL")).as_string()));
+                        io_bel = ctx->getBelByName(ctx->id(drv->attrs.at(id_BEL).as_string()));
                     else
                         log_error("%s '%s' has D input connected to illegal cell type %s\n", ci->type.c_str(ctx),
                                 ctx->nameOf(ci), drv->type.c_str(ctx));
@@ -1138,16 +1235,18 @@ void XC7Packer::pack_iologic()
                 }
 
                 std::string iol_site = get_ilogic_site(ctx->getBelName(io_bel).str(ctx));
-                ci->attrs[ctx->id("BEL")] = iol_site + "/ISERDESE2";
+                ci->attrs[id_BEL] = iol_site + "/ISERDESE2";
             }
         }
+
+        // disconnect some ports that vivado also disconnects when wired to constant
+        disconnect_constant_port(ci, id_CLKDIVP);
     }
 
     // place OSERDESE2 which are not connected to an output, but to another ISERDESE2 via OFB
     std::queue<BelId> available_oserdes_bels;
-    IdString oserdes_id = ctx->id("OSERDESE2_OSERDESE2");
     for (auto bel : ctx->getBels()) {
-        if (ctx->getBelType(bel) != oserdes_id)
+        if (ctx->getBelType(bel) != id_OSERDESE2_OSERDESE2)
             continue;
         if (used_oserdes_bels.count(bel))
             continue;
@@ -1162,17 +1261,17 @@ void XC7Packer::pack_iologic()
                 unconstr_oserdes);
         }
         auto oserdes_bel_name = std::string(ctx->nameOfBel(available_oserdes_bels.front()));
-        ci->attrs[ctx->id("BEL")] = oserdes_bel_name;
+        ci->attrs[id_BEL] = oserdes_bel_name;
 
-        NetInfo *d = get_net_or_empty(ci, ctx->id("OFB"));
+        NetInfo *d = get_net_or_empty(ci, id_OFB);
         NPNR_ASSERT_MSG(d != nullptr, "Only OSERDESE2 with connected OFB should be unconstrained at this point");
         NPNR_ASSERT_MSG(d->users.size() == 1, "OSERDESE2 OFB can only be connected to one cell");
         auto iserdes = d->users.at(0).cell;
         std::string iserdes_bel_name = oserdes_bel_name;
         boost::replace_all(iserdes_bel_name, "OLOGIC", "ILOGIC");
         boost::replace_all(iserdes_bel_name, "OSERDES", "ISERDES");
-        NPNR_ASSERT_MSG(iserdes->attrs.count(ctx->id("BEL"))  == 0, "ISERDESE2 which is connected to OFB of OSERDESE2 already placed");
-        iserdes->attrs[ctx->id("BEL")] = iserdes_bel_name;
+        NPNR_ASSERT_MSG(iserdes->attrs.count(id_BEL)  == 0, "ISERDESE2 which is connected to OFB of OSERDESE2 already placed");
+        iserdes->attrs[id_BEL] = iserdes_bel_name;
         available_oserdes_bels.pop();
     }
 
@@ -1183,42 +1282,41 @@ void XC7Packer::pack_iologic()
 
 void XC7Packer::pack_idelayctrl()
 {
-    auto get_iodelay_group_number = [&](CellInfo * ci) {
-        int64_t group_number = -1;
+    auto get_iodelay_group_name = [&](CellInfo * ci) {
+        std::string group_name = "";
         auto iodelay_group = ci->attrs.find(ctx->id("IODELAY_GROUP"));
         if (iodelay_group != ci->attrs.end()) {
-            group_number = (*iodelay_group).second.as_int64();
+            group_name = (*iodelay_group).second.as_string();
         }
-        return group_number;
+        return group_name;
     };
 
-    std::unordered_map<int64_t, CellInfo *> idelayctrl_map;
+    std::unordered_map<std::string, CellInfo *> idelayctrl_map;
     for (auto cell : sorted(ctx->cells)) {
         CellInfo *ci = cell.second;
         if (ci->type == ctx->id("IDELAYCTRL")) {
-            int64_t group_number = get_iodelay_group_number(ci);
-            if (0 < idelayctrl_map.count(group_number)) {
-                if (group_number == -1)
+            std::string group_name = get_iodelay_group_name(ci);
+            if (0 < idelayctrl_map.count(group_name)) {
+                if (group_name == "")
                     log_error("Found more than one IDELAYCTRL cell for the default IODELAY_GROUP!\n");
                 else
-                    log_error("Found more than one IDELAYCTRL cell for the IODELAY_GROUP with number %ld!\n", group_number);
+                    log_error("Found more than one IDELAYCTRL cell for the IODELAY_GROUP with name %s!\n", group_name.c_str());
             }
-            idelayctrl_map[group_number] = ci;
+            idelayctrl_map[group_name] = ci;
         }
     }
     if (idelayctrl_map.empty())
         return;
     for (auto group : idelayctrl_map)
     {
-        auto group_number = group.first;
+        auto group_name = group.first;
         auto idelayctrl = group.second;
-        auto group_name = group_number == -1 ? "default" : std::to_string(group_number);
         std::set<std::string> ioctrl_sites;
         for (auto cell : sorted(ctx->cells)) {
             CellInfo *ci = cell.second;
             if (ci->type == ctx->id("IDELAYE2_IDELAYE2") || ci->type == ctx->id("ODELAYE2_ODELAYE2")) {
-                auto grp_num = get_iodelay_group_number(ci);
-                if (!ci->attrs.count(ctx->id("BEL")) || grp_num != group_number)
+                auto grp_name = get_iodelay_group_name(ci);
+                if (!ci->attrs.count(ctx->id("BEL")) || grp_name != group_name)
                     continue;
                 ioctrl_sites.insert(get_ioctrl_site(ci->attrs.at(ctx->id("X_IO_BEL")).as_string()));
             }
@@ -1299,6 +1397,17 @@ void XC7Packer::pack_cfg()
             auto bel = "BSCAN_X0Y" + std::to_string(chain - 1) + "/BSCAN";
             ci->attrs[id_BEL] = bel;
             log_info("    Constraining '%s' to site '%s'\n", ci->name.c_str(ctx), bel.c_str());
+        } else if (ci->type == id_STARTUP_STARTUP || ci->type == id_DCIRESET_DCIRESET ||
+                   ci->type == id_DNA_PORT_DNA_PORT || ci->type == id_EFUSE_USR_EFUSE_USR ||
+                   ci->type == id_ICAP_ICAP || ci->type == id_FRAME_ECC_FRAME_ECC ||
+                   ci->type == id_USR_ACCESS_USR_ACCESS) {
+            // These configuration primitives live in a single dedicated site each. The
+            // placer has no way to discover that site on its own, so without an explicit
+            // preplacement it aborts with "Unable to find legal placement for cell". BSCAN
+            // above is the exception only because JTAG_CHAIN already names its site.
+            // Affects any design that instantiates e.g. STARTUPE2 to source a clock from
+            // CFGMCLK, or ICAPE2 / DNA_PORT for configuration access.
+            preplace_unique(ci);
         }
     }
 }
