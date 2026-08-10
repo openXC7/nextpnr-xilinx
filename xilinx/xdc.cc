@@ -102,6 +102,9 @@ void Arch::parseXdc(std::istream &in)
         IdString cellname = id(strip_quotes(split_name));
         if (cells.count(cellname))
             tgt_cells.push_back(cells.at(cellname).get());
+        else
+            log_warning("%s: no cell named '%s' (on line %d) - this target is ignored\n",
+                        split.front().c_str(), cellname.c_str(this), lineno);
         return tgt_cells;
     };
 
@@ -122,6 +125,9 @@ void Arch::parseXdc(std::istream &in)
         NetInfo *maybe_net = getNetByAlias(netname);
         if (maybe_net != nullptr)
             tgt_nets.push_back(maybe_net);
+        else
+            log_warning("%s: no net or port named '%s' (on line %d) - this target is ignored\n",
+                        split.front().c_str(), netname.c_str(this), lineno);
         return tgt_nets;
     };
 
@@ -192,6 +198,11 @@ void Arch::parseXdc(std::istream &in)
                 continue;
             }
             std::vector<NetInfo *> dest = get_nets(arguments.at(cursor));
+            if (dest.empty())
+                log_warning("create_clock: target %s matched nothing, so the %.3f ns constraint "
+                            "was NOT applied (on line %d). The clock domain keeps the default "
+                            "target and will be reported as meeting timing at that default.\n",
+                            arguments.at(cursor).c_str(), period, lineno);
             for (auto n : dest) {
                 n->clkconstr = std::unique_ptr<ClockConstraint>(new ClockConstraint);
                 n->clkconstr->period = getDelayFromNS(period);
