@@ -1691,6 +1691,13 @@ struct FasmBackend
             // overriding the cell's own parameter -- which defaults to 4 in the library.
             if (int_or_default(ci->params, ctx->id("TRISTATE_WIDTH"), 4) == 4)
                 write_bit("TRISTATE_WIDTH.W4");
+            // An explicitly requested CLKDIV inversion on an OSERDESE2 was discarded:
+            // the bit is documented (OLOGIC_Y*.IS_CLKDIV_INVERTED) and was written
+            // nowhere.  It sits on the OLOGIC, not inside the OSERDES prefix.
+            pop();
+            write_bit("IS_CLKDIV_INVERTED",
+                      bool_or_default(ci->params, ctx->id("IS_CLKDIV_INVERTED"), false));
+            push("OSERDES");
             if (is_slave) write_bit("SERDES_MODE.SLAVE");
 
             pop();
