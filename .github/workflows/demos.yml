@@ -82,7 +82,11 @@ jobs:
 
       - name: Build nextpnr-xilinx from this PR
         run: |
-          nix develop ./toolchain-nix --command bash -euxo pipefail -c '
+          # ci-tests devshell carries the build deps (cmake, boost,
+          # eigen); the default devshell is the toolchain env (yosys,
+          # prjxray, ...) and has no cmake -- the runner's system cmake
+          # would configure and fail the Boost lookup.
+          nix develop ./toolchain-nix#ci-tests.x86_64-linux --command bash -euxo pipefail -c '
             cmake -S nextpnr-xilinx -B build-pr \
               -DARCH=xilinx -DBUILD_GUI=OFF -DBUILD_PYTHON=OFF \
               -DUSE_OPENMP=ON -DCMAKE_BUILD_TYPE=Release \
