@@ -163,7 +163,13 @@ struct FasmBackend
                                      // without it the routethru never propagates
                                      "IDELAY_Y" + i + ".IDELAY_TYPE_FIXED",
                                      "ILOGIC_Y" + i + ".IDELMUXE3.P1",
-                                     "ILOGIC_Y" + i + ".IFF.SRTYPE.ASYNC",
+                                     // IFF.SRTYPE deliberately NOT asserted here: this is
+                                     // the COMBINATORIAL pass-through, and the IFF's set/reset
+                                     // type is no part of it.  SRTYPE.ASYNC is an all-negated
+                                     // feature (!29_67), so asserting it sets nothing but does
+                                     // actively CLEAR the bit -- which collides with an IDDR on
+                                     // the same ILOGIC site emitting IFF.SRTYPE.SYNC, and
+                                     // fasm2frames then refuses the design outright.
                                      "ILOGIC_Y" + i + ".ISERDES.MODE.MASTER",
                                      "ILOGIC_Y" + i + ".ISERDES.NUM_CE.N1",
                                      "ILOGIC_Y" + i + ".ZINV_D"
@@ -212,7 +218,8 @@ struct FasmBackend
                                 // input): IDELMUXE3.P1 = direct D path
                                 "IDELAY_Y" + i + ".IDELAY_TYPE_FIXED",
                                 "ILOGIC_Y" + i + ".IDELMUXE3.P1",
-                                "ILOGIC_Y" + i + ".IFF.SRTYPE.ASYNC",
+                                // see the LIOI3 block above: IFF.SRTYPE is not part of a
+                                // combinatorial pass-through and collides with an IDDR here
                                 "ILOGIC_Y" + i + ".ISERDES.MODE.MASTER",
                                 "ILOGIC_Y" + i + ".ISERDES.NUM_CE.N1",
                                 "ILOGIC_Y" + i + ".ZINV_D"
