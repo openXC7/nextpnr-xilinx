@@ -134,7 +134,11 @@ std::unique_ptr<CellInfo> create_cell(Context *ctx, IdString type, IdString name
         add_port("IBUFDISABLE", PORT_IN);
         add_port("INTERMDISABLE", PORT_IN);
         add_port("O", PORT_OUT);
-    } else if (type == ctx->id("IBUFDS")) {
+    } else if (type == ctx->id("IBUFDS") || type == ctx->id("IBUFGDS")) {
+        // IBUFGDS is the legacy clock-capable spelling of IBUFDS. On 7-series
+        // they are the same primitive -- UG953 documents IBUFGDS only as a
+        // Spartan-6-and-earlier name, and Vivado still accepts it -- so it is
+        // handled as an alias rather than as a separate cell. (fixes #74)
         add_port("I", PORT_IN);
         add_port("IB", PORT_IN);
         add_port("O", PORT_OUT);
