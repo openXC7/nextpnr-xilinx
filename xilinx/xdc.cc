@@ -29,6 +29,7 @@ void Arch::parseXdc(std::istream &in)
     std::string line;
     std::string linebuf;
     int lineno = 0;
+    int missing_targets = 0;
 
     auto isempty = [](const std::string &str) {
         return std::all_of(str.begin(), str.end(), [](char c) { return std::isspace(c); });
@@ -119,9 +120,16 @@ void Arch::parseXdc(std::istream &in)
         }
         if (cells.count(cellname))
             tgt_cells.push_back(cells.at(cellname).get());
-        else
-            log_warning("%s: no cell named '%s' (on line %d) - this target is ignored\n",
-                        split.front().c_str(), cellname.c_str(this), lineno);
+        else {
+            // A board-level XDC legitimately constrains every pin of the
+            // board while a design uses a subset (the standard apio/PCF
+            // practice), so these are not reportable events: stay silent
+            // like the ice40 flow does, and itemise only in verbose mode.
+            missing_targets++;
+            if (getCtx()->verbose)
+                log_info("%s: no cell named '%s' (on line %d) - this target is ignored\n", split.front().c_str(),
+                         cellname.c_str(this), lineno);
+        }
         return tgt_cells;
     };
 
@@ -147,9 +155,12 @@ void Arch::parseXdc(std::istream &in)
         }
         if (maybe_net != nullptr)
             tgt_nets.push_back(maybe_net);
-        else
-            log_warning("%s: no net or port named '%s' (on line %d) - this target is ignored\n",
-                        split.front().c_str(), netname.c_str(this), lineno);
+        else {
+            missing_targets++;
+            if (getCtx()->verbose)
+                log_info("%s: no net or port named '%s' (on line %d) - this target is ignored\n",
+                         split.front().c_str(), netname.c_str(this), lineno);
+        }
         return tgt_nets;
     };
 
@@ -289,6 +300,10 @@ void Arch::parseXdc(std::istream &in)
     }
     if (!isempty(linebuf))
         log_error("unexpected end of XDC file\n");
+    if (missing_targets > 0 && getCtx()->verbose)
+        log_info("%d XDC constraint target(s) reference ports or nets that are not in this design and were "
+                 "ignored (a board-level XDC normally constrains more pins than a design uses)\n",
+                 missing_targets);
 }
 
 NEXTPNR_NAMESPACE_END
