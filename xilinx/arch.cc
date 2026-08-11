@@ -147,7 +147,14 @@ BelId Arch::getBelByName(IdString name) const
                 break;
             }
         }
-    } else {
+    } else if (tile_by_name.count(split.first)) {
+        // Guarded to match the site_by_name branch above. An unrecognised name --
+        // a typo in a BEL attribute, most often -- used to reach .at() and throw
+        // an uncaught std::out_of_range, aborting with a libc++ message and no
+        // hint as to which cell was at fault. Returning an empty BelId instead
+        // lets the caller's own diagnostic run: placer_heap.cc:386 already says
+        // "No Bel named '<name>' located for this chip (processing BEL attribute
+        // on '<cell>')", which is the message the user needs.
         int tile = tile_by_name.at(split.first);
         auto &tile_info = chip_info->tile_types[chip_info->tile_insts[tile].type];
         IdString belname = id(split.second);
