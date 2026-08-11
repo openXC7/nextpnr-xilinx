@@ -2665,10 +2665,14 @@ struct FasmBackend
             0b1111111111001111101011111010010000000001UL
         };
         auto clkfbout_mult = (int)float_or_default(ci, "CLKFBOUT_MULT_F", 5.000);
-        if (63 < clkfbout_mult)
-            log_error("MMCME2_ADV: CLKFBOUT_MULT_F must not be greater than 63");
-        if (0 == clkfbout_mult)
-            log_error("MMCME2_ADV: CLKFBOUT_MULT_F must not be 0");
+        // lk_table[] and filter_lookup*[] hold 64 entries and are read at [mult-1].
+        // The old pair of tests rejected 0 and >63 but let every NEGATIVE value
+        // through, and (int) of an out-of-range double is undefined behaviour that
+        // differs by host -- x86-64 yields INT_MIN, arm64 saturates to INT_MAX -- so
+        // the same netlist crashed on one machine and passed on another (#78).
+        // Range-check both ends and name the offending value.
+        if (clkfbout_mult < 1 || clkfbout_mult > 64)
+            log_error("MMCME2_ADV: CLKFBOUT_MULT_F must be in the range 1..64 (got %d)\n", clkfbout_mult);
         write_int_vector("LKTABLE[39:0]", lk_table[clkfbout_mult - 1], 40);
 
         uint16_t filter_lookup_low [] = {
