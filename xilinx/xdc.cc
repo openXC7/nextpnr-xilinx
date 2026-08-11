@@ -86,6 +86,18 @@ void Arch::parseXdc(std::istream &in)
         }), s.end());
         return s;
     };
+    // Vivado calls a one-bit vector port "a[0]", but the JSON frontend collapses a
+    // width-1, offset-0 vector to the bare name "a" (get_bit_name(),
+    // frontend/frontend_base.h:367) because yosys' JSON carries nothing that tells
+    // `wire [0:0] a` apart from `wire a`. An XDC written against Vivado names
+    // therefore misses such a port, the constraint is dropped, and the design dies
+    // later with "port a of type PAD has no IOSTANDARD property" -- a message that
+    // points nowhere near the cause.  Strip a trailing "[0]" so the lookup can retry.
+    auto debus_zero = [](const std::string &str) {
+        if (str.size() > 3 && str.compare(str.size() - 3, 3, "[0]") == 0)
+            return str.substr(0, str.size() - 3);
+        return std::string();
+    };
     auto get_cells = [&](std::string str) {
         std::vector<CellInfo *> tgt_cells;
         if (str.empty() || str.front() != '[')
@@ -100,6 +112,11 @@ void Arch::parseXdc(std::istream &in)
         if (split.size() < 2)
             log_error("failed to parse target (on line %d)\n", lineno);
         IdString cellname = id(strip_quotes(split_name));
+        if (!cells.count(cellname)) {
+            std::string base = debus_zero(strip_quotes(split_name));
+            if (!base.empty() && cells.count(id(base)))
+                cellname = id(base);
+        }
         if (cells.count(cellname))
             tgt_cells.push_back(cells.at(cellname).get());
         else
@@ -123,6 +140,11 @@ void Arch::parseXdc(std::istream &in)
             log_error("failed to parse target (on line %d)\n", lineno);
         IdString netname = id(strip_quotes(split_name));
         NetInfo *maybe_net = getNetByAlias(netname);
+        if (maybe_net == nullptr) {
+            std::string base = debus_zero(strip_quotes(split_name));
+            if (!base.empty())
+                maybe_net = getNetByAlias(id(base));
+        }
         if (maybe_net != nullptr)
             tgt_nets.push_back(maybe_net);
         else
