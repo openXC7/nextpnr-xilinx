@@ -86,9 +86,15 @@ jobs:
           # eigen); the default devshell is the toolchain env (yosys,
           # prjxray, ...) and has no cmake -- the runner's system cmake
           # would configure and fail the Boost lookup.
+          #
+          # BUILD_PYTHON must stay ON: ddr3-test-arty-s7 passes
+          # `--pre-place constraints.py --pre-route show_bels.py`, and those
+          # options only exist inside #ifndef NO_PYTHON (common/command.cc:114-123).
+          # With Python off the demo dies on `unrecognised option '--pre-place'`
+          # before it reaches anything this gate is meant to test.
           nix develop ./toolchain-nix#ci-tests.x86_64-linux --command bash -euxo pipefail -c '
             cmake -S nextpnr-xilinx -B build-pr \
-              -DARCH=xilinx -DBUILD_GUI=OFF -DBUILD_PYTHON=OFF \
+              -DARCH=xilinx -DBUILD_GUI=OFF -DBUILD_PYTHON=ON \
               -DUSE_OPENMP=ON -DCMAKE_BUILD_TYPE=Release \
               -DCURRENT_GIT_VERSION=0.9.2
             cmake --build build-pr --parallel 4
