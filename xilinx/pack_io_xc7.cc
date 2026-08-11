@@ -79,6 +79,52 @@ void XC7Packer::decompose_iob(CellInfo *xil_iob, bool is_hr, const std::string &
         NPNR_ASSERT_FALSE(("can't find PAD for net " + n->name.str(ctx)).c_str());
     };
 
+    // Name a pad the way the user wrote it, so a placement complaint can be traced
+    // back to a line of XDC rather than to a site number.
+    auto pad_desc = [&](NetInfo *n, const std::string &site) {
+        std::string d;
+        for (auto user : n->users) {
+            if (user.cell->type != ctx->id("PAD"))
+                continue;
+            d = "'" + user.cell->name.str(ctx) + "'";
+            for (auto attr : {ctx->id("LOC"), ctx->id("PACKAGE_PIN")})
+                if (user.cell->attrs.count(attr)) {
+                    d += " (package pin " + user.cell->attrs.at(attr).as_string() + ")";
+                    break;
+                }
+            break;
+        }
+        if (d.empty())
+            d = "<unknown pad>";
+        return d + " at site " + site;
+    };
+
+    // A differential pair is the master (P) and slave (N) site of ONE IOB tile, and only
+    // the master site carries the M bels.  Constraining P to an N pin, or splitting the
+    // pair across two tiles, therefore fails later as a BEL lookup -- "No Bel named
+    // 'IOB_X1Y147/IOB33M/OUTBUF' located for this chip" -- which says nothing about the
+    // pins the user actually wrote.  Check it up front and say what is wrong. (fixes #9)
+    auto check_diff_pair = [&](NetInfo *p_net, NetInfo *n_net, const std::string &site_p,
+                               const std::string &site_n, bool is18, const char *m_bel, const char *s_bel) {
+        auto has_bel = [&](const std::string &name) { return ctx->getBelByName(ctx->id(name)) != BelId(); };
+        bool p_is_master = has_bel(site_p + m_bel);
+        bool n_is_slave = has_bel(site_n + s_bel);
+        bool same_tile = get_tilename_by_sitename(ctx, site_p) == get_tilename_by_sitename(ctx, site_n);
+        if (p_is_master && n_is_slave && same_tile)
+            return;
+        const char *why = !p_is_master ? "its P side is constrained to the N (slave) pin of a pair"
+                          : !n_is_slave ? "its N side is constrained to a P (master) pin"
+                                        : "the two pins are not the two halves of one differential pair";
+        log_error("%s '%s' cannot be placed: %s.\n"
+                  "       P side: %s\n"
+                  "       N side: %s\n"
+                  "       Constrain the P port to an IO_L<n>P_... pin and the N port to the matching\n"
+                  "       IO_L<n>N_... pin of the same pair (see package_pins.csv for the part).\n",
+                  xil_iob->type.c_str(ctx), xil_iob->name.c_str(ctx), why,
+                  pad_desc(p_net, site_p).c_str(), pad_desc(n_net, site_n).c_str());
+        (void)is18;
+    };
+
     /*
      * IO primitives in Xilinx are complex "macros" that usually expand to more than one BEL
      * To avoid various nasty bugs (such as auto-transformation by Vivado of dedicated INV primitives to LUT1s), we
@@ -208,6 +254,10 @@ void XC7Packer::decompose_iob(CellInfo *xil_iob, bool is_hr, const std::string &
             inv->attrs[ctx->id("BEL")] = site_n + "/IOB33S/O_ININV";
             inv->attrs[ctx->id("X_IOB_SITE_TYPE")] = std::string("IOB33S");
         }
+
+        check_diff_pair(pad_p_net, pad_n_net, site_p, site_n, is_riob18,
+                        is_riob18 ? "/IOB18M/OUTBUF_DCIEN" : "/IOB33M/OUTBUF",
+                        is_riob18 ? "/IOB18S/OUTBUF_DCIEN" : "/IOB33S/OUTBUF");
 
         bool has_dci = xil_iob->type == ctx->id("IOBUFDS_DCIEN") || xil_iob->type == ctx->id("IOBUFDSE3");
 
