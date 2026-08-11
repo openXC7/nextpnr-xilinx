@@ -1117,8 +1117,18 @@ void XC7Packer::pack_idelayctrl()
                 ioctrl_sites.insert(get_ioctrl_site(ci->attrs.at(ctx->id("X_IO_BEL")).as_string()));
             }
         }
-        if (ioctrl_sites.empty())
-            log_error("Found IDELAYCTRL but no I/ODELAYs in group %s\n", group_name.c_str());
+        if (ioctrl_sites.empty()) {
+            // An IDELAYCTRL whose group contains no I/ODELAYs is useless but legal --
+            // Vivado places it and drives RDY rather than rejecting the design, and a
+            // design can legitimately arrive here after optimisation removed the last
+            // delay element. Warn instead of failing the build. (fixes #60)
+            //
+            // The continue is load-bearing, not tidiness: falling through leaves
+            // dup_rdys empty and the RDY-AND tree below calls dup_rdys.front() on it.
+            log_warning("Found IDELAYCTRL '%s' but no I/ODELAYs in group %s; leaving it unreplicated\n",
+                        ctx->nameOf(idelayctrl), group_name.empty() ? "default" : group_name.c_str());
+            continue;
+        }
         NetInfo *rdy = get_net_or_empty(idelayctrl, ctx->id("RDY"));
         disconnect_port(ctx, idelayctrl, ctx->id("RDY"));
         std::vector<NetInfo *> dup_rdys;
