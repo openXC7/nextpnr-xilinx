@@ -421,6 +421,79 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
             get_net_or_empty(l5, id_A6) != nullptr)
             return false;
     }
+    // Per-position site-exit (OUTMUX) budget, run UNCONDITIONALLY.  Each
+    // letter position has exactly ONE selectable output pin ([A-D]MUX: O5,
+    // XOR=carry O, CY=carry CO, A5Q, ...) besides the dedicated O6 pin and
+    // the FF's Q.  The packer/legaliser could co-locate a 5LUT with fabric
+    // consumers, a carry whose O feeds an off-position FF (or fabric), and
+    // more -- each needing that one pin.  The router then inherits an
+    // unroutable site: "Failed to route arc ... CARRY4_O3 to AFFMUX_OUT"
+    // (litex deephier @ seed 4), and the same shape breaks silicon in the
+    // O+CO fanout case (#134).  Reject any position with more than one
+    // OUTMUX claimant so the legaliser keeps searching instead.
+    for (int h = 0; h < 2; h++) {
+        CellInfo *cy = lts.cells[(h << 6) | BEL_CARRY4];
+        for (int k = 0; k < 4; k++) {
+            int eighth = h * 4 + k;
+            CellInfo *l6 = lts.cells[(eighth << 4) | BEL_6LUT];
+            CellInfo *l5 = lts.cells[(eighth << 4) | BEL_5LUT];
+            CellInfo *ff1 = lts.cells[(eighth << 4) | BEL_FF];
+            CellInfo *ff2 = lts.cells[(eighth << 4) | BEL_FF2];
+            // in-position sinks that do NOT need the OUTMUX
+            auto is_local_sink = [&](const PortRef &usr, NetInfo *net) {
+                if (usr.cell == ff1 && ff1 != nullptr && ff1->ffInfo.d == net)
+                    return true; // main FF via xFFMUX
+                if (usr.cell == ff2 && ff2 != nullptr && ff2->ffInfo.d == net)
+                    return true; // 5FF via xFF5MUX
+                if (usr.cell == cy)
+                    return true; // carry S/DI/CIN feed
+                if (usr.cell == l6 || usr.cell == l5)
+                    return true; // intra-position feed (routethru cases)
+                return false;
+            };
+            auto has_external_user = [&](NetInfo *net) {
+                if (net == nullptr)
+                    return false;
+                for (auto &usr : net->users)
+                    if (!is_local_sink(usr, net))
+                        return true;
+                return false;
+            };
+            int claims = 0;
+            // O5 of a used 5LUT (O6 has its own pin; DI feed-throughs and
+            // in-position FF feeds are local)
+            if (l5 != nullptr && !l5->lutInfo.only_drives_carry && !l5->lutInfo.is_memory && !l5->lutInfo.is_srl &&
+                has_external_user(l5->lutInfo.output_sigs[0]))
+                claims++;
+            if (cy != nullptr) {
+                // carry sum O_k beyond the in-position FF
+                if (has_external_user(cy->carryInfo.out_sigs[k]))
+                    claims++;
+                // carry CO_k beyond the chain continuation
+                NetInfo *co = cy->carryInfo.cout_sigs[k];
+                if (co != nullptr) {
+                    for (auto &usr : co->users) {
+                        if (usr.cell != nullptr && usr.cell->type == id_CARRY4 && usr.port == id_CIN)
+                            continue; // chain continuation (k==3) uses the dedicated COUT
+                        if (is_local_sink(usr, co))
+                            continue;
+                        claims++;
+                        break;
+                    }
+                }
+            }
+            // 5FF Q has no dedicated pin: fabric consumers go through OUTMUX
+            if (ff2 != nullptr) {
+                NetInfo *q2 = get_net_or_empty(ff2, id_Q);
+                if (q2 != nullptr && q2->users.size() > 0)
+                    claims++;
+            }
+            if (claims > 1) {
+                DBG();
+                return false;
+            }
+        }
+    }
     bool tile_is_memory = false;
     if (lts.cells[(3 << 4) | BEL_6LUT] != nullptr && lts.cells[(3 << 4) | BEL_6LUT]->lutInfo.is_memory)
         tile_is_memory = true;
@@ -620,9 +693,17 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
             if (ff1 != nullptr && ff1->ffInfo.d != nullptr && ff1->ffInfo.d->driver.cell != nullptr) {
                 auto &drv = ff1->ffInfo.d->driver;
                 if ((drv.cell == lut6 && drv.port != id_MC31) || drv.cell == lut5 || drv.cell == out_fmux ||
-                    (carry4 != nullptr && drv.cell == carry4)) {
-                    // Direct, OK (LUT O6/O5, F7/F8 mux out, or the slot's
-                    // CARRY4 O/CO via the XOR/CY xFFMUX paths)
+                    (carry4 != nullptr && drv.cell == carry4 &&
+                     (carry4->carryInfo.out_sigs[i % 4] == ff1->ffInfo.d ||
+                      carry4->carryInfo.cout_sigs[i % 4] == ff1->ffInfo.d))) {
+                    // Direct, OK (LUT O6/O5, F7/F8 mux out, or THIS
+                    // position's CARRY4 O/CO via the XOR/CY xFFMUX paths.
+                    // The position check matters: an FF fed by another
+                    // position's carry output used to pass as "direct" here,
+                    // but position A's FFMUX cannot see O3 -- that data can
+                    // only arrive through the fabric and the X pin, so it
+                    // must be accounted as an X user like any other
+                    // indirect feed.)
                 } else if (ff1->attrs.count(id_BEL) && (lut6 == nullptr || lut5 == nullptr)) {
                     // Imported (Vivado-placed) FF with a free LUT position in
                     // the slot: Vivado feeds the main FF through a LUT
