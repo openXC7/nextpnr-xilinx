@@ -153,3 +153,16 @@ jobs:
               fi
             done
           EOF
+
+      # Built bitstreams are the primary debugging output of this gate;
+      # the runner workspace dies with the job, so publish them.
+      # Kept on failure too -- a broken bitstream is usually what the
+      # failing PR is about. Download: run page -> Artifacts, or
+      #   gh run download <run-id> -R openXC7/nextpnr-xilinx -n 'bitstreams-*'
+      - name: Upload bitstreams
+        if: always()
+        uses: actions/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3 # v4.3.4
+        with:
+          name: bitstreams-${{ matrix.part }}
+          path: demo-projects/*/*.bit
+          if-no-files-found: warn
