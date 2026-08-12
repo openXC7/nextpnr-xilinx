@@ -2425,9 +2425,12 @@ struct FasmBackend
         push(get_tile_name(ci->bel.tile));
         push("PLLE2_ADV");
         write_bit("IN_USE");
-        // FIXME: should be INV not ZINV (XRay error?)
-        write_bit("ZINV_PWRDWN", bool_or_default(ci->params, ctx->id("IS_PWRDWN_INVERTED"), false));
-        write_bit("ZINV_RST", bool_or_default(ci->params, ctx->id("IS_RST_INVERTED"), false));
+        // ZINV_x is asserted when the signal is NOT inverted.  prjxray's CMT fuzzers
+        // tag it as `add_site_tag(site, 'ZINV_' + reg, 1 ^ IS_<reg>_INVERTED)`
+        // (031-cmt-mmcm/generate.py:46, 032-cmt-pll), the same convention as every
+        // other ZINV_ in this file.  INV_CLKINSEL really is direct (invert=0 there).
+        write_bit("ZINV_PWRDWN", !bool_or_default(ci->params, ctx->id("IS_PWRDWN_INVERTED"), false));
+        write_bit("ZINV_RST", !bool_or_default(ci->params, ctx->id("IS_RST_INVERTED"), false));
         write_bit("INV_CLKINSEL", bool_or_default(ci->params, ctx->id("IS_CLKINSEL_INVERTED"), false));
         write_pll_clkout("DIVCLK", ci);
         write_pll_clkout("CLKFBOUT", ci);
@@ -2609,11 +2612,14 @@ struct FasmBackend
         push(get_tile_name(ci->bel.tile));
         push("MMCME2_ADV");
         write_bit("IN_USE");
-        // FIXME: should be INV not ZINV (XRay error?)
-        write_bit("ZINV_PWRDWN", bool_or_default(ci->params, id_IS_PWRDWN_INVERTED, false));
-        write_bit("ZINV_RST", bool_or_default(ci->params, id_IS_RST_INVERTED, false));
-        write_bit("ZINV_PSEN", bool_or_default(ci->params, id_IS_PSEN_INVERTED, false));
-        write_bit("ZINV_PSINCDEC", bool_or_default(ci->params, id_IS_PSINCDEC_INVERTED, false));
+        // ZINV_x is asserted when the signal is NOT inverted.  prjxray's CMT fuzzers
+        // tag it as `add_site_tag(site, 'ZINV_' + reg, 1 ^ IS_<reg>_INVERTED)`
+        // (031-cmt-mmcm/generate.py:46, 032-cmt-pll), the same convention as every
+        // other ZINV_ in this file.  INV_CLKINSEL really is direct (invert=0 there).
+        write_bit("ZINV_PWRDWN", !bool_or_default(ci->params, id_IS_PWRDWN_INVERTED, false));
+        write_bit("ZINV_RST", !bool_or_default(ci->params, id_IS_RST_INVERTED, false));
+        write_bit("ZINV_PSEN", !bool_or_default(ci->params, id_IS_PSEN_INVERTED, false));
+        write_bit("ZINV_PSINCDEC", !bool_or_default(ci->params, id_IS_PSINCDEC_INVERTED, false));
         write_bit("INV_CLKINSEL", bool_or_default(ci->params, id_IS_CLKINSEL_INVERTED, false));
         write_mmcm_clkout("DIVCLK", ci);
         write_mmcm_clkout("CLKFBOUT", ci);

@@ -209,6 +209,12 @@ void XC7Packer::pack_plls()
                 NetInfo *nn = get_net_or_empty(ci, ctx->id(p));
                 if (nn != nullptr && (nn->name == gnd || nn->name == vcc)) {
                     disconnect_port(ctx, ci, ctx->id(p));
+                    // pack_constants (pack.cc) fabricates IS_<pin>_INVERTED = 1 when it
+                    // ties an unconnected invertible pin to VCC -- it is a routing
+                    // optimisation, not a netlist attribute.  Having just removed the
+                    // pin, drop the parameter with it, or fasm.cc reads an inversion
+                    // for a pin that is connected to nothing.
+                    ci->params.erase(ctx->id("IS_" + p + "_INVERTED"));
                     ++n;
                 }
             }
@@ -217,6 +223,7 @@ void XC7Packer::pack_plls()
                     NetInfo *nn = get_net_or_empty(ci, ctx->id(p));
                     if (nn != nullptr && (nn->name == gnd || nn->name == vcc)) {
                         disconnect_port(ctx, ci, ctx->id(p));
+                        ci->params.erase(ctx->id("IS_" + p + "_INVERTED"));
                         ++n;
                     }
                 }
