@@ -452,7 +452,7 @@ void XilinxPacker::pack_dram()
                     z--;
                 }
                 create_muxf_tree(base, "O", o_pre, addressw_high, o,
-                        m256 ? 4 : (ctx->xc7 ? 2 : 6));
+                        m256 ? 0 : (ctx->xc7 ? 2 : 6));
                 packed_cells.insert(ci->name);
             }
         } else if (cs.memtype == ctx->id("RAMS32")
