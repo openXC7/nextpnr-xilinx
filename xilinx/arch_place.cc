@@ -711,6 +711,20 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
                     // 5LUT: lower-half INIT buffer + xFFMUX.O5) and leaves
                     // the X bypass for the 5FF -- no X usage here.  The
                     // router realises this via the route-thru pseudo pip.
+                } else if (carry4 != nullptr && drv.cell == carry4) {
+                    // The FF's data comes from ANOTHER position's output of
+                    // this very slice's carry (the matching-position case was
+                    // accepted as direct above).  There is no realizable
+                    // path: this position's xFFMUX sees only its own O/CO,
+                    // and the X input comes from the fabric -- whose source
+                    // would be this same site, an exit-and-reenter the
+                    // router does not model for intra-site arcs ("Failed to
+                    // route arc ... CARRY4_O2 to AFFMUX_OUT",
+                    // litex-ddr-qmtech-kintex7 on the demos CI).  Flat
+                    // reject; the FF is placeable in any OTHER slice via a
+                    // normal fabric route.
+                    DBG();
+                    return false;
                 } else {
                     // Indirect, must use X input
                     ff1_uses_x = true;
@@ -729,6 +743,14 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
                 auto &drv = ff2->ffInfo.d->driver;
                 if (drv.cell == lut5) {
                     // Direct, OK
+                } else if (carry4 != nullptr && drv.cell == carry4) {
+                    // The 5FF's D mux sees only O5 and the X bypass -- a
+                    // carry output can NEVER reach it directly, at any
+                    // position, and via X it would need the same
+                    // exit-and-reenter the router does not model.  Flat
+                    // reject (same class as the main-FF case above).
+                    DBG();
+                    return false;
                 } else {
                     // Indirect, must use X input
                     if (x_net == nullptr)
