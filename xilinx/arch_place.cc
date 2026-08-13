@@ -692,40 +692,45 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
             bool ff1_uses_x = false;
             if (ff1 != nullptr && ff1->ffInfo.d != nullptr && ff1->ffInfo.d->driver.cell != nullptr) {
                 auto &drv = ff1->ffInfo.d->driver;
-                if ((drv.cell == lut6 && drv.port != id_MC31) || drv.cell == lut5 || drv.cell == out_fmux ||
-                    (carry4 != nullptr && drv.cell == carry4 &&
-                     (carry4->carryInfo.out_sigs[i % 4] == ff1->ffInfo.d ||
-                      carry4->carryInfo.cout_sigs[i % 4] == ff1->ffInfo.d))) {
-                    // Direct, OK (LUT O6/O5, F7/F8 mux out, or THIS
-                    // position's CARRY4 O/CO via the XOR/CY xFFMUX paths.
-                    // The position check matters: an FF fed by another
-                    // position's carry output used to pass as "direct" here,
-                    // but position A's FFMUX cannot see O3 -- that data can
-                    // only arrive through the fabric and the X pin, so it
-                    // must be accounted as an X user like any other
-                    // indirect feed.)
-                } else if (ff1->attrs.count(id_BEL) && (lut6 == nullptr || lut5 == nullptr)) {
-                    // Imported (Vivado-placed) FF with a free LUT position in
-                    // the slot: Vivado feeds the main FF through a LUT
-                    // routethru (free 6LUT: INIT buffer + xFFMUX.O6; free
-                    // 5LUT: lower-half INIT buffer + xFFMUX.O5) and leaves
-                    // the X bypass for the 5FF -- no X usage here.  The
-                    // router realises this via the route-thru pseudo pip.
-                } else if (carry4 != nullptr && drv.cell == carry4) {
-                    // The FF's data comes from ANOTHER position's output of
-                    // this very slice's carry (the matching-position case was
-                    // accepted as direct above).  There is no realizable
-                    // path: this position's xFFMUX sees only its own O/CO,
-                    // and the X input comes from the fabric -- whose source
-                    // would be this same site, an exit-and-reenter the
-                    // router does not model for intra-site arcs ("Failed to
-                    // route arc ... CARRY4_O2 to AFFMUX_OUT",
-                    // litex-ddr-qmtech-kintex7 on the demos CI).  Flat
-                    // reject; the FF is placeable in any OTHER slice via a
-                    // normal fabric route.
-                    DBG();
-                    return false;
-                } else {
+                // Two feed shapes reach the main FF without the X pin; they
+                // are legal as-is, and accepting them means exactly "leave
+                // ff1_uses_x false and account nothing":
+                //
+                // direct_feed: LUT O6/O5, F7/F8 mux out, or THIS position's
+                // CARRY4 O/CO via the XOR/CY xFFMUX paths.  The position
+                // check matters: an FF fed by another position's carry
+                // output used to pass as "direct" here, but position A's
+                // FFMUX cannot see O3.
+                const bool direct_feed =
+                        (drv.cell == lut6 && drv.port != id_MC31) || drv.cell == lut5 || drv.cell == out_fmux ||
+                        (carry4 != nullptr && drv.cell == carry4 &&
+                         (carry4->carryInfo.out_sigs[i % 4] == ff1->ffInfo.d ||
+                          carry4->carryInfo.cout_sigs[i % 4] == ff1->ffInfo.d));
+                // lut_routethru_feed: imported (Vivado-placed) FF with a
+                // free LUT position in the slot.  Vivado feeds the main FF
+                // through a LUT routethru (free 6LUT: INIT buffer +
+                // xFFMUX.O6; free 5LUT: lower-half INIT buffer + xFFMUX.O5)
+                // and leaves the X bypass for the 5FF -- no X usage.  The
+                // router realises this via the route-thru pseudo pip.
+                const bool lut_routethru_feed =
+                        ff1->attrs.count(id_BEL) && (lut6 == nullptr || lut5 == nullptr);
+                if (!direct_feed && !lut_routethru_feed) {
+                    if (carry4 != nullptr && drv.cell == carry4) {
+                        // The FF's data comes from ANOTHER position's output
+                        // of this very slice's carry (the matching-position
+                        // case is direct_feed above).  There is no
+                        // realizable path: this position's xFFMUX sees only
+                        // its own O/CO, and the X input comes from the
+                        // fabric -- whose source would be this same site, an
+                        // exit-and-reenter the router does not model for
+                        // intra-site arcs ("Failed to route arc ...
+                        // CARRY4_O2 to AFFMUX_OUT", litex-ddr-qmtech-kintex7
+                        // on the demos CI).  Flat reject; the FF is
+                        // placeable in any OTHER slice via a normal fabric
+                        // route.
+                        DBG();
+                        return false;
+                    }
                     // Indirect, must use X input
                     ff1_uses_x = true;
                     if (x_net == nullptr)
@@ -741,17 +746,18 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
             CellInfo *ff2 = lts.cells[i << 4 | BEL_FF2];
             if (ff2 != nullptr && ff2->ffInfo.d != nullptr && ff2->ffInfo.d->driver.cell != nullptr) {
                 auto &drv = ff2->ffInfo.d->driver;
-                if (drv.cell == lut5) {
-                    // Direct, OK
-                } else if (carry4 != nullptr && drv.cell == carry4) {
-                    // The 5FF's D mux sees only O5 and the X bypass -- a
-                    // carry output can NEVER reach it directly, at any
-                    // position, and via X it would need the same
-                    // exit-and-reenter the router does not model.  Flat
-                    // reject (same class as the main-FF case above).
-                    DBG();
-                    return false;
-                } else {
+                // The 5FF's only X-free feed is its own position's O5
+                // (drv.cell == lut5): legal as-is, nothing to account.
+                if (drv.cell != lut5) {
+                    if (carry4 != nullptr && drv.cell == carry4) {
+                        // The 5FF's D mux sees only O5 and the X bypass -- a
+                        // carry output can NEVER reach it directly, at any
+                        // position, and via X it would need the same
+                        // exit-and-reenter the router does not model.  Flat
+                        // reject (same class as the main-FF case above).
+                        DBG();
+                        return false;
+                    }
                     // Indirect, must use X input
                     if (x_net == nullptr)
                         x_net = ff2->ffInfo.d;
