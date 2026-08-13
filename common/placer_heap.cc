@@ -313,7 +313,12 @@ class HeAPPlacer
         placer1_cfg.hpwl_scale_x = cfg.hpwl_scale_x;
         placer1_cfg.hpwl_scale_y = cfg.hpwl_scale_y;
         placer1_cfg.netShareWeight = cfg.netShareWeight;
-        placer1_refine(ctx, placer1_cfg);
+        // placer1_refine() returns false when its final post-placement validity
+        // check fails; that check's log_error is caught inside placer1_refine, so
+        // discarding the result let a known-invalid placement reach the router,
+        // where it resurfaced as an unreadable intra-site arc failure.
+        if (!placer1_refine(ctx, placer1_cfg))
+            return false;
 
         return true;
     }
