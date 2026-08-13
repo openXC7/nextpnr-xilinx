@@ -243,9 +243,17 @@ void XilinxPacker::pack_dram()
             continue;
         auto &dt = dt_iter->second;
         DRAMControlSet dcs;
-        for (int i = 0; i < dt.abits; i++)
-            dcs.wa.push_back(get_net_or_empty(
-                    ci, ctx->id(dt.abits <= 6 ? ("A" + std::to_string(i)) : ("A[" + std::to_string(i) + "]"))));
+        for (int i = 0; i < dt.abits; i++) {
+            // Address pin style is per-primitive, not per-width: RAM128X1S has
+            // 7 abits but SCALAR pins A0..A6 (unlike RAM128X1D/RAM256X1S,
+            // which use an A[] bus), so the width-based guess left every
+            // address (and with it WADR/WA7USED) unconnected. Try the scalar
+            // name first and fall back to the bus form.
+            NetInfo *an = get_net_or_empty(ci, ctx->id("A" + std::to_string(i)));
+            if (an == nullptr)
+                an = get_net_or_empty(ci, ctx->id("A[" + std::to_string(i) + "]"));
+            dcs.wa.push_back(an);
+        }
         dcs.wclk = get_net_or_empty(ci, ctx->id("WCLK"));
         dcs.we = get_net_or_empty(ci, ctx->id("WE"));
         dcs.wclk_inv = bool_or_default(ci->params, ctx->id("IS_WCLK_INVERTED"));
