@@ -462,16 +462,21 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
             int claims = 0;
             // O5 of a used 5LUT (O6 has its own pin; DI feed-throughs and
             // in-position FF feeds are local)
-            if (l5 != nullptr && !l5->lutInfo.only_drives_carry && !l5->lutInfo.is_memory && !l5->lutInfo.is_srl &&
-                has_external_user(l5->lutInfo.output_sigs[0]))
+            const bool o5_needs_outmux = l5 != nullptr && !l5->lutInfo.only_drives_carry &&
+                                         !l5->lutInfo.is_memory && !l5->lutInfo.is_srl &&
+                                         has_external_user(l5->lutInfo.output_sigs[0]);
+            if (o5_needs_outmux)
                 claims++;
-            if (cy != nullptr) {
+            const bool position_has_carry = cy != nullptr;
+            if (position_has_carry) {
                 // carry sum O_k beyond the in-position FF
-                if (has_external_user(cy->carryInfo.out_sigs[k]))
+                const bool carry_o_needs_outmux = has_external_user(cy->carryInfo.out_sigs[k]);
+                if (carry_o_needs_outmux)
                     claims++;
                 // carry CO_k beyond the chain continuation
                 NetInfo *co = cy->carryInfo.cout_sigs[k];
-                if (co != nullptr) {
+                const bool co_is_used = co != nullptr; // an unused CO claims nothing
+                if (co_is_used) {
                     for (auto &usr : co->users) {
                         if (usr.cell != nullptr && usr.cell->type == id_CARRY4 && usr.port == id_CIN)
                             continue; // chain continuation (k==3) uses the dedicated COUT
@@ -483,9 +488,11 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
                 }
             }
             // 5FF Q has no dedicated pin: fabric consumers go through OUTMUX
-            if (ff2 != nullptr) {
+            const bool position_has_5ff = ff2 != nullptr;
+            if (position_has_5ff) {
                 NetInfo *q2 = get_net_or_empty(ff2, id_Q);
-                if (q2 != nullptr && q2->users.size() > 0)
+                const bool ff2_q_reaches_fabric = q2 != nullptr && q2->users.size() > 0;
+                if (ff2_q_reaches_fabric)
                     claims++;
             }
             if (claims > 1) {
@@ -746,10 +753,12 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
             CellInfo *ff2 = lts.cells[i << 4 | BEL_FF2];
             if (ff2 != nullptr && ff2->ffInfo.d != nullptr && ff2->ffInfo.d->driver.cell != nullptr) {
                 auto &drv = ff2->ffInfo.d->driver;
-                // The 5FF's only X-free feed is its own position's O5
-                // (drv.cell == lut5): legal as-is, nothing to account.
-                if (drv.cell != lut5) {
-                    if (carry4 != nullptr && drv.cell == carry4) {
+                // The 5FF's only X-free feed is its own position's O5:
+                // legal as-is, nothing to account.
+                const bool direct_o5_feed = drv.cell == lut5;
+                const bool fed_by_own_slice_carry = carry4 != nullptr && drv.cell == carry4;
+                if (!direct_o5_feed) {
+                    if (fed_by_own_slice_carry) {
                         // The 5FF's D mux sees only O5 and the X bypass -- a
                         // carry output can NEVER reach it directly, at any
                         // position, and via X it would need the same
