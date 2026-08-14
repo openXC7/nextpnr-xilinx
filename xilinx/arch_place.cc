@@ -478,8 +478,11 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
                 const bool co_is_used = co != nullptr; // an unused CO claims nothing
                 if (co_is_used) {
                     for (auto &usr : co->users) {
-                        if (usr.cell != nullptr && usr.cell->type == id_CARRY4 && usr.port == id_CIN)
-                            continue; // chain continuation (k==3) uses the dedicated COUT
+                        // the chain continuation (k==3) uses the dedicated COUT
+                        const bool is_chain_continuation =
+                                usr.cell != nullptr && usr.cell->type == id_CARRY4 && usr.port == id_CIN;
+                        if (is_chain_continuation)
+                            continue;
                         if (is_local_sink(usr, co))
                             continue;
                         claims++;
@@ -722,10 +725,12 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
                 const bool lut_routethru_feed =
                         ff1->attrs.count(id_BEL) && (lut6 == nullptr || lut5 == nullptr);
                 if (!direct_feed && !lut_routethru_feed) {
-                    if (carry4 != nullptr && drv.cell == carry4) {
-                        // The FF's data comes from ANOTHER position's output
-                        // of this very slice's carry (the matching-position
-                        // case is direct_feed above).  There is no
+                    // With direct_feed excluded, a carry driver can only be
+                    // ANOTHER position's output of this very slice's carry
+                    // (the matching-position case is direct_feed above).
+                    const bool cross_position_carry_feed = carry4 != nullptr && drv.cell == carry4;
+                    if (cross_position_carry_feed) {
+                        // There is no
                         // realizable path: this position's xFFMUX sees only
                         // its own O/CO, and the X input comes from the
                         // fabric -- whose source would be this same site, an
