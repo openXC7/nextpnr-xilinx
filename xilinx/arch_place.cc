@@ -421,6 +421,89 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
             get_net_or_empty(l5, id_A6) != nullptr)
             return false;
     }
+    // Per-position site-exit (OUTMUX) budget, run UNCONDITIONALLY.  Each
+    // letter position has exactly ONE selectable output pin ([A-D]MUX: O5,
+    // XOR=carry O, CY=carry CO, A5Q, ...) besides the dedicated O6 pin and
+    // the FF's Q.  The packer/legaliser could co-locate a 5LUT with fabric
+    // consumers, a carry whose O feeds an off-position FF (or fabric), and
+    // more -- each needing that one pin.  The router then inherits an
+    // unroutable site: "Failed to route arc ... CARRY4_O3 to AFFMUX_OUT"
+    // (litex deephier @ seed 4), and the same shape breaks silicon in the
+    // O+CO fanout case (#134).  Reject any position with more than one
+    // OUTMUX claimant so the legaliser keeps searching instead.
+    for (int h = 0; h < 2; h++) {
+        CellInfo *cy = lts.cells[(h << 6) | BEL_CARRY4];
+        for (int k = 0; k < 4; k++) {
+            int eighth = h * 4 + k;
+            CellInfo *l6 = lts.cells[(eighth << 4) | BEL_6LUT];
+            CellInfo *l5 = lts.cells[(eighth << 4) | BEL_5LUT];
+            CellInfo *ff1 = lts.cells[(eighth << 4) | BEL_FF];
+            CellInfo *ff2 = lts.cells[(eighth << 4) | BEL_FF2];
+            // in-position sinks that do NOT need the OUTMUX
+            auto is_local_sink = [&](const PortRef &usr, NetInfo *net) {
+                if (usr.cell == ff1 && ff1 != nullptr && ff1->ffInfo.d == net)
+                    return true; // main FF via xFFMUX
+                if (usr.cell == ff2 && ff2 != nullptr && ff2->ffInfo.d == net)
+                    return true; // 5FF via xFF5MUX
+                if (usr.cell == cy)
+                    return true; // carry S/DI/CIN feed
+                if (usr.cell == l6 || usr.cell == l5)
+                    return true; // intra-position feed (routethru cases)
+                return false;
+            };
+            auto has_external_user = [&](NetInfo *net) {
+                if (net == nullptr)
+                    return false;
+                for (auto &usr : net->users)
+                    if (!is_local_sink(usr, net))
+                        return true;
+                return false;
+            };
+            int claims = 0;
+            // O5 of a used 5LUT (O6 has its own pin; DI feed-throughs and
+            // in-position FF feeds are local)
+            const bool o5_needs_outmux = l5 != nullptr && !l5->lutInfo.only_drives_carry &&
+                                         !l5->lutInfo.is_memory && !l5->lutInfo.is_srl &&
+                                         has_external_user(l5->lutInfo.output_sigs[0]);
+            if (o5_needs_outmux)
+                claims++;
+            const bool position_has_carry = cy != nullptr;
+            if (position_has_carry) {
+                // carry sum O_k beyond the in-position FF
+                const bool carry_o_needs_outmux = has_external_user(cy->carryInfo.out_sigs[k]);
+                if (carry_o_needs_outmux)
+                    claims++;
+                // carry CO_k beyond the chain continuation
+                NetInfo *co = cy->carryInfo.cout_sigs[k];
+                const bool co_is_used = co != nullptr; // an unused CO claims nothing
+                if (co_is_used) {
+                    for (auto &usr : co->users) {
+                        // the chain continuation (k==3) uses the dedicated COUT
+                        const bool is_chain_continuation =
+                                usr.cell != nullptr && usr.cell->type == id_CARRY4 && usr.port == id_CIN;
+                        if (is_chain_continuation)
+                            continue;
+                        if (is_local_sink(usr, co))
+                            continue;
+                        claims++;
+                        break;
+                    }
+                }
+            }
+            // 5FF Q has no dedicated pin: fabric consumers go through OUTMUX
+            const bool position_has_5ff = ff2 != nullptr;
+            if (position_has_5ff) {
+                NetInfo *q2 = get_net_or_empty(ff2, id_Q);
+                const bool ff2_q_reaches_fabric = q2 != nullptr && q2->users.size() > 0;
+                if (ff2_q_reaches_fabric)
+                    claims++;
+            }
+            if (claims > 1) {
+                DBG();
+                return false;
+            }
+        }
+    }
     bool tile_is_memory = false;
     if (lts.cells[(3 << 4) | BEL_6LUT] != nullptr && lts.cells[(3 << 4) | BEL_6LUT]->lutInfo.is_memory)
         tile_is_memory = true;
@@ -619,18 +702,47 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
             bool ff1_uses_x = false;
             if (ff1 != nullptr && ff1->ffInfo.d != nullptr && ff1->ffInfo.d->driver.cell != nullptr) {
                 auto &drv = ff1->ffInfo.d->driver;
-                if ((drv.cell == lut6 && drv.port != id_MC31) || drv.cell == lut5 || drv.cell == out_fmux ||
-                    (carry4 != nullptr && drv.cell == carry4)) {
-                    // Direct, OK (LUT O6/O5, F7/F8 mux out, or the slot's
-                    // CARRY4 O/CO via the XOR/CY xFFMUX paths)
-                } else if (ff1->attrs.count(id_BEL) && (lut6 == nullptr || lut5 == nullptr)) {
-                    // Imported (Vivado-placed) FF with a free LUT position in
-                    // the slot: Vivado feeds the main FF through a LUT
-                    // routethru (free 6LUT: INIT buffer + xFFMUX.O6; free
-                    // 5LUT: lower-half INIT buffer + xFFMUX.O5) and leaves
-                    // the X bypass for the 5FF -- no X usage here.  The
-                    // router realises this via the route-thru pseudo pip.
-                } else {
+                // Two feed shapes reach the main FF without the X pin; they
+                // are legal as-is, and accepting them means exactly "leave
+                // ff1_uses_x false and account nothing":
+                //
+                // direct_feed: LUT O6/O5, F7/F8 mux out, or THIS position's
+                // CARRY4 O/CO via the XOR/CY xFFMUX paths.  The position
+                // check matters: an FF fed by another position's carry
+                // output used to pass as "direct" here, but position A's
+                // FFMUX cannot see O3.
+                const bool direct_feed =
+                        (drv.cell == lut6 && drv.port != id_MC31) || drv.cell == lut5 || drv.cell == out_fmux ||
+                        (carry4 != nullptr && drv.cell == carry4 &&
+                         (carry4->carryInfo.out_sigs[i % 4] == ff1->ffInfo.d ||
+                          carry4->carryInfo.cout_sigs[i % 4] == ff1->ffInfo.d));
+                // lut_routethru_feed: imported (Vivado-placed) FF with a
+                // free LUT position in the slot.  Vivado feeds the main FF
+                // through a LUT routethru (free 6LUT: INIT buffer +
+                // xFFMUX.O6; free 5LUT: lower-half INIT buffer + xFFMUX.O5)
+                // and leaves the X bypass for the 5FF -- no X usage.  The
+                // router realises this via the route-thru pseudo pip.
+                const bool lut_routethru_feed =
+                        ff1->attrs.count(id_BEL) && (lut6 == nullptr || lut5 == nullptr);
+                if (!direct_feed && !lut_routethru_feed) {
+                    // With direct_feed excluded, a carry driver can only be
+                    // ANOTHER position's output of this very slice's carry
+                    // (the matching-position case is direct_feed above).
+                    const bool cross_position_carry_feed = carry4 != nullptr && drv.cell == carry4;
+                    if (cross_position_carry_feed) {
+                        // There is no
+                        // realizable path: this position's xFFMUX sees only
+                        // its own O/CO, and the X input comes from the
+                        // fabric -- whose source would be this same site, an
+                        // exit-and-reenter the router does not model for
+                        // intra-site arcs ("Failed to route arc ...
+                        // CARRY4_O2 to AFFMUX_OUT", litex-ddr-qmtech-kintex7
+                        // on the demos CI).  Flat reject; the FF is
+                        // placeable in any OTHER slice via a normal fabric
+                        // route.
+                        DBG();
+                        return false;
+                    }
                     // Indirect, must use X input
                     ff1_uses_x = true;
                     if (x_net == nullptr)
@@ -646,9 +758,20 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
             CellInfo *ff2 = lts.cells[i << 4 | BEL_FF2];
             if (ff2 != nullptr && ff2->ffInfo.d != nullptr && ff2->ffInfo.d->driver.cell != nullptr) {
                 auto &drv = ff2->ffInfo.d->driver;
-                if (drv.cell == lut5) {
-                    // Direct, OK
-                } else {
+                // The 5FF's only X-free feed is its own position's O5:
+                // legal as-is, nothing to account.
+                const bool direct_o5_feed = drv.cell == lut5;
+                const bool fed_by_own_slice_carry = carry4 != nullptr && drv.cell == carry4;
+                if (!direct_o5_feed) {
+                    if (fed_by_own_slice_carry) {
+                        // The 5FF's D mux sees only O5 and the X bypass -- a
+                        // carry output can NEVER reach it directly, at any
+                        // position, and via X it would need the same
+                        // exit-and-reenter the router does not model.  Flat
+                        // reject (same class as the main-FF case above).
+                        DBG();
+                        return false;
+                    }
                     // Indirect, must use X input
                     if (x_net == nullptr)
                         x_net = ff2->ffInfo.d;
