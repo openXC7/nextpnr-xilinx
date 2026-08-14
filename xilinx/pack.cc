@@ -209,19 +209,21 @@ std::vector<std::pair<IdString, IdString>> XilinxPacker::split_lut6_2()
         return pairs;
 
     for (CellInfo *ci : to_split) {
-        // A BEL pin on the LUT6_2 itself names a single physical resource for
-        // what is about to become two independent cells; there's no defined
-        // rule here for which half (if either) should inherit it, and
-        // silently dropping it would place a "constrained" instance wherever
-        // the placer likes. Fail loudly rather than guess.
-        if (ci->attrs.count(id_BEL))
-            log_error("LUT6_2 cell '%s' has a BEL constraint; splitting a pre-placed LUT6_2 is not supported\n",
-                       ci->name.c_str(ctx));
-
         NetInfo *o5 = get_net_or_empty(ci, ctx->id("O5"));
         NetInfo *o6 = get_net_or_empty(ci, ctx->id("O6"));
         NetInfo *i5 = get_net_or_empty(ci, ctx->id("I5"));
         Property init = get_or_default(ci->params, ctx->id("INIT"), Property()).extract(0, 64);
+
+        // A BEL pin on the LUT6_2 itself names a single physical resource for
+        // what is about to become two independent cells. That's fine as long
+        // as only one output is actually used -- the lone surviving half just
+        // inherits it below -- but if both O5 and O6 are driven there's no
+        // defined rule for which half should get it. Fail loudly rather than
+        // guess in that case.
+        if (ci->attrs.count(id_BEL) && o5 != nullptr && o6 != nullptr)
+            log_error("LUT6_2 cell '%s' has a BEL constraint but drives both O5 and O6; splitting it in two "
+                       "would leave that constraint ambiguous\n",
+                       ci->name.c_str(ctx));
 
         // Build one LUT<n_in> cell driving `out`, whose INIT is the
         // 2^n_in-bit slice of the LUT6_2 INIT starting at bit `lo`.
@@ -247,6 +249,11 @@ std::vector<std::pair<IdString, IdString>> XilinxPacker::split_lut6_2()
             // instance -- unlike a BEL pin, a region is just a bbox and
             // applies equally well to both halves.
             half->region = ci->region;
+            // The BEL-ambiguity check above guarantees at most one half is
+            // ever actually built when the original cell was BEL-constrained,
+            // so it's safe to hand that BEL straight to whichever one it is.
+            if (ci->attrs.count(id_BEL))
+                half->attrs[id_BEL] = ci->attrs.at(id_BEL);
             new_cells.push_back(std::move(half));
         };
 
