@@ -220,7 +220,8 @@ std::vector<std::pair<IdString, IdString>> XilinxPacker::split_lut6_2()
         // inherits it below -- but if both O5 and O6 are driven there's no
         // defined rule for which half should get it. Fail loudly rather than
         // guess in that case.
-        if (ci->attrs.count(id_BEL) && o5 != nullptr && o6 != nullptr)
+        bool bel_constrained_with_both_outputs_used = ci->attrs.count(id_BEL) && o5 != nullptr && o6 != nullptr;
+        if (bel_constrained_with_both_outputs_used)
             log_error("LUT6_2 cell '%s' has a BEL constraint but drives both O5 and O6; splitting it in two "
                        "would leave that constraint ambiguous\n",
                        ci->name.c_str(ctx));
@@ -231,7 +232,8 @@ std::vector<std::pair<IdString, IdString>> XilinxPacker::split_lut6_2()
             if (out == nullptr)
                 return;
             IdString half_name = ctx->id(ci->name.str(ctx) + suffix);
-            if (ctx->cells.count(half_name))
+            bool half_name_collides = ctx->cells.count(half_name);
+            if (half_name_collides)
                 log_error("splitting LUT6_2 cell '%s' would create cell '%s', which already exists\n",
                            ci->name.c_str(ctx), half_name.c_str(ctx));
             std::unique_ptr<CellInfo> half = create_cell(ctx, ctx->id("LUT" + std::to_string(n_in)), half_name);
@@ -252,7 +254,8 @@ std::vector<std::pair<IdString, IdString>> XilinxPacker::split_lut6_2()
             // The BEL-ambiguity check above guarantees at most one half is
             // ever actually built when the original cell was BEL-constrained,
             // so it's safe to hand that BEL straight to whichever one it is.
-            if (ci->attrs.count(id_BEL))
+            bool bel_constrained = ci->attrs.count(id_BEL);
+            if (bel_constrained)
                 half->attrs[id_BEL] = ci->attrs.at(id_BEL);
             new_cells.push_back(std::move(half));
         };
@@ -319,8 +322,11 @@ void XilinxPacker::constrain_lut6_2_pairs(const std::vector<std::pair<IdString, 
         // pair unpaired rather than corrupt an existing constraint -- it
         // costs the extra LUT bel split_lut6_2() already accepts for the
         // non-constant-I5 case.
-        if (lut6->constr_parent != nullptr || lut6->constr_abs_z || !lut6->constr_children.empty() ||
-            lut5->constr_parent != nullptr || lut5->constr_abs_z || !lut5->constr_children.empty())
+        bool lut6_already_constrained =
+                lut6->constr_parent != nullptr || lut6->constr_abs_z || !lut6->constr_children.empty();
+        bool lut5_already_constrained =
+                lut5->constr_parent != nullptr || lut5->constr_abs_z || !lut5->constr_children.empty();
+        if (lut6_already_constrained || lut5_already_constrained)
             continue;
 
         rename_port(ctx, lut5, id_O6, id_O5);
