@@ -1,5 +1,7 @@
 # nextpnr-xilinx
 
+[![NLnet Foundation](https://img.shields.io/badge/funded%20by-NLnet%20Foundation-74AA00)](https://nlnet.nl/)
+
 nextpnr is a open-source multi-architecture place-and-route framework
 aimed at real-world FPGA silicon. This is an experiment to integrate
 nextpnr with RapidWright, an open interface into Xilinx FPGAs, and 
