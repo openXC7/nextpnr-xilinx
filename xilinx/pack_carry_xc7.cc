@@ -1168,8 +1168,17 @@ void XC7Packer::relocate_carry_o_fabric()
     // link.  Both cells pass the carry through their empty lanes with
     // S=VCC: in the MUXCY, CO = S ? CIN : DI, so S must be HIGH to
     // propagate (the earlier S=GND fill selected DI and silently zeroed
-    // the carry -- O, not CO, is what passes CIN when S is low).  Moved
-    // LUT/FF constraints are re-anchored onto the new CARRY4 (rows
+    // the carry -- O, not CO, is what passes CIN when S is low).
+    //
+    // A CARRY4 S pin is physically driven by the corresponding 6LUT O6;
+    // there is no direct constant input.  Atomic carry packing normally
+    // inserts and constrains a feed-through LUT for a constant S, but this
+    // split happens afterwards.  Do the same for every synthetic
+    // pass-through lane here.  Connecting $PACKER_VCC_NET directly to S
+    // routes in nextpnr's graph but emits no LUT INIT, leaving the hardware
+    // carry stage without the required high propagate value.
+    //
+    // Moved LUT/FF constraints are re-anchored onto the new CARRY4 (rows
     // assigned by the chain renumber).
     auto split_at = [&](CellInfo *c4, int i, CellInfo *root) -> CellInfo * {
         std::unique_ptr<CellInfo> nb{new CellInfo};
@@ -1211,14 +1220,36 @@ void XC7Packer::relocate_carry_o_fabric()
         connect_port(ctx, link.get(), nb.get(), ctx->id("CIN"));
         IdString lname = link->name;
         ctx->nets[lname] = std::move(link);
-        // pass-through fills: c4's freed head i..3 carries CO[i-1] up to its
-        // CO3; nb's empty tail 0..i-1 carries its CIN up to bit i
+        // Pass-through fills: c4's freed head i..3 carries CO[i-1] up to its
+        // CO3; nb's empty tail 0..i-1 carries its CIN up to bit i.  Realise
+        // each S=1 with a local 6LUT, just like pack_carries_atomic() does
+        // for constant S inputs before relocation.
         for (int b = i; b < 4; b++) {
             connect_port(ctx, vcc, c4, pname("S", b));
+            PortRef pr{c4, pname("S", b)};
+            auto s_feed = feed_through_lut(vcc, {pr});
+            CellInfo *s_lut = s_feed.get();
+            root->constr_children.push_back(s_lut);
+            s_lut->constr_parent = root;
+            s_lut->constr_x = 0;
+            s_lut->constr_y = 0;
+            s_lut->constr_abs_z = true;
+            s_lut->constr_z = (b << 4) | BEL_6LUT;
+            new_cells.push_back(std::move(s_feed));
             connect_port(ctx, gnd, c4, pname("DI", b));
         }
         for (int b = 0; b < i; b++) {
             connect_port(ctx, vcc, nb.get(), pname("S", b));
+            PortRef pr{nb.get(), pname("S", b)};
+            auto s_feed = feed_through_lut(vcc, {pr});
+            CellInfo *s_lut = s_feed.get();
+            root->constr_children.push_back(s_lut);
+            s_lut->constr_parent = root;
+            s_lut->constr_x = 0;
+            s_lut->constr_y = 0;
+            s_lut->constr_abs_z = true;
+            s_lut->constr_z = (b << 4) | BEL_6LUT;
+            new_cells.push_back(std::move(s_feed));
             connect_port(ctx, gnd, nb.get(), pname("DI", b));
         }
         // re-anchor the moved LUT/FF constraints onto the new CARRY4
