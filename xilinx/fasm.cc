@@ -2139,7 +2139,55 @@ struct FasmBackend
 
     void write_bram_width(CellInfo *ci, const std::string &name, bool is_36, bool is_y1)
     {
-        int width = int_or_default(ci->params, ctx->id(name), 0);
+        // SDP mode spans both data sides of the memory, so the "opposite-side"
+        // width markers must also be configured wide, exactly like Vivado's
+        // golden bitstreams:
+        //   - RAMB36E1 READ_WIDTH_A=72: the 72-bit read is the A port (lower
+        //     36 bits) PLUS the B port (upper 36 bits) -> READ_WIDTH_B_18 on
+        //     BOTH RAMB18 halves.  yosys leaves READ_WIDTH_B at 0 and its
+        //     unisim model derives the B width from READ_WIDTH_A, so the
+        //     width-1 default looked correct in simulation; on silicon it
+        //     kills the B-side read path and the upper half of every read
+        //     returns garbage (litex-ddr-arty-s7 ROM: CPU fetches corrupted
+        //     instructions -> dead serial console while the equivalent Vivado
+        //     build works).
+        //   - RAMB18E1 READ_WIDTH_A=36: the 36-bit read is DOADO/DOPADOP
+        //     (lower 18) PLUS DOBDO/DOPBDOP (upper 18) -> READ_WIDTH_B_18.
+        //   - RAMB18E1 WRITE_WIDTH_B=36: the 36-bit write takes DIADI/DIPADIP
+        //     (lower 18) PLUS DIBDI/DIPBDIP (upper 18) -> WRITE_WIDTH_A_18
+        //     (VexRiscv regfile: register writes lose half their data
+        //     otherwise).
+        //
+        // Fetch the port-width parameters once so that every condition below
+        // is a self-documenting named boolean.
+        const int read_width_a  = int_or_default(ci->params, ctx->id("READ_WIDTH_A"), 0);
+        const int write_width_b = int_or_default(ci->params, ctx->id("WRITE_WIDTH_B"), 0);
+        const int this_width    = int_or_default(ci->params, ctx->id(name), 0);
+
+        // The width parameter being emitted is unset: yosys leaves the
+        // opposite side of an SDP port at 0, although that side still carries
+        // data on silicon.
+        const bool this_width_param_is_unset = (this_width == 0);
+        // The parameter being emitted is the B-side read width.
+        const bool this_param_is_read_width_b = (name == "READ_WIDTH_B");
+        // The parameter being emitted is the A-side write width.
+        const bool this_param_is_write_width_a = (name == "WRITE_WIDTH_A");
+        // On a RAMB36E1 the B side carries half of a 72-bit SDP read; on a
+        // RAMB18E1 it carries half of a 36-bit SDP read.
+        const bool b_side_reads_half_the_word =
+                (is_36 ? (read_width_a == 72) : (read_width_a == 36));
+        // On a RAMB18E1 the A side carries half of a 36-bit SDP write.
+        const bool a_side_writes_half_the_word = (!is_36 && (write_width_b == 36));
+
+        if (this_width_param_is_unset && this_param_is_read_width_b && b_side_reads_half_the_word) {
+            write_bit("READ_WIDTH_B_18");
+            return;
+        }
+        if (this_width_param_is_unset && this_param_is_write_width_a && a_side_writes_half_the_word) {
+            write_bit("WRITE_WIDTH_A_18");
+            return;
+        }
+        int width = this_width;
         if (width == 0)
             width = 1; // golden encodes unused ports as width 1
         int actual_width = width;
