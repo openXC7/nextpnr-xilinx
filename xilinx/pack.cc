@@ -36,6 +36,16 @@ NEXTPNR_NAMESPACE_BEGIN
 void XilinxPacker::flush_cells()
 {
     for (auto pcell : packed_cells) {
+        CellInfo *dying = ctx->cells[pcell].get();
+        // A cell being deleted here must not still be referenced by another
+        // cell's cluster/constraint pointers: constrain_muxf_tree() (and any
+        // similar pass) records constr_parent/constr_children by raw
+        // CellInfo*, not by name, so a pass that deletes a cell it has
+        // already constrained (or that some other cell constrains) leaves a
+        // dangling pointer the placer later dereferences -- silently, far
+        // from here, and without a helpful stack trace. Trip loudly instead.
+        NPNR_ASSERT(dying->constr_parent == nullptr);
+        NPNR_ASSERT(dying->constr_children.empty());
         for (auto &port : ctx->cells[pcell]->ports) {
             disconnect_port(ctx, ctx->cells[pcell].get(), port.first);
         }
@@ -204,13 +214,29 @@ std::vector<std::pair<IdString, IdString>> XilinxPacker::split_lut6_2()
         NetInfo *i5 = get_net_or_empty(ci, ctx->id("I5"));
         Property init = get_or_default(ci->params, ctx->id("INIT"), Property()).extract(0, 64);
 
+        // A BEL pin on the LUT6_2 itself names a single physical resource for
+        // what is about to become two independent cells. That's fine as long
+        // as only one output is actually used -- the lone surviving half just
+        // inherits it below -- but if both O5 and O6 are driven there's no
+        // defined rule for which half should get it. Fail loudly rather than
+        // guess in that case.
+        bool bel_constrained_with_both_outputs_used = ci->attrs.count(id_BEL) && o5 != nullptr && o6 != nullptr;
+        if (bel_constrained_with_both_outputs_used)
+            log_error("LUT6_2 cell '%s' has a BEL constraint but drives both O5 and O6; splitting it in two "
+                       "would leave that constraint ambiguous\n",
+                       ci->name.c_str(ctx));
+
         // Build one LUT<n_in> cell driving `out`, whose INIT is the
         // 2^n_in-bit slice of the LUT6_2 INIT starting at bit `lo`.
         auto make_half = [&](const char *suffix, NetInfo *out, int n_in, int lo) {
             if (out == nullptr)
                 return;
-            std::unique_ptr<CellInfo> half = create_cell(
-                    ctx, ctx->id("LUT" + std::to_string(n_in)), ctx->id(ci->name.str(ctx) + suffix));
+            IdString half_name = ctx->id(ci->name.str(ctx) + suffix);
+            bool half_name_collides = ctx->cells.count(half_name);
+            if (half_name_collides)
+                log_error("splitting LUT6_2 cell '%s' would create cell '%s', which already exists\n",
+                           ci->name.c_str(ctx), half_name.c_str(ctx));
+            std::unique_ptr<CellInfo> half = create_cell(ctx, ctx->id("LUT" + std::to_string(n_in)), half_name);
             for (int i = 0; i < n_in; i++) {
                 IdString p = ctx->id("I" + std::to_string(i));
                 half->addInput(p);
@@ -221,6 +247,16 @@ std::vector<std::pair<IdString, IdString>> XilinxPacker::split_lut6_2()
             half->addOutput(ctx->id("O"));
             connect_port(ctx, out, half.get(), ctx->id("O"));
             half->params[ctx->id("INIT")] = init.extract(lo, 1 << n_in);
+            // Preserve any region (area) constraint carried by the original
+            // instance -- unlike a BEL pin, a region is just a bbox and
+            // applies equally well to both halves.
+            half->region = ci->region;
+            // The BEL-ambiguity check above guarantees at most one half is
+            // ever actually built when the original cell was BEL-constrained,
+            // so it's safe to hand that BEL straight to whichever one it is.
+            bool bel_constrained = ci->attrs.count(id_BEL);
+            if (bel_constrained)
+                half->attrs[id_BEL] = ci->attrs.at(id_BEL);
             new_cells.push_back(std::move(half));
         };
 
@@ -279,6 +315,19 @@ void XilinxPacker::constrain_lut6_2_pairs(const std::vector<std::pair<IdString, 
         CellInfo *lut5 = ctx->cells.at(p.second).get();
         if (lut6->type != id_SLICE_LUTX || lut5->type != id_SLICE_LUTX)
             continue;
+        // Either half may already carry a constraint from an earlier pass
+        // (e.g. constrain_muxf_tree(), if that half feeds a MUXF7/8/9 input).
+        // Overwriting constr_parent here would desync it from the other
+        // cell's constr_children list it's still sitting in, so leave such a
+        // pair unpaired rather than corrupt an existing constraint -- it
+        // costs the extra LUT bel split_lut6_2() already accepts for the
+        // non-constant-I5 case.
+        bool lut6_already_constrained =
+                lut6->constr_parent != nullptr || lut6->constr_abs_z || !lut6->constr_children.empty();
+        bool lut5_already_constrained =
+                lut5->constr_parent != nullptr || lut5->constr_abs_z || !lut5->constr_children.empty();
+        if (lut6_already_constrained || lut5_already_constrained)
+            continue;
 
         rename_port(ctx, lut5, id_O6, id_O5);
         lut5->attrs.erase(ctx->id("X_ORIG_PORT_O6"));
@@ -295,11 +344,9 @@ void XilinxPacker::constrain_lut6_2_pairs(const std::vector<std::pair<IdString, 
     }
 }
 
-void XilinxPacker::pack_luts()
+void XilinxPacker::pack_luts(const std::vector<std::pair<IdString, IdString>> &lut6_2_pairs)
 {
     log_info("Packing LUTs..\n");
-
-    auto lut6_2_pairs = split_lut6_2();
 
     std::unordered_map<IdString, XFormRule> lut_rules;
     for (int k = 1; k <= 6; k++) {
@@ -1358,11 +1405,20 @@ bool Arch::pack()
         packer.pack_plls();
         packer.pack_gt();
         packer.pack_gbs();
+        // Must run before pack_muxfs()/pack_carries()/pack_srls(): those
+        // passes walk driver.cell across nets with no cell-type check
+        // (e.g. constrain_muxf_tree() following a MUXF7 input back through
+        // whatever feeds it), so a LUT6_2 downstream of any of them can be
+        // constrained into a cluster and then have split_lut6_2() delete it
+        // out from under that cluster, leaving a dangling CellInfo* the
+        // placer later dereferences. Splitting first removes LUT6_2 as a
+        // type before any of those passes ever run.
+        auto lut6_2_pairs = packer.split_lut6_2();
         packer.pack_muxfs();
         packer.pack_carries();
         packer.relocate_carry_o_fabric();
         packer.pack_srls();
-        packer.pack_luts();
+        packer.pack_luts(lut6_2_pairs);
         packer.pack_dram();
         packer.pack_bram();
         packer.pack_dsps();
@@ -1381,9 +1437,12 @@ bool Arch::pack()
         packer.pack_iologic();
         packer.pack_idelayctrl();
         packer.pack_clocking();
+        // See the matching comment in the xc7 branch above: must run before
+        // pack_muxfs()/pack_carries().
+        auto lut6_2_pairs = packer.split_lut6_2();
         packer.pack_muxfs();
         packer.pack_carries();
-        packer.pack_luts();
+        packer.pack_luts(lut6_2_pairs);
         packer.pack_dram();
         packer.pack_bram();
         packer.pack_uram();
