@@ -919,6 +919,18 @@ bool Arch::place()
             // determined.
             if (ci->constr_parent != nullptr)
                 continue;
+            // place_lef's CE-buffer promotion invents $cebuf$N cells and stamps
+            // a site for the BUFHCE and BUFR forms, but leaves the BUFG form
+            // unplaced ON PURPOSE for a placer to site -- place_lef_core.ml has
+            // no BUFGCTRL site allocator, so that branch is a bare
+            // "ignore (add_buf bit \"BUFG\" sinks)" with no ftstamps entry.
+            // These are produced BY the placement step, not evidence that the
+            // netlist and the placement disagree, so they are exempt: the
+            // placer below still sites them exactly as it did before placement
+            // became opt-in.  ibex hits this (9 of them); ethmin does not, only
+            // because it runs with TOPO_BUFG_MAX=0 and creates none.
+            if (ci->name.str(this).rfind("$cebuf$", 0) == 0)
+                continue;
             if (ci->bel == BelId() && !ci->attrs.count(id("BEL")))
                 unplaced.push_back(ci);
         }
