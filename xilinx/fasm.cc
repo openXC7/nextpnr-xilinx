@@ -24,6 +24,7 @@
 #include <fstream>
 #include "log.h"
 #include "nextpnr.h"
+#include "version.h"
 #include "pins.h"
 #include "util.h"
 
@@ -5198,6 +5199,22 @@ void Arch::writeFasm(const std::string &filename)
     std::ofstream out(filename);
     if (!out)
         log_error("failed to open file %s for writing (%s)\n", filename.c_str(), strerror(errno));
+
+    // Run identity.  A seed alone does not identify a run: the same --seed on
+    // two different binaries or chipdbs gives two different placements, so
+    // "it fails at seed 4" is not reproducible information on its own.  This
+    // cost a real round of confusion between contributors comparing seed
+    // sweeps.  Comments are dropped by fasm2frames, so the bitstream and the
+    // demos gate's normalized-hash comparison are unaffected.
+    out << "# nextpnr-xilinx " << GIT_DESCRIBE_STR << std::endl;
+    out << "# chipdb " << chip_info->name.get() << " version " << chip_info->version
+        << " generator " << chip_info->generator.get() << std::endl;
+    if (settings.count(id("seed.arg")))
+        out << "# placer seed " << getCtx()->setting<uint64_t>("seed.arg") << std::endl;
+    else
+        out << "# placer seed default" << std::endl;
+    if (settings.count(id("seed")))
+        out << "# placer rngstate " << getCtx()->setting<uint64_t>("seed") << std::endl;
 
     FasmBackend be(getCtx(), out);
     be.write_fasm();
