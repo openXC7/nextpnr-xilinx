@@ -47,7 +47,7 @@ jobs:
           - family: spartan7
             upper: SPARTAN7
             part: xc7s50csga324-1
-            projects: litex-ddr-arty-s7
+            projects: litex-ddr-arty-s7 litex-minimal-arty-s7
           - family: artix7
             upper: ARTIX7
             part: xc7a35tcsg324-1
