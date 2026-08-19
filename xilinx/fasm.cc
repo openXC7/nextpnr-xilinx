@@ -2833,6 +2833,18 @@ struct FasmBackend
         return fnd->second.as_bool();
     }
 
+    // Is a GTXE2_COMMON placed in this tile?  Used to decide who owns the
+    // shared IBUFDS_GTE2.CLKSWING_CFG bits -- see write_ibufds_gte2.
+    bool tile_has_gtxe2_common(int tile)
+    {
+        for (auto &cell : ctx->cells) {
+            CellInfo *c = cell.second.get();
+            if (c->type == id_GTXE2_COMMON && c->bel != BelId() && c->bel.tile == tile)
+                return true;
+        }
+        return false;
+    }
+
     void write_ibufds_gte2(CellInfo * ci)
     {
         push(get_tile_name(ci->bel.tile));
@@ -2847,7 +2859,31 @@ struct FasmBackend
         if (!clkrcv_trst) log_warning("%s/%s: According to ug482, CLKRCV_TRST should always be on\n",
                                        ci->hierpath.c_str(ctx), ci->name.c_str(ctx));
         write_bit("CLKRCV_TRST", clkrcv_trst);
-        pop(2);
+        pop();
+
+        // CLKSWING_CFG belongs to the reference-clock BUFFER, but prjxray puts
+        // its bits in the GTXE2_COMMON feature space, not in IBUFDS_GTE2_Y*.
+        // So it was written ONLY by write_gtx_pll -- i.e. only when the design
+        // happens to instantiate a GTXE2_COMMON.
+        //
+        // A design that uses the per-channel CPLL instead of the QPLL has no
+        // COMMON cell at all (LiteEth's K7_1000BASEX is one), and then nothing
+        // wrote these bits: the refclk buffer came up with swing config 0
+        // where Vivado writes 0b11, silently, on every such design.  Found by
+        // importing a routed design back into Vivado, whose DRC named the
+        // missing attribute (ADEF-446) on a board that was otherwise working.
+        //
+        // Write it here when no COMMON in this tile will, and stay out of the
+        // way when one does -- two writers would emit the feature twice.
+        if (!tile_has_gtxe2_common(ci->bel.tile)) {
+            push("GTXE2_COMMON");
+            auto clkswing_cfg = int_or_default(ci->params, ctx->id("CLKSWING_CFG"), 3);
+            if (clkswing_cfg != 3) log_warning("%s/%s: According to ug476, CLKSWING_CFG should always be 0b11\n",
+                                               ci->hierpath.c_str(ctx), ci->name.c_str(ctx));
+            write_int_vector("IBUFDS_GTE2.CLKSWING_CFG[1:0]", clkswing_cfg, 2);
+            pop();
+        }
+        pop();
     }
 
     void write_gtp_pll(CellInfo *ci)
