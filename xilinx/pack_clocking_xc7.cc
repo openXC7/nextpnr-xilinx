@@ -125,6 +125,23 @@ void XC7Packer::prepare_clocking()
             save_orig_port("CE",  "CE");
             save_orig_port("CLR", "CLR");
             save_orig_port("O",   "O");
+        } else if (ci->type == ctx->id("BUFIO")) {
+            // BUFIO is the undivided I/O clock buffer and sits in its own
+            // site, one BEL of type BUFIO_BUFIO carrying just two pins --
+            // I and O.  No CE and no CLR, which is the difference from the
+            // BUFR case above; there is nothing to tie off.  Same
+            // rename-to-match-the-BEL treatment and the same identity port
+            // tags, for the json2dcp reason given there.
+            //
+            // Without this branch the cell reached the placer still typed
+            // BUFIO, no bel of that type exists to bind it to, and the run
+            // died with "no Bels remaining of type 'BUFIO'" while twenty
+            // sat unused -- the resource table counts bels by site type and
+            // so listed them as available the whole time.
+            save_orig_type();
+            ci->type = id_BUFIO_BUFIO;
+            save_orig_port("I", "I");
+            save_orig_port("O", "O");
         }
     }
 }
