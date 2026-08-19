@@ -580,7 +580,23 @@ struct FasmBackend
                 if (!lut->attrs.count(ctx->id("X_ORIG_PORT_" + phys_inputs[j].str(ctx))))
                     continue;
                 std::string orig = lut->attrs.at(ctx->id("X_ORIG_PORT_" + phys_inputs[j].str(ctx))).as_string();
-                boost::split(phys_to_log[j], orig, boost::is_any_of(" "));
+                // Match the logical-input names rather than trusting the
+                // separator.  X_ORIG_PORT_A<n> lists every logical input that
+                // shares this physical pin, and fixupRouting() used to build
+                // that list with the separator on the wrong side, so a shared
+                // pin came out as "I1I3 " instead of "I1 I3".  Splitting on " "
+                // then yielded the token "I1I3", which is not the name of any
+                // logical input.
+                for (size_t p = 0; p < orig.size(); p++) {
+                    if (orig[p] != 'I')
+                        continue;
+                    size_t q = p + 1;
+                    while (q < orig.size() && orig[q] >= '0' && orig[q] <= '9')
+                        q++;
+                    if (q > p + 1)
+                        phys_to_log[j].push_back(orig.substr(p, q - p));
+                    p = q - 1;
+                }
             }
             int lbound = 0, ubound = 64;
             // Fracturable LUTs
@@ -594,8 +610,21 @@ struct FasmBackend
                 for (int k = 0; k < 6; k++) {
                     if ((j & (1 << k)) == 0)
                         continue;
-                    for (auto &p2l : phys_to_log[k])
-                        log_index |= (1 << log_to_bit[p2l]);
+                    for (auto &p2l : phys_to_log[k]) {
+                        // find(), never operator[]: operator[] inserts a
+                        // missing key with value 0, so an unparseable name was
+                        // silently encoded as if the pin drove I0 and the LUT
+                        // received a truth table that is not its function --
+                        // in the bitstream only.  The JSON and the SDF stayed
+                        // correct, so the design failed on the die and nowhere
+                        // else.
+                        auto lb = log_to_bit.find(p2l);
+                        if (lb == log_to_bit.end())
+                            log_error("LUT '%s': X_ORIG_PORT_%s names logical input '%s', "
+                                      "which this cell does not have\n",
+                                      ctx->nameOf(lut), phys_inputs[k].c_str(ctx), p2l.c_str());
+                        log_index |= (1 << lb->second);
+                    }
                 }
                 bits[j] = (init.str.at(log_index) == Property::S1);
             }
