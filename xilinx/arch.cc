@@ -2870,7 +2870,18 @@ bool Arch::xc7_cell_timing_lookup(int tt_id, int inst_id, IdString variant, IdSt
 // to availablePlacers below.
 const std::string Arch::defaultPlacer = "sa";
 
-const std::vector<std::string> Arch::availablePlacers = {"sa"};
+// ...and it is back, because removing it broke the demos that have no placer
+// of their own.  johnson and the uartram calculator go stock yosys -> nextpnr
+// with no place_lef stage, so they relied on the DEFAULT placer being heap.
+// With heap gone they first hit the unplaced-cell gate, and with "--placer sa"
+// they route-fail instead: sa does not honour the MUXF7 slot rule, so a lut0
+// output cannot reach its mux7 at SLICE_X159Y155/F7BMUX.
+//
+// sa stays the DEFAULT -- that part was right, and it is what makes a forgotten
+// "--placer" give the flow's real placer rather than a 51-minute heap run on a
+// hard-macro design.  heap is merely selectable again, for the designs that
+// want a placer at all.
+const std::vector<std::string> Arch::availablePlacers = {"sa", "heap"};
 
 const std::string Arch::defaultRouter = "router2";
 const std::vector<std::string> Arch::availableRouters = {"router1", "router2"};
