@@ -240,6 +240,11 @@ struct XC7Packer : public XilinxPacker
     void pack_idelayctrl();
 
     // Clocking
+    // create_clock lands on the net the XDC names (the pad); carry it through
+    // IBUF/BUFG/BUFH/BUFR/... and derive PLLE2/MMCME2 outputs so every clock
+    // domain the flops see is analysed against the constraint the design
+    // states instead of the --freq default (openXC7/nextpnr-xilinx#155).
+    void propagate_clock_constraints();
     void prepare_clocking();
     void pack_plls();
     void pack_gbs();

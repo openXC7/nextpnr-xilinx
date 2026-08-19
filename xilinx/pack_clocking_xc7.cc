@@ -18,6 +18,7 @@
  */
 
 #include <algorithm>
+#include <cmath>
 #include <boost/optional.hpp>
 #include <boost/algorithm/string.hpp>
 #include <iterator>
@@ -332,6 +333,169 @@ void XC7Packer::pack_clocking()
 {
     pack_plls();
     pack_gbs();
+}
+
+
+// -----------------------------------------------------------------------
+// Clock constraint propagation (openXC7/nextpnr-xilinx#155)
+//
+// create_clock attaches a ClockConstraint to the net the XDC names -- for
+// `[get_ports clk100]` that is the pad-side net, which no flop is clocked
+// by. The timing walk keys its domains by the net that actually reaches
+// the flops (the IBUF output, the BUFG output, a PLL output...), and none of
+// those inherited the constraint, so every domain but the pad's was
+// analysed against the --freq default and reported "PASS at 12.00 MHz" for
+// designs constrained at 100 that do not meet it.
+//
+// Same scheme as the ecp5/ice40 packers: walk from every constrained net
+// through the clock buffers (ratio 1, or 1/N for a dividing BUFR) and
+// through PLLE2/MMCME2 (period_out = period_in * DIVCLK_DIVIDE *
+// CLKOUTn_DIVIDE / CLKFBOUT_MULT), to a fixpoint. A constraint the user put
+// on a downstream net themselves wins over a derived one.
+// -----------------------------------------------------------------------
+void XC7Packer::propagate_clock_constraints()
+{
+    log_info("Propagating clock constraints...\n");
+
+    auto MHz = [&](delay_t period) { return 1000.0 / ctx->getDelayNS(period); };
+    auto param_double = [&](CellInfo *ci, const std::string &name, double def) {
+        IdString p = ctx->id(name);
+        if (!ci->params.count(p))
+            return def;
+        const Property &prop = ci->params.at(p);
+        if (prop.is_string) {
+            try {
+                return std::stod(prop.as_string());
+            } catch (...) {
+                return def;
+            }
+        }
+        return double(prop.as_int64());
+    };
+
+    std::unordered_set<IdString> user_constrained;
+    std::unordered_set<IdString> changed_nets;
+    for (auto &net : ctx->nets) {
+        if (net.second->clkconstr) {
+            user_constrained.insert(net.first);
+            changed_nets.insert(net.first);
+        }
+    }
+    if (changed_nets.empty())
+        return;
+
+    // Give `to` the constraint of `from` scaled by ratio (f_to = f_from * ratio).
+    auto set_derived = [&](CellInfo *ci, NetInfo *from, NetInfo *to, double ratio) {
+        if (from == nullptr || from->clkconstr == nullptr || to == nullptr || ratio <= 0)
+            return;
+        delay_t period = delay_t(from->clkconstr->period.delay / ratio);
+        if (to->clkconstr != nullptr) {
+            if (user_constrained.count(to->name) && std::abs(to->clkconstr->period.delay - period) > 1)
+                log_warning("    net '%s' is constrained to %.1f MHz by the XDC; the %.1f MHz derived through "
+                            "'%s' is not applied\n",
+                            to->name.c_str(ctx), MHz(to->clkconstr->period.delay), MHz(period), ci->name.c_str(ctx));
+            return;
+        }
+        to->clkconstr = std::unique_ptr<ClockConstraint>(new ClockConstraint);
+        to->clkconstr->period.delay = period;
+        to->clkconstr->high.delay = period / 2;
+        to->clkconstr->low.delay = period / 2;
+        log_info("    derived %.1f MHz for net '%s' (through %s '%s')\n", MHz(period), to->name.c_str(ctx),
+                 ci->type.c_str(ctx), ci->name.c_str(ctx));
+        changed_nets.insert(to->name);
+    };
+    auto copy_through = [&](CellInfo *ci, const std::string &in, const std::string &out, double ratio = 1.0) {
+        NetInfo *from = get_net_or_empty(ci, ctx->id(in));
+        NetInfo *to = get_net_or_empty(ci, ctx->id(out));
+        set_derived(ci, from, to, ratio);
+    };
+
+    const IdString t_IBUF = ctx->id("IBUF"), t_IBUFDS = ctx->id("IBUFDS"), t_IBUFG = ctx->id("IBUFG"),
+                   t_IBUFGDS = ctx->id("IBUFGDS"), t_BUFG = ctx->id("BUFG"), t_BUFGCTRL = ctx->id("BUFGCTRL"),
+                   t_BUFGCE = ctx->id("BUFGCE"), t_BUFH = ctx->id("BUFH"), t_BUFHCE = ctx->id("BUFHCE"),
+                   t_BUFR = ctx->id("BUFR"), t_BUFMR = ctx->id("BUFMR"), t_BUFMRCE = ctx->id("BUFMRCE"),
+                   t_BUFIO = ctx->id("BUFIO"), t_PLLE2_ADV = ctx->id("PLLE2_ADV"), t_PLLE2_BASE = ctx->id("PLLE2_BASE"),
+                   t_MMCME2_ADV = ctx->id("MMCME2_ADV"), t_MMCME2_BASE = ctx->id("MMCME2_BASE");
+
+    // Iterate while constraints keep appearing (buffer after PLL after buffer...);
+    // the bound guards against a loop through a self-fed PLL.
+    int iter = 0;
+    const int itermax = 1000;
+    while (!changed_nets.empty() && iter < itermax) {
+        ++iter;
+        std::unordered_set<IdString> changed_cells;
+        for (auto net : changed_nets)
+            for (auto &user : ctx->nets.at(net)->users)
+                changed_cells.insert(user.cell->name);
+        changed_nets.clear();
+        for (auto cell : sorted(changed_cells)) {
+            CellInfo *ci = ctx->cells.at(cell).get();
+            IdString t = ci->type;
+            if (t == t_IBUF || t == t_IBUFDS || t == t_IBUFG || t == t_IBUFGDS || t == t_BUFG || t == t_BUFGCE ||
+                t == t_BUFH || t == t_BUFHCE || t == t_BUFMR || t == t_BUFMRCE || t == t_BUFIO) {
+                copy_through(ci, "I", "O");
+            } else if (t == t_BUFGCTRL) {
+                copy_through(ci, "I0", "O");
+                copy_through(ci, "I1", "O");
+            } else if (t == t_BUFR) {
+                std::string div = str_or_default(ci->params, ctx->id("BUFR_DIVIDE"), "BYPASS");
+                double ratio = 1.0;
+                if (div != "BYPASS") {
+                    try {
+                        ratio = 1.0 / std::stod(div);
+                    } catch (...) {
+                        log_warning("    BUFR '%s': unrecognised BUFR_DIVIDE '%s', assuming BYPASS for the "
+                                    "constraint\n",
+                                    ci->name.c_str(ctx), div.c_str());
+                    }
+                }
+                copy_through(ci, "I", "O", ratio);
+            } else if (t == t_PLLE2_ADV || t == t_PLLE2_BASE || t == t_MMCME2_ADV || t == t_MMCME2_BASE) {
+                bool is_mmcm = (t == t_MMCME2_ADV || t == t_MMCME2_BASE);
+                NetInfo *in = get_net_or_empty(ci, ctx->id("CLKIN1"));
+                if (in == nullptr || in->clkconstr == nullptr)
+                    in = get_net_or_empty(ci, ctx->id("CLKIN2"));
+                if (in == nullptr || in->clkconstr == nullptr)
+                    continue;
+                double mult = is_mmcm && ci->params.count(ctx->id("CLKFBOUT_MULT_F"))
+                                      ? param_double(ci, "CLKFBOUT_MULT_F", 1.0)
+                                      : param_double(ci, "CLKFBOUT_MULT", 1.0);
+                double divclk = param_double(ci, "DIVCLK_DIVIDE", 1.0);
+                if (mult <= 0 || divclk <= 0)
+                    continue;
+                // f_vco = f_in * mult / divclk ; f_out_n = f_vco / CLKOUTn_DIVIDE
+                double vco_ratio = mult / divclk;
+                log_info("    %s '%s': input %.1f MHz, VCO %.1f MHz\n", ci->type.c_str(ctx), ci->name.c_str(ctx),
+                         MHz(in->clkconstr->period.delay), MHz(in->clkconstr->period.delay) * vco_ratio);
+                int nout = is_mmcm ? 7 : 6;
+                for (int n = 0; n < nout; n++) {
+                    std::string port = "CLKOUT" + std::to_string(n);
+                    double div;
+                    if (is_mmcm && n == 0 && ci->params.count(ctx->id("CLKOUT0_DIVIDE_F")))
+                        div = param_double(ci, "CLKOUT0_DIVIDE_F", 1.0);
+                    else
+                        div = param_double(ci, port + "_DIVIDE", 1.0);
+                    // MMCM: CLKOUT4 may be cascaded through CLKOUT6's divider
+                    if (is_mmcm && n == 4 &&
+                        str_or_default(ci->params, ctx->id("CLKOUT4_CASCADE"), "FALSE") == "TRUE")
+                        div *= param_double(ci, "CLKOUT6_DIVIDE", 1.0);
+                    if (div <= 0)
+                        continue;
+                    set_derived(ci, in, get_net_or_empty(ci, ctx->id(port)), vco_ratio / div);
+                    // the inverted outputs (MMCM CLKOUT0B..3B) run at the same rate
+                    if (is_mmcm && n <= 3)
+                        set_derived(ci, in, get_net_or_empty(ci, ctx->id(port + "B")), vco_ratio / div);
+                }
+                // CLKFBOUT runs at the VCO rate
+                set_derived(ci, in, get_net_or_empty(ci, ctx->id("CLKFBOUT")), vco_ratio);
+                if (is_mmcm)
+                    set_derived(ci, in, get_net_or_empty(ci, ctx->id("CLKFBOUTB")), vco_ratio);
+            }
+        }
+    }
+    if (iter >= itermax)
+        log_warning("    clock constraint propagation did not settle after %d iterations (loop through a PLL?)\n",
+                    itermax);
 }
 
 NEXTPNR_NAMESPACE_END
