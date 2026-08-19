@@ -1754,7 +1754,11 @@ void Arch::fixupRouting()
                     auto &orig_attr = lut6->attrs[id("X_ORIG_PORT_" + p.str(this))].str;
                     bool first = true;
                     for (auto &nc : new_connections.at(p)) {
-                        orig_attr += orig_ports_l6[nc] + (first ? "" : " ");
+                        // The separator belongs BEFORE each element after the first.
+                        // Appending it after built "I1I3 " instead of "I1 I3" for a
+                        // shared pin, which every reader that splits on " " then
+                        // mis-parses -- see the note in xilinx/fasm.cc.
+                        orig_attr += (first ? "" : " ") + orig_ports_l6[nc];
                         first = false;
                     }
                     if (orig_attr.empty())
@@ -1770,7 +1774,11 @@ void Arch::fixupRouting()
                     auto &orig_attr = lut5->attrs[id("X_ORIG_PORT_" + p.str(this))].str;
                     bool first = true;
                     for (auto &nc : new_connections.at(p)) {
-                        orig_attr += orig_ports_l5[nc] + (first ? "" : " ");
+                        // The separator belongs BEFORE each element after the first.
+                        // Appending it after built "I1I3 " instead of "I1 I3" for a
+                        // shared pin, which every reader that splits on " " then
+                        // mis-parses -- see the note in xilinx/fasm.cc.
+                        orig_attr += (first ? "" : " ") + orig_ports_l5[nc];
                         first = false;
                     }
                     if (orig_attr.empty())
