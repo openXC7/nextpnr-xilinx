@@ -878,8 +878,14 @@ void XC7Packer::pack_carries()
                 }
             }
             if (c4_di) {
+                // Only adopt a driver that can actually LIVE on the 5LUT: it
+                // is pinned to BEL_5LUT below so its O5 reaches DI internally,
+                // and a 5LUT bel has neither A6 nor O6.  A six-input LUT taken
+                // in here would be constrained somewhere it cannot go; the
+                // feed-through path below already handles "no usable di_lut".
                 if (c4_di->users.size() == 1 && c4_di->driver.cell != nullptr &&
-                    lut_types.count(c4_di->driver.cell->type)) {
+                    lut_types.count(c4_di->driver.cell->type) &&
+                    get_net_or_empty(c4_di->driver.cell, ctx->id("I5")) == nullptr) {
                     di_lut = c4_di->driver.cell;
                     for (int j = 0; j < 5; j++) {
                         NetInfo *ix = get_net_or_empty(di_lut, ctx->id("I" + std::to_string(j)));

@@ -462,9 +462,15 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
                 CellInfo *mc = lts.cells[(i << 4) | mt];
                 if (mc == nullptr || mc->belStrength >= STRENGTH_USER)
                     continue;
+                // UNCONSTR means NO positional constraint -- it does NOT mean
+                // "offset zero".  Conflating the two made this rule demand that
+                // any child with a parent share the parent's tile even when
+                // nothing asked for it, and it rejected a correctly packed
+                // carry slice (SLICE_X169Y172: count_cycle LUTs, GND di_luts on
+                // the 5LUT slots, FFs, CARRY4 at z=79).  Only enforce
+                // co-location where the constraint EXPLICITLY says offset 0.
                 auto tile_local = [](const CellInfo *c) {
-                    return (c->constr_x == c->UNCONSTR || c->constr_x == 0) &&
-                           (c->constr_y == c->UNCONSTR || c->constr_y == 0);
+                    return c->constr_x == 0 && c->constr_y == 0;
                 };
                 CellInfo *par = mc->constr_parent;
                 if (par != nullptr && par->bel != BelId() && mc->bel != BelId() && tile_local(mc)) {

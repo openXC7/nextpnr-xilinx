@@ -731,6 +731,22 @@ class SAPlacer
             bool strict_cluster = true;
             auto proc_bel = [&](BelId bel) {
                 if (ctx->getBelType(bel) == targetType && ctx->isValidBelForCell(cell, bel)) {
+                    // Honour the cell's OWN absolute-z constraint.  DRAM
+                    // elements are pinned to an exact slot -- pack_dram sets
+                    //   constr_abs_z = true;
+                    //   constr_z = (z << 4) | (o5 ? BEL_5LUT : BEL_6LUT)
+                    // -- and the binder respects that for CHILDREN, imposing
+                    // the root's half bits (constr_z | (rootLoc.z & ~0x3F)).
+                    // Nothing applied it to the ROOT, which was chosen on bel
+                    // TYPE alone: the RV32 register file's DPR0_0 roots landed
+                    // on C5LUT and B5LUT when their own constraint named a
+                    // different slot, so every sibling's position was computed
+                    // from a root in the wrong place and nine could not be
+                    // seated at all.  Only the low 6 bits are the cell's
+                    // business; bit 6 up is the slice half, left free.
+                    if (cell->constr_abs_z &&
+                        (ctx->getBelLocation(bel).z & 0x3F) != (cell->constr_z & 0x3F))
+                        return;
                     if (strict_cluster && !cell->constr_children.empty()) {
                         std::unordered_set<BelId> claimed;
                         if (!constr_children_fit(cell, ctx->getBelLocation(bel), claimed))
