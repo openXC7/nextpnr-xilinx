@@ -272,12 +272,48 @@ class SAPlacer
 
             for (auto &cell : ctx->cells) {
                 CellInfo *ci = cell.second.get();
-                if (ci->bel == BelId()) {
+                // Constrained CHILDREN are deliberately absent: `autoplaced`
+                // is also the SA MOVE LIST, so listing them lets annealing
+                // relocate a child on its own and split the cluster -- which is
+                // how a MUXF7 ended up in a different slice from its LUTs.
+                // They are seated by their root, and any the root could not
+                // seat are swept up after this loop.
+                if (ci->bel == BelId() && ci->constr_parent == nullptr) {
                     autoplaced.push_back(cell.second.get());
                 }
             }
             std::sort(autoplaced.begin(), autoplaced.end(), [](CellInfo *a, CellInfo *b) { return a->name < b->name; });
             ctx->shuffle(autoplaced);
+            // BIGGEST CLUSTERS FIRST.  A root binds its own children, so it
+            // must choose its site while their bels are still free.  Ordering
+            // roots merely before singletons is not enough: a LUT+FF pair is a
+            // cluster too, and once enough one-LUT clusters are scattered
+            // about, no slice retains the FOUR free LUT bels a MUXF7/F8 tree
+            // needs.  ethmin failed exactly so, with the contested bels held by
+            // other cluster roots --
+            //   child ...MUXF8_O_I1_MUXF7_O_I0_LUT2_O wants SLICE_X108Y170/B6LUT,
+            //   held by 'core.soc.cpu.eoi_FDRE_Q_12_D_LUT3_O'
+            // -- and enlarging the region did not help, because the small
+            // clusters simply spread out with it (8375 sites failed the same
+            // way as 2577).  Seat the most demanding clusters while the device
+            // is still empty; singletons fit in the gaps afterwards.
+            {
+                std::unordered_map<IdString, int> desc;
+                std::function<int(CellInfo *)> count = [&](CellInfo *c) -> int {
+                    auto it = desc.find(c->name);
+                    if (it != desc.end())
+                        return it->second;
+                    int n = 0;
+                    for (auto ch : c->constr_children)
+                        n += 1 + count(ch);
+                    desc[c->name] = n;
+                    return n;
+                };
+                for (auto c : autoplaced)
+                    count(c);
+                std::stable_sort(autoplaced.begin(), autoplaced.end(),
+                                 [&](CellInfo *a, CellInfo *b) { return desc[a->name] > desc[b->name]; });
+            }
             auto iplace_start = std::chrono::high_resolution_clock::now();
             // Place cells randomly initially
             log_info("Creating initial placement for remaining %d cells.\n", int(autoplaced.size()));
@@ -292,6 +328,35 @@ class SAPlacer
             if ((placed_cells - constr_placed_cells) % 500 != 0)
                 log_info("  initial placement placed %d/%d cells\n", int(placed_cells - constr_placed_cells),
                          int(autoplaced.size()));
+            // Orphan sweep: a root that had to fall back to placing itself
+            // alone (a long CARRY4 chain that fits nowhere as a unit) leaves
+            // its children unbound, and they are not in `autoplaced`.  Place
+            // them individually rather than letting them reach the router
+            // unplaced.
+            {
+                int orphans = 0;
+                for (auto &cell : ctx->cells) {
+                    CellInfo *ci = cell.second.get();
+                    if (ci->bel == BelId()) {
+                        // Inherit the ROOT's region.  A constrained child has
+                        // none of its own (only roots are given one), so an
+                        // orphan placed here would be free to land anywhere on
+                        // the die -- 9 of them scattered out of a region at
+                        // X[122..174] Y[114..166] as far as SLICE_X24Y347, and
+                        // one produced a tile the validity check then refused.
+                        if (ci->region == nullptr) {
+                            CellInfo *root = ci;
+                            while (root->constr_parent != nullptr)
+                                root = root->constr_parent;
+                            ci->region = root->region;
+                        }
+                        place_initial(ci);
+                        ++orphans;
+                    }
+                }
+                if (orphans > 0)
+                    log_info("  placed %d cluster child(ren) whose root could not seat them\n", orphans);
+            }
             if (cfg.budgetBased && cfg.slack_redist_iter > 0)
                 assign_budget(ctx);
             ctx->yield();
@@ -526,8 +591,119 @@ class SAPlacer
 
   private:
     // Initial random placement
+    // Where a constrained child lands if its parent sits at parentLoc.
+    Loc constr_child_loc(const CellInfo *child, const Loc &parentLoc) const
+    {
+        Loc cl;
+        cl.x = parentLoc.x + (child->constr_x == child->UNCONSTR ? 0 : child->constr_x);
+        cl.y = parentLoc.y + (child->constr_y == child->UNCONSTR ? 0 : child->constr_y);
+        cl.z = child->constr_abs_z ? (child->constr_z | (parentLoc.z & ~0x3F))
+                                   : parentLoc.z + (child->constr_z == child->UNCONSTR ? 0 : child->constr_z);
+        return cl;
+    }
+
+    // Could every constrained descendant be placed, if `cell` went to cellLoc?
+    //
+    // place_initial otherwise places cells ONE AT A TIME with no knowledge of
+    // constraints: only BEL-pinned roots get their children bound up front
+    // (see bind_children above, gated on attrs["BEL"]), so for a design placed
+    // from scratch every cluster member lands at an independent random bel and
+    // the cluster is only reassembled afterwards, if SA's chain moves happen to
+    // manage it.  On johnson most did and one did not -- an F7BMUX two slices
+    // from its F8MUX root -- which is unroutable, because a MUXF7 can only be
+    // fed by the two LUTs of its own slice.
+    bool constr_children_fit(CellInfo *cell, Loc cellLoc, std::unordered_set<BelId> &claimed)
+    {
+        for (auto child : cell->constr_children) {
+            Loc cl = constr_child_loc(child, cellLoc);
+            BelId tb = ctx->getBelByLocation(cl);
+            if (tb == BelId() || ctx->getBelType(tb) != child->type)
+                return false;
+            if (!ctx->checkBelAvail(tb) || !claimed.insert(tb).second)
+                return false;
+            // Deliberately NOT isValidBelForCell(child, tb).  This predicate
+            // exists to predict whether bind_constr_children can seat the
+            // cluster, and that binder tests only type and availability -- so
+            // adding a legality test here makes the gate STRICTER THAN THE
+            // BINDER IT GUARDS and rejects placements that would work.  On
+            // ethmin it refused every CARRY4 site in the region over one
+            // packer-made VCC LUT:
+            //   at SLICE_X155Y191/CARRY4: child '$PACKER_VCC_NET$LUT$1696'
+            //      (SLICE_LUTX) -> isValidBelForCell refused the child
+            // Genuine illegality is still caught afterwards by the tile-level
+            // isBelLocationValid, which is where slice rules belong.
+            if (!constr_children_fit(child, cl, claimed))
+                return false;
+        }
+        return true;
+    }
+
+    void bind_constr_children(CellInfo *cell, Loc cellLoc)
+    {
+        for (auto child : cell->constr_children) {
+            Loc cl = constr_child_loc(child, cellLoc);
+            BelId tb = ctx->getBelByLocation(cl);
+            if (tb == BelId())
+                continue;
+            // The child may ALREADY be bound -- place_initial's ripup path
+            // re-enters this loop for the cell it evicted, and if that cell is
+            // a cluster root its children are still sitting where they were put
+            // the first time.  Binding unconditionally then aborts the whole
+            // run inside bindBel:
+            //   Assertion failure: tileStatus[bel.tile].boundcells[bel.index]
+            //                      == nullptr (xilinx/arch.h:847)
+            if (child->bel == tb)
+                continue; // already exactly where it belongs
+            if (child->bel != BelId())
+                ctx->unbindBel(child->bel);
+            // Someone else holds the slot: leave the child unbound rather than
+            // abort.  The orphan sweep after initial placement will site it,
+            // and the tile-level validity check still refuses an illegal split.
+            if (!ctx->checkBelAvail(tb))
+                continue;
+            ctx->bindBel(tb, child, STRENGTH_STRONG);
+            child->attrs[ctx->id("BEL")] = ctx->getBelName(tb).str(ctx);
+            bind_constr_children(child, cl);
+        }
+    }
+
+    // Does this cell belong to a cluster whose members must share one tile?
+    // Checked from the cell in either direction: a child of such a cluster, or
+    // a root whose children are tile-pinned.
+    bool is_in_tile_local_cluster(CellInfo *cell) const
+    {
+        CellInfo *root = cell;
+        while (root->constr_parent != nullptr)
+            root = root->constr_parent;
+        if (root->constr_children.empty())
+            return false;
+        return cluster_is_tile_local(root);
+    }
+
+    // Is every descendant pinned to the root's own tile?  A MUXF7/F8 tree is
+    // (all children carry constr_x/constr_y of 0, only z differs) and it is
+    // ILLEGAL to split -- a MUXF7 can only be fed by the two LUTs of its slice.
+    // A CARRY4 chain is not: it walks up the rows, so it can be relaxed and
+    // reassembled by the annealer.  The distinction decides whether falling
+    // back to placing the root alone is acceptable or produces a design the
+    // validity checker will (rightly) refuse.
+    bool cluster_is_tile_local(const CellInfo *cell) const
+    {
+        for (auto child : cell->constr_children) {
+            if ((child->constr_x != child->UNCONSTR && child->constr_x != 0) ||
+                (child->constr_y != child->UNCONSTR && child->constr_y != 0))
+                return false;
+            if (!cluster_is_tile_local(child))
+                return false;
+        }
+        return true;
+    }
+
     void place_initial(CellInfo *cell)
     {
+        // Already seated by its cluster root -- nothing to choose.
+        if (cell->bel != BelId())
+            return;
         bool all_placed = false;
         int iters = 25;
         while (!all_placed) {
@@ -541,8 +717,25 @@ class SAPlacer
             }
             IdString targetType = cell->type;
 
+            // Try to seat the WHOLE cluster first; fall back to the root alone
+            // if nothing on the device can take it.  Strict is right for a
+            // slice-local cluster (a MUXF7/F8 tree, whose children must share
+            // the slice), but a CARRY4 chain is 232 cells deep on ethmin and
+            // spans many rows, so demanding every descendant fit at every
+            // candidate rejected the entire device and killed placement with
+            //   ERROR: failed to place cell '...CARRY4' of type 'CARRY4'
+            // before a single cell was placed.  Relaxing is what the placer did
+            // unconditionally before, so the fallback is no worse than the old
+            // behaviour -- and it says when it happens rather than silently
+            // scattering the cluster.
+            bool strict_cluster = true;
             auto proc_bel = [&](BelId bel) {
                 if (ctx->getBelType(bel) == targetType && ctx->isValidBelForCell(cell, bel)) {
+                    if (strict_cluster && !cell->constr_children.empty()) {
+                        std::unordered_set<BelId> claimed;
+                        if (!constr_children_fit(cell, ctx->getBelLocation(bel), claimed))
+                            return;
+                    }
                     if (ctx->checkBelAvail(bel)) {
                         uint64_t score = ctx->rng64();
                         if (score <= best_score) {
@@ -561,19 +754,100 @@ class SAPlacer
                 }
             };
 
-            if (cell->region != nullptr && cell->region->constr_bels) {
-                for (auto bel : cell->region->bels) {
-                    proc_bel(bel);
+            auto scan_bels = [&]() {
+                if (cell->region != nullptr && cell->region->constr_bels) {
+                    for (auto bel : cell->region->bels) {
+                        proc_bel(bel);
+                    }
+                } else {
+                    for (auto bel : ctx->getBels()) {
+                        proc_bel(bel);
+                    }
                 }
-            } else {
-                for (auto bel : ctx->getBels()) {
-                    proc_bel(bel);
-                }
+            };
+            scan_bels();
+            if (best_bel == BelId() && ripup_bel == BelId() && strict_cluster && !cell->constr_children.empty() &&
+                !cluster_is_tile_local(cell)) {
+                strict_cluster = false;
+                scan_bels();
+                if (best_bel != BelId() || ripup_bel != BelId())
+                    log_warning("no site fits the whole cluster rooted at '%s'; placing the root alone and "
+                                "leaving its children to the annealer\n",
+                                ctx->nameOf(cell));
             }
 
             if (best_bel == BelId()) {
-                if (iters == 0 || ripup_bel == BelId())
-                    log_error("failed to place cell '%s' of type '%s'\n", cell->name.c_str(ctx), cell->type.c_str(ctx));
+                if (iters == 0 || ripup_bel == BelId()) {
+                    // SAY WHY.  "failed to place cell X" alone gives nothing to
+                    // act on: the interesting question is always whether the
+                    // cell itself had no legal bel, or whether its CLUSTER
+                    // could not be seated as a unit -- and if the latter, which
+                    // child blocked it.
+                    if (!cell->constr_children.empty()) {
+                        int n_desc = 0;
+                        std::function<void(CellInfo *)> count = [&](CellInfo *c) {
+                            for (auto ch : c->constr_children) {
+                                ++n_desc;
+                                count(ch);
+                            }
+                        };
+                        count(cell);
+                        log_info("  cluster root with %d descendant(s), tile-local=%s, strict=%s\n", n_desc,
+                                 cluster_is_tile_local(cell) ? "yes" : "no", strict_cluster ? "yes" : "no");
+                        // Explain the first candidate we would have liked.
+                        int shown = 0;
+                        auto explain = [&](BelId bel) {
+                            if (shown >= 3 || ctx->getBelType(bel) != targetType)
+                                return;
+                            if (!ctx->isValidBelForCell(cell, bel))
+                                return;
+                            Loc rl = ctx->getBelLocation(bel);
+                            for (auto child : cell->constr_children) {
+                                Loc cl = constr_child_loc(child, rl);
+                                BelId tb = ctx->getBelByLocation(cl);
+                                const char *why = nullptr;
+                                if (tb == BelId()) {
+                                    log_info("    at %s (z=%d): child '%s' -> no bel at (%d,%d,z=%d) "
+                                             "[constr x=%d y=%d z=%d abs=%d]\n",
+                                             ctx->getBelName(bel).c_str(ctx), rl.z, ctx->nameOf(child), cl.x, cl.y,
+                                             cl.z, child->constr_x, child->constr_y, child->constr_z,
+                                             child->constr_abs_z ? 1 : 0);
+                                    ++shown;
+                                    return;
+                                }
+                                else if (ctx->getBelType(tb) != child->type)
+                                    why = "bel there is the wrong type";
+                                else if (!ctx->checkBelAvail(tb)) {
+                                    CellInfo *occ = ctx->getBoundBelCell(tb);
+                                    log_info("    at %s: child '%s' wants %s, held by '%s'%s\n",
+                                             ctx->getBelName(bel).c_str(ctx), ctx->nameOf(child),
+                                             ctx->getBelName(tb).c_str(ctx),
+                                             occ ? ctx->nameOf(occ) : "?",
+                                             (occ == child) ? "  <-- THE CHILD ITSELF, already placed" : "");
+                                    ++shown;
+                                    return;
+                                }
+                                else if (!ctx->isValidBelForCell(child, tb))
+                                    why = "isValidBelForCell refused the child";
+                                if (why != nullptr) {
+                                    log_info("    at %s: child '%s' (%s) -> %s\n",
+                                             ctx->getBelName(bel).c_str(ctx), ctx->nameOf(child),
+                                             child->type.c_str(ctx), why);
+                                    ++shown;
+                                    return;
+                                }
+                            }
+                        };
+                        if (cell->region != nullptr && cell->region->constr_bels)
+                            for (auto bel : cell->region->bels)
+                                explain(bel);
+                        else
+                            for (auto bel : ctx->getBels())
+                                explain(bel);
+                    }
+                    log_error("failed to place cell '%s' of type '%s'\n", cell->name.c_str(ctx),
+                              cell->type.c_str(ctx));
+                }
                 --iters;
                 ctx->unbindBel(ripup_target->bel);
                 best_bel = ripup_bel;
@@ -584,6 +858,10 @@ class SAPlacer
 
             // Back annotate location
             cell->attrs[ctx->id("BEL")] = ctx->getBelName(cell->bel).str(ctx);
+            // ...and bring the cluster with it.  Bound STRENGTH_STRONG so a
+            // later ripup cannot pick a child off individually and strand it.
+            if (strict_cluster && !cell->constr_children.empty())
+                bind_constr_children(cell, ctx->getBelLocation(best_bel));
             cell = ripup_target;
         }
     }
@@ -595,8 +873,23 @@ class SAPlacer
         moveChange.reset(this);
         if (!require_legal && is_constrained(cell))
             return false;
+        // A TILE-LOCAL cluster must never be broken up, not even during
+        // legalisation (which is why this is not gated on !require_legal like
+        // the test above).  Such a cluster -- a MUXF7/F8 tree, a LUT+FF pair --
+        // is only legal with every member in one slice, and moving one member
+        // on its own is what splits it.  The tile-level validity check cannot
+        // catch that reliably: it is CACHED PER TILE and a move only dirties
+        // the tiles it touches, so breaking the invariant in the PARENT's tile
+        // goes unnoticed until the final full sweep, by which point the move is
+        // long since committed and the run dies with
+        //   ERROR: post-placement validity check failed for Bel ... (no cell)
+        // Refusing the move is the only place the rule can be enforced cheaply.
+        if (is_in_tile_local_cluster(cell))
+            return false;
         BelId oldBel = cell->bel;
         CellInfo *other_cell = ctx->getBoundBelCell(newBel);
+        if (other_cell != nullptr && is_in_tile_local_cluster(other_cell))
+            return false;
         if (!require_legal && other_cell != nullptr &&
             (is_constrained(other_cell) || other_cell->belStrength > STRENGTH_WEAK)) {
             return false;
@@ -741,7 +1034,16 @@ class SAPlacer
             BelId targetBel = ctx->getBelByLocation(targetLoc);
             if (targetBel == BelId())
                 return false;
-            if (ctx->getBelType(targetBel) != cell->type)
+            // Compare against the type of the MEMBER being moved, not the
+            // chain root's.  Both are the same for a homogeneous chain (a
+            // carry chain of CARRY4s), which is why this went unnoticed, but a
+            // xc7 MUXF7/MUXF8 cluster is heterogeneous: a SELMUX2_1 root with
+            // SLICE_LUTX children.  Testing every member against the root's
+            // type rejected the swap the moment a LUT member was considered,
+            // so mux clusters could never move as a unit and ended up split
+            // across slices -- which the router cannot close, because a MUXF7
+            // must be fed by the two LUTs of its own slice.
+            if (ctx->getBelType(targetBel) != cr.first->type)
                 return false;
             CellInfo *bound = ctx->getBoundBelCell(targetBel);
             // We don't consider swapping chains with other chains, at least for the time being - unless it is

@@ -29,6 +29,7 @@
 #include "nextpnr.h"
 #include "placer1.h"
 #include "placer_heap.h"
+#include "placer_lef.h"
 #include "router1.h"
 #include "router2.h"
 #include "timing.h"
@@ -991,6 +992,9 @@ bool Arch::place()
             return false;
     } else if (placer == "sa") {
         if (!placer1(getCtx(), Placer1Cfg(getCtx())))
+            return false;
+    } else if (placer == "lef") {
+        if (!placer_lef(getCtx()))
             return false;
     } else {
         log_error("US+ architecture does not support placer '%s'\n", placer.c_str());
@@ -2881,7 +2885,11 @@ const std::string Arch::defaultPlacer = "sa";
 // "--placer" give the flow's real placer rather than a 51-minute heap run on a
 // hard-macro design.  heap is merely selectable again, for the designs that
 // want a placer at all.
-const std::vector<std::string> Arch::availablePlacers = {"sa", "heap"};
+// "lef" is the in-progress translation of place_lef.exe's passes into nextpnr
+// (xilinx/placer_lef.cc).  Selectable so each ported pass can be measured with
+// `make placement-ab`; NOT the default until it reproduces place_lef's
+// placement, which today it does not -- it delegates to placer1.
+const std::vector<std::string> Arch::availablePlacers = {"sa", "heap", "lef"};
 
 const std::string Arch::defaultRouter = "router2";
 const std::vector<std::string> Arch::availableRouters = {"router1", "router2"};

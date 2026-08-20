@@ -21,6 +21,7 @@
 #include <queue>
 #include "design_utils.h"
 #include "log.h"
+#include <cstdlib>
 #include "nextpnr.h"
 #include "timing.h"
 #include "util.h"
@@ -35,7 +36,12 @@ inline NetInfo *port_or_nullptr(const CellInfo *cell, IdString name)
 }
 
 //#define DEBUG_VALIDITY
-bool dbg_validity_runtime = false;
+// Set NEXTPNR_DBG_VALIDITY=1 to have every rejected slice name the rule that
+// refused it (DBG()/DBG_RT() print __LINE__).  The flag existed but nothing
+// ever set it, so "post-placement validity check failed for Bel X (no cell)"
+// was unactionable -- it says a tile is illegal without saying which of the
+// dozen rules in this file objected.
+bool dbg_validity_runtime = getenv("NEXTPNR_DBG_VALIDITY") != nullptr;
 static bool packing_oracle();
 #define DBG_RT()                                                                                                       \
     do {                                                                                                               \
@@ -415,6 +421,89 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
     if (lts.cells[(3 << 4) | BEL_5LUT] != nullptr && lts.cells[(3 << 4) | BEL_5LUT]->lutInfo.is_memory)
         small_memory = true;
     NetInfo *wclk = nullptr;
+    // A MUXF8 belongs on an F8MUX bel and a MUXF7 on F7AMUX/F7BMUX.  This
+    // repeats the gate in isValidBelForCell ON PURPOSE: that one only filters
+    // INITIAL candidates, and SA swaps and legalisation go around it -- exactly
+    // as the 5LUT and SLICEM comments in this file record.  With the rule
+    // stated only there, johnson's MUXF8 roots drifted back onto F7BMUX bels
+    // during annealing and took their clusters apart across three slices each:
+    //   root SLICE_X124Y216/F7BMUX kids=6 -> X122Y216, X124Y216, X125Y216
+    // which the router then cannot close, e.g.
+    //   Failed to route arc 0 ... from SLICE_X124Y215/F7BMUX_OUT
+    //                              to SLICE_X122Y215/C6LUT_O6
+    // (a MUXF7 has to be fed by the two LUTs of its own slice).
+    // Only xc7 needs this: other families keep MUXF7/MUXF8 as distinct cell
+    // types, so the type check alone is sufficient there.
+    if (xc7) {
+        // A mux cluster must not straddle slices.  The packer builds the whole
+        // F7/F7/F8 tree plus its four LUTs as one constrained cluster, and the
+        // constraints themselves are right (X=0 Y=0, Z relative: -1 for the
+        // F7AMUX, +31 for the F7BMUX, off the F8MUX's z=8).  Even so ONE child
+        // was observed escaping -- SLICE_X125Y217/F7BMUX under a parent at
+        // SLICE_X123Y217/F8MUX, five of six siblings correct -- with no
+        // "chain child pre-bind failed" warning, so the placer believed it was
+        // legal.  A MUXF7 can only be fed by the two LUTs of its own slice, so
+        // the router then fails:
+        //   Failed to route arc 0 ... from SLICE_X123Y217/D6LUT_O6
+        //                              to SLICE_X125Y217/D6LUT_O6
+        // Rejecting the straddle here makes the state unreachable rather than
+        // relying on every placement path to maintain it.
+        // Every slot, not just the mux ones.  A LUT->FF pair is a cluster too
+        // (constr_x/y both 0, so the flop must share its LUT's slice for the
+        // O6->D path), and SA's LEGALISATION pass moves constrained cells
+        // individually on purpose -- try_swap_position only refuses them while
+        // `!require_legal`.  With the rule stated for muxes alone, a LUT+FF
+        // pair split across rows survived to the router:
+        //   child  SLICE_FFX  SLICE_X125Y217/AFF
+        //   parent SLICE_LUTX SLICE_X125Y216/A6LUT
+        // johnson had merely been lucky in the ordering until now.
+        for (int i = 0; i < 8; i++) {
+            for (int mt : {BEL_F7MUX, BEL_F8MUX, BEL_6LUT, BEL_5LUT, BEL_FF, BEL_FF2}) {
+                CellInfo *mc = lts.cells[(i << 4) | mt];
+                if (mc == nullptr || mc->belStrength >= STRENGTH_USER)
+                    continue;
+                auto tile_local = [](const CellInfo *c) {
+                    return (c->constr_x == c->UNCONSTR || c->constr_x == 0) &&
+                           (c->constr_y == c->UNCONSTR || c->constr_y == 0);
+                };
+                CellInfo *par = mc->constr_parent;
+                if (par != nullptr && par->bel != BelId() && mc->bel != BelId() && tile_local(mc)) {
+                    Loc pl = getBelLocation(par->bel), cl = getBelLocation(mc->bel);
+                    if (pl.x != cl.x || pl.y != cl.y) {
+                        DBG();
+                        return false;
+                    }
+                }
+                for (auto ch : mc->constr_children) {
+                    if (ch->bel == BelId() || mc->bel == BelId() || !tile_local(ch))
+                        continue;
+                    Loc chl = getBelLocation(ch->bel), cl = getBelLocation(mc->bel);
+                    if (chl.x != cl.x || chl.y != cl.y) {
+                        DBG();
+                        return false;
+                    }
+                }
+            }
+        }
+        for (int i = 0; i < 8; i++) {
+            CellInfo *m7 = lts.cells[(i << 4) | BEL_F7MUX];
+            if (m7 != nullptr && m7->belStrength < STRENGTH_USER) {
+                auto o = m7->attrs.find(id("X_ORIG_TYPE"));
+                if (o != m7->attrs.end() && o->second.as_string() == "MUXF8") {
+                    DBG();
+                    return false;
+                }
+            }
+            CellInfo *m8 = lts.cells[(i << 4) | BEL_F8MUX];
+            if (m8 != nullptr && m8->belStrength < STRENGTH_USER) {
+                auto o = m8->attrs.find(id("X_ORIG_TYPE"));
+                if (o != m8->attrs.end() && o->second.as_string() == "MUXF7") {
+                    DBG();
+                    return false;
+                }
+            }
+        }
+    }
     // Check eight-tiles (mostly LUT-related validity)
     for (int i = 0; i < 8; i++) {
         if (lts.eights[i].dirty) {
@@ -610,13 +699,32 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
                     (carry4 != nullptr && drv.cell == carry4)) {
                     // Direct, OK (LUT O6/O5, F7/F8 mux out, or the slot's
                     // CARRY4 O/CO via the XOR/CY xFFMUX paths)
-                } else if (ff1->attrs.count(id_BEL) && (lut6 == nullptr || lut5 == nullptr)) {
+                } else if (ff1->belStrength >= STRENGTH_USER && (lut6 == nullptr || lut5 == nullptr)) {
                     // Imported (Vivado-placed) FF with a free LUT position in
                     // the slot: Vivado feeds the main FF through a LUT
                     // routethru (free 6LUT: INIT buffer + xFFMUX.O6; free
                     // 5LUT: lower-half INIT buffer + xFFMUX.O5) and leaves
                     // the X bypass for the 5FF -- no X usage here.  The
                     // router realises this via the route-thru pseudo pip.
+                    //
+                    // TEST belStrength, NOT attrs["BEL"].  This arm is reached
+                    // from isBelLocationValid, i.e. AFTER binding, and placer1
+                    // back-annotates `cell->attrs["BEL"]` on every cell it
+                    // places (placer1.cc:585-587, bound STRENGTH_WEAK).  So the
+                    // attribute is true for nextpnr's OWN placements too, and
+                    // this Vivado-only escape hatch fired for them whenever the
+                    // slot's 5LUT happened to be free -- skipping the X-usage
+                    // accounting below and accepting a slice that cannot route.
+                    // That is how johnson ended up with an F8MUX (whose select
+                    // consumes BX) sharing SLICE_X122Y216 with a BFF whose D
+                    // came from another slice and needed BX as well:
+                    //   ERROR: Failed to route arc 1 of net 'core.prbs[26]',
+                    //     from SLICE_X123Y216/AQ to SLICE_X122Y216/BFFMUX_OUT
+                    // Cells stamped from the JSON are bound STRENGTH_USER by
+                    // the constraints placer (placer1.cc:192), so the strength
+                    // separates the two cases where the attribute cannot.  The
+                    // same hazard is documented at the foot of this file for
+                    // the post-placement fast path.
                 } else {
                     // Indirect, must use X input
                     ff1_uses_x = true;
@@ -1030,6 +1138,37 @@ bool Arch::isValidBelForCell(CellInfo *cell, BelId bel) const
 {
     if (usp_bel_hard_unavail(bel))
         return false;
+    // A MUXF8 may only sit on an F8MUX bel, and a MUXF7 only on F7AMUX/F7BMUX.
+    //
+    // On every other family that is enforced by the TYPE: pack.cc gives
+    // MUXF7 -> F7MUX and MUXF8 -> F8MUX.  On xc7 alone both are rewritten to
+    // the single type SELMUX2_1 (pack.cc: `ctx->xc7 ? id("SELMUX2_1") : ...`),
+    // which erases the distinction the placer would otherwise honour -- so
+    // nothing stops an F8 landing on an F7 bel.  It happened in two of
+    // johnson's three mux trees (MUXF8 cells bound to SLICE_X124Y214/F7BMUX
+    // and SLICE_X124Y216/F7BMUX), and the router then cannot reach the LUT
+    // that should have shared the slice:
+    //   ERROR: Failed to route arc 0 ... from SITEWIRE/SLICE_X124Y215/F7BMUX_OUT
+    //                                      to SITEWIRE/SLICE_X124Y214/C6LUT_O6
+    // That is the whole reason johnson and calc cannot be placed by nextpnr
+    // and have to come in pre-stamped by place_lef.
+    //
+    // The original type survives packing as X_ORIG_TYPE, so the rule can be
+    // restated here without touching the packer or the chipdb.  Enforced at
+    // candidate-selection time for the same reason as the 5LUT and SLICEM
+    // gates above: a post-hoc tile check rejects it too late for the placer to
+    // choose differently.
+    if (xc7 && cell->type == id("SELMUX2_1") && !cell->attrs.count(id("BEL"))) {
+        auto orig = cell->attrs.find(id("X_ORIG_TYPE"));
+        if (orig != cell->attrs.end()) {
+            const std::string &ot = orig->second.as_string();
+            int bel_z = getBelLocation(bel).z & 0xF;
+            if (ot == "MUXF8" && bel_z != BEL_F8MUX)
+                return false;
+            if (ot == "MUXF7" && bel_z != BEL_F7MUX)
+                return false;
+        }
+    }
     // A distributed-RAM / SRL LUT (is_memory / is_srl) is only legal in a
     // SLICEM.  Like the 6LUT-on-5LUT gate below, this MUST be enforced at
     // candidate-selection time: the tile-level isBelLocationValid() rejects

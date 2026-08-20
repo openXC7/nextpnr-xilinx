@@ -947,6 +947,18 @@ class HeAPPlacer
             int radius = 0;
             int iter = 0;
             int iter_at_radius = 0;
+            // Bound that CANNOT be reset, plus a breakdown of WHY candidates
+            // were refused.  `iter` below is zeroed every time the search
+            // radius grows (see "iter = 0" further down), so the timeout it
+            // guards can be postponed indefinitely: a cell no bel will ever
+            // accept just widens its radius forever.  That is the reported
+            // 7.4M-attempt hang on a SELMUX2_1 with the device 0% full -- and
+            // because total_iters_noreset is only tested in the OUTER loop, an
+            // inner loop that never exits is never counted at all.  A hang with
+            // no diagnostic is the real defect here, whatever the placement
+            // quality afterwards.
+            int hard_iters = 0;
+            int64_t cand_tried = 0, cand_invalid = 0, cand_region = 0;
             bool placed = false;
             BelId bestBel;
             int best_inp_len = std::numeric_limits<int>::max();
@@ -970,6 +982,28 @@ class HeAPPlacer
                 if (iter > std::max(10000, 3 * int(ctx->cells.size())))
                     log_error("Unable to find legal placement for cell '%s', check constraints and utilisation.\n",
                               ctx->nameOf(ci));
+
+                // ...and one the radius reset cannot defer, which SAYS WHY.
+                // Overridable so the diagnostic below can actually be
+                // EXERCISED (NEXTPNR_HEAP_MAX_ITERS=200).  An error path that
+                // has never once been run is not a diagnostic, it is a guess.
+                int hard_cap = std::max(200000, 50 * int(ctx->cells.size()));
+                if (const char *e = getenv("NEXTPNR_HEAP_MAX_ITERS"))
+                    hard_cap = atoi(e);
+                if (++hard_iters > hard_cap) {
+                    log_info("placer_heap: giving up on '%s' (type %s) after %d attempts\n", ctx->nameOf(ci),
+                             ci->type.c_str(ctx), hard_iters);
+                    log_info("  candidate bels examined %lld: %lld refused by isBelLocationValid, %lld outside "
+                             "the cell's region\n",
+                             (long long)cand_tried, (long long)cand_invalid, (long long)cand_region);
+                    log_info("  search radius %d (device %dx%d), region %s\n", radius, max_x, max_y,
+                             ci->region == nullptr ? "none" : ci->region->name.c_str(ctx));
+                    if (cand_tried > 0 && cand_invalid == cand_tried)
+                        log_info("  EVERY candidate was rejected as invalid -- this is a legality rule the "
+                                 "placer cannot satisfy, not a utilisation problem.\n");
+                    log_error("Unable to find legal placement for cell '%s' (see the breakdown above).\n",
+                              ctx->nameOf(ci));
+                }
 
                 int rx = radius, ry = radius;
 
@@ -1043,8 +1077,11 @@ class HeAPPlacer
 
                 if (ci->constr_children.empty() && !ci->constr_abs_z) {
                     for (auto sz : fb.at(nx).at(ny)) {
-                        if (ci->region != nullptr && ci->region->constr_bels && !ci->region->bels.count(sz))
+                        if (ci->region != nullptr && ci->region->constr_bels && !ci->region->bels.count(sz)) {
+                            ++cand_region;
                             continue;
+                        }
+                        ++cand_tried;
                         if (ctx->checkBelAvail(sz) || (radius > ripup_radius || ctx->rng(20000) < 10)) {
                             CellInfo *bound = ctx->getBoundBelCell(sz);
                             if (bound != nullptr) {
@@ -1055,6 +1092,7 @@ class HeAPPlacer
                             }
                             ctx->bindBel(sz, ci, STRENGTH_WEAK);
                             if (require_validity && !ctx->isBelLocationValid(sz)) {
+                                ++cand_invalid;
                                 ctx->unbindBel(sz);
                                 if (bound != nullptr)
                                     ctx->bindBel(sz, bound, STRENGTH_WEAK);
