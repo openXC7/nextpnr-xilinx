@@ -109,6 +109,21 @@ struct CarryStampStats
 // per primitive).  `slice_sites` supplies the legal SLICE site names for the
 // neighbour-bel search -- from nextpnr's chipdb, replacing carry_stamp.py's
 // CARRY_FLOORPLAN read.  Honours CARRY_STAMP_AVOID_CI and CARRY_FB_NETS.
+// ---- emit_clock_xdc ------------------------------------------------------
+// nextpnr can only create_clock on PORTS, but the interesting clocks are BUFG
+// outputs several derivations downstream of one (GT refclk -> GTXE2 -> TXOUTCLK
+// -> MMCM -> userclk2), which it cannot derive.  Without these, every clock
+// falls back to --freq: measured on ethmin that reported the 125 MHz SGMII
+// datapath as "65.35 MHz (PASS at 25.00 MHz)" -- missing its real target by 2x
+// and calling it a PASS.  Every criticality the router exports is then relative
+// to the wrong period.
+//
+// `spec` is TOPO_CLOCK_PERIODS: "bufg_userclk2=8.0,clk_sys_bufg=40.0,...".
+// Keys are matched as SUBSTRINGS of BUFG/BUFGCTRL CELL names, which come from
+// the design hierarchy and are stable, unlike synthesis-generated net names.
+// Returns the number of create_clock lines written, -1 on failure.
+int netlist_emit_clock_xdc(Netlist *n, const std::string &path, const std::string &spec);
+
 CarryStampStats netlist_carry_stamp(Netlist *n,
                                     const std::vector<std::pair<std::string, std::string>> &bels,
                                     const std::vector<std::string> &slice_sites);

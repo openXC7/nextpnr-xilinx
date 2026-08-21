@@ -91,9 +91,18 @@ void UspCommandHandler::customAfterLoad(Context *ctx)
             ctx->parseXdc(in);
         }
     }
+    // The transplant's own clock constraints, parsed AFTER the user's --xdc so
+    // an explicit constraint still wins.  nextpnr cannot derive a BUFG-output
+    // clock, and without these every clock silently falls back to --freq.
+    if (const char *cx = getenv("TOPO_CLOCKS_XDC")) {
+        std::ifstream in(cx);
+        if (in) {
+            ctx->parseXdc(in);
+            log_info("place_lef: applied generated clock constraints from %s\n", cx);
+        }
+    }
     if (vm.count("fixed-routes"))
         ctx->settings[ctx->id("fixed-routes")] = vm["fixed-routes"].as<std::string>();
-
 }
 
 // --placer lef: run the whole place_lef transplant HERE, before the netlist is

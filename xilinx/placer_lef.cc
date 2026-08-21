@@ -1939,6 +1939,17 @@ std::string place_lef_transplant(Context *ctx, const std::string &json_path)
             log_warning("  %d wide-mux data pin(s) LEFT ALONE (driver is not a LUT) -- each "
                         "will fail to route\n",
                         ps.mux_skipped);
+        // Clock constraints, from the POST-prepass netlist (BUFG cells and
+        // netnames are final by now; carry_stamp adds neither).  Emitted here
+        // so the flow is self-sufficient -- it previously borrowed a clocks.xdc
+        // that place_lef had written on an earlier run.
+        if (const char *cx = getenv("TOPO_CLOCKS_XDC")) {
+            int nclk = lefpack::netlist_emit_clock_xdc(nl, cx, getenv_str("TOPO_CLOCK_PERIODS", ""));
+            if (nclk < 0)
+                log_warning("  could not write TOPO_CLOCKS_XDC '%s'\n", cx);
+            else
+                log_info("  wrote %d create_clock line(s) to %s\n", nclk, cx);
+        }
         // Optional dump of the PRE-carry_stamp netlist, for the three-step flow.
         if (const char *ft = getenv("PACK_LEF_FT_JSON")) {
             if (!lefpack::netlist_write(nl, ft)) {
