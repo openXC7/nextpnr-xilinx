@@ -786,6 +786,14 @@ struct LefSite
     bool used = false;
     std::string kind;  // place_lef's floorplan kind: SLICE, BRAM, DSP, IO, ...
     BelId rep;         // representative bel (the A6LUT for a SLICE)
+    // Physical-overlap group.  A RAMB36 site occupies the SAME TILE as two
+    // RAMB18 sites (RAMB36_XaYb <-> RAMB18_XaY2b and XaY2b+1), so the two pools
+    // ALIAS.  Allocated independently they collide, and nextpnr rejects the
+    // result only after packing, as
+    //   ERROR: post-placement validity check failed for Bel
+    //          'RAMB18_X6Y40/FIFO18E1' (no cell)
+    // which names the victim, not the RAMB36 that took its tile.  -1 = no alias.
+    int grp = -1;
 };
 
 // Site NAME -> place_lef floorplan kind.  Mirrors kind_of_lef's codomain; the
@@ -890,6 +898,24 @@ static std::vector<LefSite> build_sites(Context *ctx)
         s.sx = nearest(tilex2sx, l.x);
         s.sy = nearest(tiley2sy, l.y);
     }
+
+    // Alias groups for the BRAM pools (see LefSite::grp).  Keyed on the TILE
+    // the site occupies, which is what actually overlaps -- safer than doing
+    // index arithmetic on the names.
+    std::map<std::pair<int, int>, int> grp_id;
+    for (auto &s : sites) {
+        if ((s.kind != "BRAM" && s.kind != "BRAM18") || s.rep == BelId())
+            continue;
+        Loc l = ctx->getBelLocation(s.rep);
+        auto key = std::make_pair(l.x, l.y);
+        auto it = grp_id.find(key);
+        if (it == grp_id.end()) {
+            int id = int(grp_id.size());
+            grp_id[key] = id;
+            s.grp = id;
+        } else
+            s.grp = it->second;
+    }
     return sites;
 }
 
@@ -980,9 +1006,32 @@ static bool place_lef_place(Context *ctx, lefpack::PackResult &r, std::vector<Le
     }
 
     std::unordered_map<std::string, int> occ; // site name -> cell
+    int ngrp = 0;
+    for (auto &s : sites)
+        ngrp = std::max(ngrp, s.grp + 1);
+    // A BRAM tile hosts EITHER one RAMB36 OR up to two RAMB18s, so the two
+    // pools alias without being mutually exclusive one-for-one.  Blocking the
+    // whole tile on any use is wrong the other way: it halves the RAMB18
+    // capacity and spreads the memory over twice the columns.
+    std::vector<int> grp_n18(ngrp, 0), grp_n36(ngrp, 0);
+    auto site_free = [&](const LefSite &s) {
+        if (s.used)
+            return false;
+        if (s.grp < 0)
+            return true;
+        if (s.kind == "BRAM") // a RAMB36 needs the tile to itself
+            return grp_n18[s.grp] == 0 && grp_n36[s.grp] == 0;
+        return grp_n36[s.grp] == 0; // a RAMB18 only conflicts with a RAMB36
+    };
     auto fits = [&](size_t i, const LefSite &s) { return need_sm[i] ? s.sm : true; };
     auto bind = [&](size_t i, LefSite &s) {
         s.used = true;
+        if (s.grp >= 0) {
+            if (s.kind == "BRAM")
+                grp_n36[s.grp]++;
+            else
+                grp_n18[s.grp]++;
+        }
         cell_site[i] = int(&s - sites.data());
         pos_x[i] = s.sx;
         pos_y[i] = s.sy;
@@ -1045,7 +1094,7 @@ static bool place_lef_place(Context *ctx, lefpack::PackResult &r, std::vector<Le
         LefSite *best = nullptr;
         int bd = INT_MAX;
         for (auto &s : sites) {
-            if (s.used || s.kind != kind)
+            if (!site_free(s) || s.kind != kind)
                 continue;
             int d = std::abs(s.sx - tx) + std::abs(s.sy - ty);
             if (d < bd) {
@@ -1055,6 +1104,53 @@ static bool place_lef_place(Context *ctx, lefpack::PackResult &r, std::vector<Le
         }
         return best;
     };
+    // TOPO_SITE_IN: adopt an external tool's HARD-BLOCK placement.  For ethmin
+    // this pins the GT and the clock buffers to the sites VIVADO uses; left
+    // free, "nearest free site" puts the transceiver somewhere else entirely
+    // and the design does not route.  Keyed by PRIMITIVE because that is what
+    // external tools name; the packed unit is found through pc_bels, falling
+    // back to the unit's own name minus the "$site" pack_to_lef appends --
+    // GT and IO units carry NO bel suffix, so a bels-only lookup would silently
+    // fail for exactly the two cells the anchor depends on most.
+    std::unordered_map<std::string, std::string> site_want;
+    if (const char *sip = getenv("TOPO_SITE_IN")) {
+        std::ifstream f(sip);
+        if (!f)
+            log_warning("  TOPO_SITE_IN: %s not found (ignored)\n", sip);
+        std::string line;
+        while (std::getline(f, line)) {
+            std::stringstream ss(line);
+            std::string nm, sb;
+            if (!std::getline(ss, nm, '\t') || !std::getline(ss, sb, '\t'))
+                continue;
+            size_t sl = sb.find('/');
+            if (sl != std::string::npos)
+                sb = sb.substr(0, sl);
+            site_want[nm] = sb;
+            // distributed RAM arrives as LEAF sub-bels; offer the collapsed
+            // parent key too, first one wins
+            size_t rs = nm.rfind('/');
+            if (rs != std::string::npos && rs > 0 && !site_want.count(nm.substr(0, rs)))
+                site_want[nm.substr(0, rs)] = sb;
+        }
+    }
+    std::unordered_map<std::string, LefSite *> site_by_name;
+    for (auto &s2 : sites)
+        site_by_name[s2.name] = &s2;
+    auto want_site_of = [&](const lefpack::PackedCell &c) -> const std::string * {
+        for (auto &b : c.pc_bels) {
+            auto it = site_want.find(b.first);
+            if (it != site_want.end())
+                return &it->second;
+        }
+        std::string n = c.pc_name;
+        size_t d = n.find('$');
+        if (d != std::string::npos && n.compare(d, 5, "$site") == 0)
+            n = n.substr(0, d);
+        auto it = site_want.find(n);
+        return it == site_want.end() ? nullptr : &it->second;
+    };
+
     std::vector<size_t> hard;
     for (size_t i = 0; i < ncells; i++)
         if (!skip[i] && kind_of_lef(r.cells[i].pc_lef) != "SLICE")
@@ -1065,14 +1161,26 @@ static bool place_lef_place(Context *ctx, lefpack::PackResult &r, std::vector<Le
         return ka < kb;
     });
     std::map<std::string, std::pair<int, int>> last_pos;
-    int nhard = 0, nhard_fail = 0;
+    int nhard = 0, nhard_fail = 0, nhard_imported = 0;
     for (size_t i : hard) {
         std::string kind = kind_of_lef(r.cells[i].pc_lef);
         std::string gk = kind + ":" + group_key(r.cells[i].pc_name);
         auto lp = last_pos.find(gk);
         int tx = lp == last_pos.end() ? 110 : lp->second.first;
         int ty = lp == last_pos.end() ? 100 : lp->second.second;
-        LefSite *s = nearest_free_of(kind, tx, ty);
+        LefSite *s = nullptr;
+        if (const std::string *wn = want_site_of(r.cells[i])) {
+            auto it = site_by_name.find(*wn);
+            if (it != site_by_name.end() && site_free(*it->second)) {
+                s = it->second;
+                nhard_imported++;
+            } else
+                log_warning("  TOPO_SITE_IN: site '%s' for %s is %s\n", wn->c_str(),
+                            r.cells[i].pc_name.c_str(),
+                            it == site_by_name.end() ? "unknown to the chipdb" : "already taken");
+        }
+        if (!s)
+            s = nearest_free_of(kind, tx, ty);
         if (s) {
             bind(i, *s);
             last_pos[gk] = {s->sx, s->sy};
@@ -1082,7 +1190,8 @@ static bool place_lef_place(Context *ctx, lefpack::PackResult &r, std::vector<Le
             nhard_fail++;
         }
     }
-    log_info("  phase A: %d hard block(s) placed, %d unplaceable\n", nhard, nhard_fail);
+    log_info("  phase A: %d hard block(s) placed (%d from TOPO_SITE_IN), %d unplaceable\n", nhard,
+             nhard_imported, nhard_fail);
 
     // ---- anchor ---------------------------------------------------------
     // NOTE: place_lef invents its own IO sites (it ignores PACKAGE_PIN), so its
