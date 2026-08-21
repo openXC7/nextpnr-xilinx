@@ -71,6 +71,7 @@
 
 #include "log.h"
 #include "nextpnr.h"
+#include "pack_to_lef_port.h"
 #include "placer1.h"
 #include "util.h"
 
@@ -754,6 +755,91 @@ bool placer_lef(Context *ctx)
     // Everything not yet ported still goes to placer1 -- but now inside the
     // region above, so its choices are made in the same part of the die.
     return placer1(ctx, Placer1Cfg(ctx));
+}
+
+// =========================================================================
+// place_lef TRANSPLANT -- the recognition pre-pass.
+//
+// This runs from customAfterLoad, on the RAW netlist, because pack_to_lef
+// recognises LUT6 / FDRE / CARRY4 / MUXF7 -- and by the time the placer slot
+// runs, nextpnr's packer has already turned those into SLICE_LUTX/SLICE_FFX.
+// It reads the yosys JSON file directly, which is exactly the input the OCaml
+// takes, so the recognition is bit-for-bit the ported one.
+//
+// The unit it produces is the thing being transplanted: place_lef anneals
+// 1443 packed SLICEs whose contents were decided in advance, where nextpnr
+// anneals 7759 loose cells and lets co-tenancy fall out of legality checks.
+// Measured on ethmin those two partitions share only 28.9% of the co-tenancy
+// pairs pack_to_lef decides.
+// =========================================================================
+bool place_lef_prepass(Context *ctx, const std::string &json_path)
+{
+    lefpack::PackResult r = lefpack::pack_to_lef_json(json_path);
+    if (r.cells.empty()) {
+        log_error("place_lef pre-pass: packed NO cells from '%s'\n", json_path.c_str());
+        return false;
+    }
+
+    log_info("place_lef pre-pass: %zu instances -> %zu packed units\n", r.n_instances,
+             r.cells.size());
+    for (auto &kv : r.report)
+        log_info("    %5d  %s\n", kv.second, kv.first.c_str());
+
+    // Unit census by LEF type, and the size distribution -- this is the
+    // grouping the placer is supposed to move as single objects.
+    std::map<std::string, int> by_lef;
+    std::map<size_t, int> by_size;
+    size_t members = 0;
+    for (auto &c : r.cells) {
+        by_lef[c.pc_lef]++;
+        by_size[c.pc_bels.size()]++;
+        members += c.pc_bels.size();
+    }
+    for (auto &kv : by_lef)
+        log_info("  unit type %-14s %5d\n", kv.first.c_str(), kv.second);
+    std::string hist;
+    for (auto &kv : by_size)
+        hist += stringf("%zu:%d ", kv.first, kv.second);
+    log_info("  members/unit: %s(mean %.2f)\n", hist.c_str(),
+             double(members) / double(r.cells.size()));
+
+    // JOIN RATE.  pack_to_lef's names come from the yosys JSON; ctx's come from
+    // nextpnr's own parser.  Two name spaces meet here, and a silent mismatch
+    // would look exactly like "the transplant did nothing" -- so it is measured
+    // and it is fatal, not a warning.
+    size_t matched = 0, missing = 0;
+    std::string first_missing;
+    for (auto &c : r.cells)
+        for (auto &b : c.pc_bels) {
+            if (ctx->cells.count(ctx->id(b.first)))
+                matched++;
+            else {
+                if (missing == 0)
+                    first_missing = b.first;
+                missing++;
+            }
+        }
+    log_info("  join rate: %zu/%zu unit members resolve to a ctx cell (%.1f%%)\n", matched,
+             matched + missing, 100.0 * double(matched) / double(matched + missing));
+    if (missing > 0)
+        log_warning("  %zu member(s) did NOT resolve, first '%s' -- the placement cannot be "
+                    "stamped onto them\n",
+                    missing, first_missing.c_str());
+
+    // Database dump.  bels.txt is the same shape place_lef writes, so the
+    // downstream (carry_stamp.py -> route) stays byte-identical to the OCaml
+    // flow and an A/B differs in exactly one component.  Sites are filled in by
+    // the placer; this pre-pass emits the grouping only.
+    if (const char *out = getenv("PACK_LEF_UNITS_OUT")) {
+        std::ofstream o(out);
+        if (!o)
+            log_error("place_lef pre-pass: cannot write '%s'\n", out);
+        for (auto &c : r.cells)
+            for (auto &b : c.pc_bels)
+                o << b.first << "\t" << b.second << "\t" << c.pc_name << "\t" << c.pc_lef << "\n";
+        log_info("  wrote unit membership to %s\n", out);
+    }
+    return true;
 }
 
 NEXTPNR_NAMESPACE_END

@@ -1,0 +1,1256 @@
+// pack_to_lef.cpp -- EXACT C++ transliteration of SVS deps/System-Verilog-suite/
+// pack_to_lef.ml (the recognition packer place_lef.exe uses).
+//
+// WHY THIS EXISTS.  nextpnr places individual cells; place_lef places PACKED
+// UNITS decided before placement.  Measured on ethmin, the two flows agree on
+// only 28.9% of the slice co-tenancy pairs that pack_to_lef decides (85% where
+// nextpnr's own packer fills in), while agreeing almost exactly on the census
+// (1542 vs 1501 slices, 7801 vs 7759 cells).  Same cells, different partition.
+// So the packer is ported EXACTLY first, as a standalone whose output can be
+// diffed cell-for-cell against the OCaml, and only then integrated.
+//
+// FIDELITY NOTES -- the things that would silently diverge:
+//   * m.instances ORDER drives every phase.  yosys JSON cell order is the
+//     order; a std::map-backed JSON parser (json11) would alphabetise it, so
+//     this file carries its own order-preserving parser.
+//   * `sinks` lists are built by PREPENDING, so they iterate in reverse
+//     instance order.  Replicated.
+//   * conns/bels are built by prepending and reversed once at `add`, so the
+//     emitted order is call order.  Replicated.
+//   * net identity on the yosys path: bit-id integer.  bit_expr maps `Int id`
+//     to BVar "n<id>" (width lookup fails -> width 1), so each bit is exactly
+//     Net("n<id>", 0) -- a bijection with the bit-id.  Hence netkey == int
+//     here, with GND/VCC as sentinels.  Anything not Int/"0"/"1" (i.e. "x",
+//     "z") maps to Const false, as in the OCaml.
+//   * phase 1a0 (r256 groups) uses Hashtbl.iter in the OCaml, whose order is
+//     UNSPECIFIED.  We use first-encounter order: deterministic, and strictly
+//     better-defined than the original.  ethmin has 0 such groups.
+
+#include <algorithm>
+#include <cctype>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <map>
+#include <memory>
+#include <set>
+#include <sstream>
+#include <string>
+#include <tuple>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+#include "pack_to_lef_port.h"
+
+namespace lefpack {
+
+// ---------------------------------------------------------------- JSON ----
+// Minimal recursive-descent parser.  Objects keep INSERTION ORDER (a vector of
+// pairs), which is the whole point of not using json11 here.
+struct JVal;
+using JPtr = std::shared_ptr<JVal>;
+struct JVal
+{
+    enum K { OBJ, ARR, STR, NUM, BOOL, NUL } k = NUL;
+    std::vector<std::pair<std::string, JPtr>> obj;
+    std::vector<JPtr> arr;
+    std::string str;
+    double num = 0;
+    bool bol = false;
+
+    JPtr member(const std::string &n) const
+    {
+        for (auto &kv : obj)
+            if (kv.first == n)
+                return kv.second;
+        return nullptr;
+    }
+};
+
+struct JParser
+{
+    const std::string &s;
+    size_t i = 0;
+    explicit JParser(const std::string &src) : s(src) {}
+
+    void ws()
+    {
+        while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r'))
+            i++;
+    }
+    [[noreturn]] void die(const char *m)
+    {
+        fprintf(stderr, "JSON parse error at offset %zu: %s\n", i, m);
+        exit(1);
+    }
+    std::string parse_string()
+    {
+        if (s[i] != '"')
+            die("expected string");
+        i++;
+        std::string out;
+        while (i < s.size() && s[i] != '"') {
+            if (s[i] == '\\') {
+                i++;
+                switch (s[i]) {
+                case 'n': out += '\n'; break;
+                case 't': out += '\t'; break;
+                case 'r': out += '\r'; break;
+                case 'b': out += '\b'; break;
+                case 'f': out += '\f'; break;
+                case 'u': {
+                    // yosys does not emit these in cell names, but be safe:
+                    // decode the BMP codepoint as UTF-8.
+                    unsigned cp = std::stoul(s.substr(i + 1, 4), nullptr, 16);
+                    i += 4;
+                    if (cp < 0x80)
+                        out += char(cp);
+                    else if (cp < 0x800) {
+                        out += char(0xC0 | (cp >> 6));
+                        out += char(0x80 | (cp & 0x3F));
+                    } else {
+                        out += char(0xE0 | (cp >> 12));
+                        out += char(0x80 | ((cp >> 6) & 0x3F));
+                        out += char(0x80 | (cp & 0x3F));
+                    }
+                    break;
+                }
+                default: out += s[i];
+                }
+                i++;
+            } else
+                out += s[i++];
+        }
+        if (i >= s.size())
+            die("unterminated string");
+        i++;
+        return out;
+    }
+    JPtr parse()
+    {
+        ws();
+        auto v = std::make_shared<JVal>();
+        if (i >= s.size())
+            die("unexpected end");
+        char c = s[i];
+        if (c == '{') {
+            v->k = JVal::OBJ;
+            i++;
+            ws();
+            if (s[i] == '}') { i++; return v; }
+            for (;;) {
+                ws();
+                std::string key = parse_string();
+                ws();
+                if (s[i] != ':')
+                    die("expected :");
+                i++;
+                v->obj.emplace_back(key, parse());
+                ws();
+                if (s[i] == ',') { i++; continue; }
+                if (s[i] == '}') { i++; break; }
+                die("expected , or }");
+            }
+        } else if (c == '[') {
+            v->k = JVal::ARR;
+            i++;
+            ws();
+            if (s[i] == ']') { i++; return v; }
+            for (;;) {
+                v->arr.push_back(parse());
+                ws();
+                if (s[i] == ',') { i++; continue; }
+                if (s[i] == ']') { i++; break; }
+                die("expected , or ]");
+            }
+        } else if (c == '"') {
+            v->k = JVal::STR;
+            v->str = parse_string();
+        } else if (c == 't') {
+            v->k = JVal::BOOL; v->bol = true; i += 4;
+        } else if (c == 'f') {
+            v->k = JVal::BOOL; v->bol = false; i += 5;
+        } else if (c == 'n') {
+            v->k = JVal::NUL; i += 4;
+        } else {
+            v->k = JVal::NUM;
+            size_t st = i;
+            while (i < s.size() && (isdigit((unsigned char)s[i]) || s[i] == '-' || s[i] == '+' ||
+                                    s[i] == '.' || s[i] == 'e' || s[i] == 'E'))
+                i++;
+            v->num = strtod(s.substr(st, i - st).c_str(), nullptr);
+        }
+        return v;
+    }
+};
+
+// ------------------------------------------------------------- netkeys ----
+// NK_GND / NK_VCC / NK_NONE and is_net() are declared in the header; this is
+// their only definition.
+std::string string_of_netkey(int k)
+{
+    if (k == NK_GND) return "GND";
+    if (k == NK_VCC) return "VCC";
+    if (k == NK_NONE) return "-";
+    char b[32];
+    snprintf(b, sizeof(b), "n%d[0]", k);
+    return b;
+}
+
+// --------------------------------------------------------------- utils ----
+static std::string upper(const std::string &s)
+{
+    std::string o = s;
+    for (auto &c : o) c = toupper((unsigned char)c);
+    return o;
+}
+// [starts_with s pre] : value first, prefix second -- matches the OCaml.
+static bool starts_with(const std::string &s, const char *pre)
+{
+    size_t n = strlen(pre);
+    return s.size() >= n && memcmp(s.data(), pre, n) == 0;
+}
+static std::string lane_letter(int k) { return std::string(1, char('A' + k)); }
+
+static bool is_output(const std::string &mn, const std::string &port)
+{
+    std::string m = upper(mn), p = upper(port);
+    if (starts_with(m, "CARRY4")) return p == "O" || p == "CO";
+    if (starts_with(m, "FD")) return p == "Q";
+    if (starts_with(m, "LUT")) return p == "O";
+    if (starts_with(m, "RAMB")) return starts_with(p, "DO") || starts_with(p, "CASCADEOUT");
+    if (starts_with(m, "DSP")) return p == "P" || p == "PCOUT" || p == "CARRYOUT";
+    if (m == "MMCME2_ADV" || m == "PLLE2_ADV")
+        return starts_with(p, "CLKOUT") || p == "CLKFBOUT" || p == "LOCKED";
+    if (starts_with(m, "BUFG") || starts_with(m, "BUFH")) return p == "O";
+    if (starts_with(m, "IBUF") || starts_with(m, "OBUF") || m == "IBUFDS") return p == "O";
+    return p == "O" || p == "Q";
+}
+
+// io_map / hard_map / slicem_map, verbatim.
+static bool io_map(const std::string &t, std::string &lef)
+{
+    if (t == "IBUF" || t == "OBUF" || t == "IBUFDS" || t == "OBUFDS" || t == "IOBUF" ||
+        t == "IBUFDS_GTE2") { lef = "IOB"; return true; }
+    if (t == "MMCME2_ADV" || t == "PLLE2_ADV") { lef = "MMCM"; return true; }
+    if (t == "BUFG" || t == "BUFGCTRL") { lef = "BUFG"; return true; }
+    if (t == "BUFH" || t == "BUFHCE") { lef = "BUFH"; return true; }
+    // CHANNEL and COMMON are NOT interchangeable (see the OCaml comment).
+    if (t == "GTXE2_CHANNEL" || t == "GTHE2_CHANNEL") { lef = "GT_CHANNEL"; return true; }
+    if (t == "GTXE2_COMMON" || t == "GTHE2_COMMON") { lef = "GT_COMMON"; return true; }
+    return false;
+}
+static bool hard_map(const std::string &t, std::string &lef, std::string &suffix)
+{
+    std::string u = upper(t);
+    if (starts_with(u, "RAMB36")) { lef = "RAMB36"; suffix = "RAMB36E1"; return true; }
+    if (starts_with(u, "RAMB18") || starts_with(u, "FIFO18")) { lef = "RAMB18"; suffix = "RAMB18E1"; return true; }
+    if (starts_with(u, "DSP48")) { lef = "DSP48"; suffix = "DSP48E1"; return true; }
+    return false;
+}
+static bool slicem_map(const std::string &t, std::string &lef, std::string &suffix)
+{
+    std::string u = upper(t);
+    if (starts_with(u, "SRL")) { lef = "SLICEM_SRL"; suffix = "A6LUT"; return true; }
+    if (starts_with(u, "RAMD") || starts_with(u, "RAMS") || starts_with(u, "RAM32") ||
+        starts_with(u, "RAM64")) { lef = "SLICEM_DRAM"; suffix = "A6LUT"; return true; }
+    if (starts_with(u, "MUXF7")) { lef = "SLICE_MUX"; suffix = "F7AMUX"; return true; }
+    if (starts_with(u, "MUXF8")) { lef = "SLICE_MUX"; suffix = "F8MUX"; return true; }
+    return false;
+}
+
+// ------------------------------------------------------------ netlist -----
+struct Inst
+{
+    std::string name;
+    std::string type;
+    std::vector<std::pair<std::string, std::vector<int>>> ports; // JSON order
+};
+
+// PackedCell is declared in the header -- it is the transplant's payload, the
+// unit place_lef anneals as one object.
+
+struct Packer
+{
+    std::vector<Inst> insts;
+    std::unordered_map<std::string, int> by_name;
+    // driver: netkey -> (inst index, port, bit).  Hashtbl.replace => last wins.
+    std::unordered_map<int, std::tuple<int, std::string, int>> drv;
+    // sinks: built by PREPENDING, so front() is the LAST instance added.
+    std::unordered_map<int, std::vector<std::tuple<int, std::string, int>>> sinks;
+    std::unordered_set<std::string> absorbed;
+    std::map<std::string, int> report;
+    std::vector<PackedCell> packed;
+
+    void bump(const std::string &k) { report[k]++; }
+    const std::string &mtype(const std::string &n) { return insts[by_name.at(n)].type; }
+
+    void add(const std::string &name, const std::string &lef,
+             const std::vector<std::pair<std::string, int>> &conns,
+             const std::vector<std::pair<std::string, std::string>> &bels = {})
+    {
+        packed.push_back({name, lef, conns, bels});
+    }
+
+    // List.assoc_opt on the port list: FIRST exact-name match.
+    int port_bit(const std::string &iname, const std::string &pname, size_t idx)
+    {
+        auto it = by_name.find(iname);
+        if (it == by_name.end()) return NK_NONE;
+        for (auto &pc : insts[it->second].ports)
+            if (pc.first == pname)
+                return idx < pc.second.size() ? pc.second[idx] : NK_NONE;
+        return NK_NONE;
+    }
+    int port_bit(int ii, const std::string &pname, size_t idx)
+    {
+        for (auto &pc : insts[ii].ports)
+            if (pc.first == pname)
+                return idx < pc.second.size() ? pc.second[idx] : NK_NONE;
+        return NK_NONE;
+    }
+
+    void build_maps()
+    {
+        for (size_t k = 0; k < insts.size(); k++) by_name[insts[k].name] = int(k);
+        for (size_t k = 0; k < insts.size(); k++) {
+            auto &i = insts[k];
+            for (auto &pc : i.ports) {
+                for (size_t bi = 0; bi < pc.second.size(); bi++) {
+                    int nk = pc.second[bi];
+                    if (!is_net(nk)) continue;
+                    if (is_output(i.type, pc.first))
+                        drv[nk] = std::make_tuple(int(k), pc.first, int(bi));
+                    else {
+                        auto &v = sinks[nk];
+                        v.insert(v.begin(), std::make_tuple(int(k), pc.first, int(bi)));
+                    }
+                }
+            }
+        }
+    }
+
+    void run();
+    void phase0_site_guided();
+    void phase1_carry();
+    void phase1a0_r256_groups();
+    void phase1b_ram256_macro();
+    void phase1a_mux();
+    void phase1c_dram_groups();
+    void phase1b2_lut_ff_pairs();
+    void phase2_dedicated_sites();
+    void phase3a_leftover_luts();
+    void phase3_leftover();
+};
+
+// ------------------------------------------------------- 0. site-guided ---
+// PACK_SITE_IN: adopt an external tool's SLICE GROUPING verbatim.  Dormant in
+// the production flow (place_route_open.sh never sets it) but ported for
+// fidelity, because when it IS set it runs BEFORE every recognition path and
+// claims CARRY4/DRAM/SRL too.
+void Packer::phase0_site_guided()
+{
+    const char *path = getenv("PACK_SITE_IN");
+    // site_of: inst -> (site, bel).  Uses Hashtbl.add for the collapsed parent
+    // key (first wins), Hashtbl.replace for the leaf (last wins).
+    std::unordered_map<std::string, std::pair<std::string, std::string>> site_of;
+    if (path) {
+        std::ifstream f(path);
+        if (!f) {
+            fprintf(stderr, "PACK_SITE_IN: %s: cannot open\n", path);
+        } else {
+            std::string line;
+            while (std::getline(f, line)) {
+                std::stringstream ss(line);
+                std::string nm, sb;
+                if (!std::getline(ss, nm, '\t')) continue;
+                if (!std::getline(ss, sb, '\t')) continue;
+                auto trim = [](std::string s) {
+                    size_t a = s.find_first_not_of(" \t\r\n");
+                    size_t b = s.find_last_not_of(" \t\r\n");
+                    return a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
+                };
+                nm = trim(nm); sb = trim(sb);
+                std::string site = sb, bel;
+                size_t sl = sb.find('/');
+                if (sl != std::string::npos) { site = sb.substr(0, sl); bel = sb.substr(sl + 1); }
+                site_of[nm] = {site, bel};
+                // Distributed RAM arrives as LEAF sub-bels while the netlist
+                // holds only the PARENT; collapse so they group by site.
+                size_t rs = nm.rfind('/');
+                if (rs != std::string::npos) {
+                    std::string p = nm.substr(0, rs);
+                    if (!p.empty() && !site_of.count(p)) site_of[p] = {site, bel};
+                }
+            }
+        }
+    }
+    if (site_of.empty()) return;
+
+    // Only SLICE-resident types; BRAM/DSP/IO/MMCM/BUFG keep their own paths.
+    auto slice_resident = [&](const std::string &t) {
+        std::string u = upper(t), l, s;
+        return (starts_with(u, "LUT") || u == "INV" || starts_with(u, "FD") ||
+                starts_with(u, "CARRY4") || slicem_map(t, l, s)) &&
+               !hard_map(t, l, s) && !io_map(t, l);
+    };
+    std::unordered_map<std::string, std::vector<int>> by_site;
+    std::vector<std::string> order;
+    for (size_t k = 0; k < insts.size(); k++) {
+        auto &i = insts[k];
+        if (absorbed.count(i.name) || !slice_resident(i.type)) continue;
+        auto it = site_of.find(i.name);
+        if (it == site_of.end()) continue;
+        const std::string &s = it->second.first;
+        if (!by_site.count(s)) order.push_back(s);
+        by_site[s].push_back(int(k));
+    }
+    int nsite = 0, nprim = 0, ncarry = 0, nsm = 0;
+    for (auto &s : order) {
+        auto &ms = by_site[s];
+        std::string l, sfx;
+        bool has_sm = false, has_carry = false, has_srl = false;
+        for (int ii : ms) {
+            if (slicem_map(insts[ii].type, l, sfx)) has_sm = true;
+            if (starts_with(upper(insts[ii].type), "CARRY4")) has_carry = true;
+            if (starts_with(upper(insts[ii].type), "SRL")) has_srl = true;
+        }
+        std::string lef;
+        if (has_sm) { nsm++; lef = has_srl ? "SLICEM_SRL" : "SLICEM_DRAM"; }
+        else if (has_carry) { ncarry++; lef = "SLICE_CARRY"; }
+        else lef = "SLICE_LOGIC";
+        std::vector<std::pair<std::string, std::string>> bels;
+        std::vector<std::pair<std::string, int>> conns;
+        for (int ii : ms) {
+            auto &inst = insts[ii];
+            std::string bel = "A6LUT";
+            auto it = site_of.find(inst.name);
+            if (it != site_of.end() && !it->second.second.empty()) bel = it->second.second;
+            bels.emplace_back(inst.name, bel);
+            // Pin names are BEL-prefixed so two primitives in one slice cannot
+            // collide; place_lef reads pc_conns only for NET identity.
+            for (auto &pc : inst.ports)
+                if (!pc.second.empty()) conns.emplace_back(bel + "_" + pc.first, pc.second[0]);
+            absorbed.insert(inst.name);
+            nprim++;
+        }
+        add("site_" + s, lef, conns, bels);
+        nsite++;
+        bump("site-guided slice");
+    }
+    printf("site-guided pack: %d primitives -> %d slice cells (%.2f per slice; %d carry, %d slicem)\n",
+           nprim, nsite, double(nprim) / (nsite > 0 ? nsite : 1), ncarry, nsm);
+}
+
+// ------------------------------------- 1. CARRY4 -> SLICE_CARRY -----------
+// Absorbs the S-driving LUTs and the sum FFs, so the cnt[i] -> S[i] feedback
+// never reaches the router.  BEL-stamps ONLY the CARRY4 itself: stamping all
+// four LUT slots leaves no room for the DI route-thru $LUTs nextpnr inserts.
+void Packer::phase1_carry()
+{
+    for (size_t k = 0; k < insts.size(); k++) {
+        auto &i = insts[k];
+        if (!starts_with(upper(i.type), "CARRY4") || absorbed.count(i.name)) continue;
+        std::vector<std::pair<std::string, int>> conns;
+        auto put = [&](const std::string &key, int v) { conns.emplace_back(key, v); };
+        std::vector<std::pair<std::string, std::string>> bels{{i.name, "CARRY4"}};
+        int v;
+        if ((v = port_bit(int(k), "CI", 0)) != NK_NONE) put("CI", v);
+        if ((v = port_bit(int(k), "CYINIT", 0)) != NK_NONE) put("CYINIT", v);
+        if ((v = port_bit(int(k), "CO", 3)) != NK_NONE) put("CO", v);
+        absorbed.insert(i.name);
+        bump("CARRY4->SLICE_CARRY");
+        char buf[64];
+        for (int kk = 0; kk <= 3; kk++) {
+            snprintf(buf, sizeof(buf), "S%d", kk);
+            if ((v = port_bit(int(k), "S", kk)) != NK_NONE) put(buf, v);
+            snprintf(buf, sizeof(buf), "DI%d", kk);
+            if ((v = port_bit(int(k), "DI", kk)) != NK_NONE) put(buf, v);
+            int obit = port_bit(int(k), "O", kk);
+            if (obit != NK_NONE) {
+                snprintf(buf, sizeof(buf), "O%d", kk);
+                put(buf, obit);
+                // absorb sum FF: FDxE whose D == this O[k]
+                auto sit = sinks.find(obit);
+                if (sit != sinks.end()) {
+                    for (auto &sk : sit->second) {
+                        int sc = std::get<0>(sk);
+                        const std::string &sp = std::get<1>(sk);
+                        if (!starts_with(upper(insts[sc].type), "FD")) continue;
+                        if (upper(sp) != "D") continue;
+                        if (absorbed.count(insts[sc].name)) continue;
+                        absorbed.insert(insts[sc].name);
+                        bump("sum-FF absorbed");
+                        int q;
+                        if ((q = port_bit(sc, "Q", 0)) != NK_NONE) {
+                            snprintf(buf, sizeof(buf), "Q%d", kk);
+                            put(buf, q);
+                        }
+                        if ((q = port_bit(sc, "C", 0)) != NK_NONE) put("CLK", q);
+                        if ((q = port_bit(sc, "CE", 0)) != NK_NONE) put("CE", q);
+                        if ((q = port_bit(sc, "R", 0)) != NK_NONE) put("SR", q);
+                        else if ((q = port_bit(sc, "S", 0)) != NK_NONE) put("SR", q);
+                    }
+                }
+            }
+            // absorb S-LUT: a LUT driving this S[k]
+            int sbit = port_bit(int(k), "S", kk);
+            if (sbit != NK_NONE) {
+                auto dit = drv.find(sbit);
+                if (dit != drv.end()) {
+                    int dn = std::get<0>(dit->second);
+                    if (starts_with(upper(insts[dn].type), "LUT") && !absorbed.count(insts[dn].name)) {
+                        absorbed.insert(insts[dn].name);
+                        bump("S-LUT absorbed");
+                        for (auto &pc : insts[dn].ports) {
+                            if (upper(pc.first) == "O") continue;
+                            if (pc.second.empty()) continue;
+                            snprintf(buf, sizeof(buf), "S%d_%s", kk, pc.first.c_str());
+                            put(buf, pc.second[0]);
+                        }
+                    }
+                }
+            }
+        }
+        // Str.search_forward "_i_1$" -- anchored, so: strip a trailing "_i_1".
+        std::string base = i.name;
+        if (base.size() >= 4 && base.compare(base.size() - 4, 4, "_i_1") == 0)
+            base = base.substr(0, base.size() - 4);
+        add(base + "$carry", "SLICE_CARRY", conns, bels);
+    }
+}
+
+// ---------------------- 1a0. decomposed RAM256X1S (r256_*) -> SLICEM_DRAM --
+// THE LANE ORDER IS REVERSED, and not by choice: nextpnr's F7AMUX reads I0
+// from the SECOND lane and I1 from the FIRST, and its F8MUX takes I1 from the
+// A/B pair.  d->A, c->B, b->C, a->D with f7b on F7AMUX and f7a on F7BMUX.
+void Packer::phase1a0_r256_groups()
+{
+    auto leaf_of = [](const std::string &n) {
+        size_t p = n.rfind('.');
+        return p == std::string::npos ? n : n.substr(p + 1);
+    };
+    auto parent_of = [](const std::string &n) {
+        size_t p = n.rfind('.');
+        return p == std::string::npos ? std::string() : n.substr(0, p);
+    };
+    std::unordered_map<std::string, std::vector<int>> groups;
+    std::vector<std::string> order; // deterministic; OCaml uses Hashtbl.iter
+    for (size_t k = 0; k < insts.size(); k++) {
+        if (!starts_with(leaf_of(insts[k].name), "r256_")) continue;
+        std::string key = parent_of(insts[k].name);
+        if (!groups.count(key)) order.push_back(key);
+        groups[key].push_back(int(k));
+    }
+    for (auto &key : order) {
+        auto &ms = groups[key];
+        auto find = [&](const char *sfx) -> int {
+            std::string want = std::string("r256_") + sfx;
+            for (int ii : ms)
+                if (leaf_of(insts[ii].name) == want) return ii;
+            return -1;
+        };
+        int ra = find("a"), rb = find("b"), rc = find("c"), rd = find("d");
+        int f7a = find("f7a"), f7b = find("f7b"), f8 = find("f8");
+        if (ra >= 0 && rb >= 0 && rc >= 0 && rd >= 0 && f7a >= 0 && f7b >= 0 && f8 >= 0 &&
+            !absorbed.count(insts[ra].name)) {
+            std::vector<std::pair<std::string, std::string>> bels{
+                {insts[rd].name, "A6LUT"}, {insts[rc].name, "B6LUT"},
+                {insts[rb].name, "C6LUT"}, {insts[ra].name, "D6LUT"},
+                {insts[f7b].name, "F7AMUX"}, {insts[f7a].name, "F7BMUX"},
+                {insts[f8].name, "F8MUX"}};
+            std::vector<std::pair<std::string, int>> conns;
+            auto put = [&](const std::string &p, int v) { conns.emplace_back(p, v); };
+            int v;
+            if ((v = port_bit(ra, "WCLK", 0)) != NK_NONE) put("WCLK", v);
+            if ((v = port_bit(ra, "WE", 0)) != NK_NONE) put("WE", v);
+            char buf[32];
+            for (int kk = 0; kk <= 5; kk++) {
+                snprintf(buf, sizeof(buf), "A%d", kk);
+                if ((v = port_bit(ra, buf, 0)) != NK_NONE) put(buf, v);
+            }
+            int banks[4] = {ra, rb, rc, rd};
+            for (int idx = 0; idx < 4; idx++) {
+                if ((v = port_bit(banks[idx], "D", 0)) != NK_NONE) {
+                    snprintf(buf, sizeof(buf), "DI%d", idx);
+                    put(buf, v);
+                }
+                if ((v = port_bit(banks[idx], "O", 0)) != NK_NONE) {
+                    snprintf(buf, sizeof(buf), "DO%d", idx);
+                    put(buf, v);
+                }
+            }
+            if ((v = port_bit(f8, "O", 0)) != NK_NONE) put("DO3", v);
+            for (int ii : {ra, rb, rc, rd, f7a, f7b, f8}) absorbed.insert(insts[ii].name);
+            bump("RAM256-group->SLICEM_DRAM");
+            add(insts[ra].name + "$r256", "SLICEM_DRAM", conns, bels);
+        } else {
+            // An INCOMPLETE group must not pass quietly.
+            std::string missing;
+            const char *names[7] = {"a", "b", "c", "d", "f7a", "f7b", "f8"};
+            int got[7] = {ra, rb, rc, rd, f7a, f7b, f8};
+            for (int t = 0; t < 7; t++)
+                if (got[t] < 0) {
+                    if (!missing.empty()) missing += ",";
+                    missing += std::string("r256_") + names[t];
+                }
+            bump("RAM256-group INCOMPLETE (scattered)");
+            fprintf(stderr,
+                    "[pack_to_lef] WARNING: r256 group '%s' has %zu of 7 members (missing: %s) -- "
+                    "NOT packed into one SLICEM; its RAM64X1S will be scattered\n",
+                    key.c_str(), ms.size(), missing.c_str());
+        }
+    }
+}
+
+// ------------------------- 1b. undecomposed RAM256X1S macro -> SLICEM_DRAM -
+void Packer::phase1b_ram256_macro()
+{
+    for (size_t k = 0; k < insts.size(); k++) {
+        auto &i = insts[k];
+        if (!starts_with(upper(i.type), "RAM256X1S") || absorbed.count(i.name)) continue;
+        std::vector<std::pair<std::string, int>> conns;
+        auto put = [&](const std::string &p, int v) { conns.emplace_back(p, v); };
+        int v;
+        if ((v = port_bit(int(k), "WCLK", 0)) != NK_NONE) put("WCLK", v);
+        if ((v = port_bit(int(k), "WE", 0)) != NK_NONE) put("WE", v);
+        char buf[32];
+        for (int kk = 0; kk <= 5; kk++) {
+            if ((v = port_bit(int(k), "A", kk)) != NK_NONE) {
+                snprintf(buf, sizeof(buf), "A%d", kk);
+                put(buf, v);
+            }
+        }
+        if ((v = port_bit(int(k), "D", 0)) != NK_NONE) put("DI0", v);
+        if ((v = port_bit(int(k), "O", 0)) != NK_NONE) put("DO3", v);
+        absorbed.insert(i.name);
+        bump("RAM256X1S->SLICEM_DRAM");
+        // z = height-1, the D lane -- what makes nextpnr's expansion land here.
+        add(i.name + "$r256macro", "SLICEM_DRAM", conns, {{i.name, "D6LUT"}});
+    }
+}
+
+// ------------------------------- 1a. MUXF7/MUXF8 -> SLICE_MUX -------------
+void Packer::phase1a_mux()
+{
+    auto is_lut_t = [](const std::string &t) { return starts_with(upper(t), "LUT"); };
+
+    // absorb MUXF7 [mn] as F7[la]MUX; its two driving LUT6 -> lanes la,lb.
+    // Returns (bels, conns) UNREVERSED, exactly as the OCaml does.
+    auto absorb_mux7 = [&](int mn, const std::string &la, const std::string &lb,
+                           std::vector<std::pair<std::string, std::string>> &bels,
+                           std::vector<std::pair<std::string, int>> &conns) {
+        absorbed.insert(insts[mn].name);
+        bels.insert(bels.begin(), {insts[mn].name, la == "A" ? "F7AMUX" : "F7BMUX"});
+        int v;
+        if ((v = port_bit(mn, "S", 0)) != NK_NONE) conns.insert(conns.begin(), {"F7" + la + "S", v});
+        if ((v = port_bit(mn, "O", 0)) != NK_NONE) conns.insert(conns.begin(), {"F7" + la + "O", v});
+        auto do_lut = [&](const char *inp, const std::string &lane) {
+            int sbit = port_bit(mn, inp, 0);
+            if (sbit == NK_NONE) return;
+            auto dit = drv.find(sbit);
+            if (dit == drv.end()) return;
+            int dn = std::get<0>(dit->second);
+            if (!is_lut_t(insts[dn].type) || absorbed.count(insts[dn].name)) return;
+            absorbed.insert(insts[dn].name);
+            bump("mux-LUT absorbed");
+            bels.insert(bels.begin(), {insts[dn].name, lane + "6LUT"});
+            for (auto &pc : insts[dn].ports) {
+                if (upper(pc.first) == "O") continue;
+                if (pc.second.empty()) continue;
+                conns.insert(conns.begin(), {lane + pc.first, pc.second[0]});
+            }
+        };
+        // nextpnr's F7[la]MUX reads I0 from the SECOND lane and I1 from the
+        // FIRST.  Assigning I0->la crosses both mux inputs.
+        do_lut("I0", lb);
+        do_lut("I1", la);
+    };
+
+    // MUXF8 groups first (absorb the two feeding MUXF7 + their LUTs)
+    for (size_t k = 0; k < insts.size(); k++) {
+        auto &i = insts[k];
+        if (!starts_with(upper(i.type), "MUXF8") || absorbed.count(i.name)) continue;
+        std::vector<std::pair<std::string, std::string>> bels{{i.name, "F8MUX"}};
+        std::vector<std::pair<std::string, int>> conns;
+        int v;
+        if ((v = port_bit(int(k), "S", 0)) != NK_NONE) conns.insert(conns.begin(), {"F8S", v});
+        if ((v = port_bit(int(k), "O", 0)) != NK_NONE) conns.insert(conns.begin(), {"F8O", v});
+        auto grab = [&](const char *inp, const std::string &la, const std::string &lb) {
+            int mbit = port_bit(int(k), inp, 0);
+            if (mbit == NK_NONE) return;
+            auto dit = drv.find(mbit);
+            if (dit == drv.end()) return;
+            int mn = std::get<0>(dit->second);
+            if (!starts_with(upper(insts[mn].type), "MUXF7") || absorbed.count(insts[mn].name)) return;
+            std::vector<std::pair<std::string, std::string>> b;
+            std::vector<std::pair<std::string, int>> c;
+            absorb_mux7(mn, la, lb, b, c);
+            bels.insert(bels.begin(), b.begin(), b.end()); // b @ !bels
+            conns.insert(conns.begin(), c.begin(), c.end());
+        };
+        grab("I1", "A", "B");
+        grab("I0", "C", "D");
+        absorbed.insert(i.name);
+        bump("MUXF8->SLICE_MUX");
+        std::reverse(bels.begin(), bels.end());
+        std::reverse(conns.begin(), conns.end());
+        add(i.name + "$mux", "SLICE_MUX", conns, bels);
+    }
+    // standalone MUXF7 (not consumed by a MUXF8)
+    for (size_t k = 0; k < insts.size(); k++) {
+        auto &i = insts[k];
+        if (!starts_with(upper(i.type), "MUXF7") || absorbed.count(i.name)) continue;
+        std::vector<std::pair<std::string, std::string>> bels;
+        std::vector<std::pair<std::string, int>> conns;
+        absorb_mux7(int(k), "A", "B", bels, conns);
+        bump("MUXF7->SLICE_MUX");
+        std::reverse(bels.begin(), bels.end());
+        std::reverse(conns.begin(), conns.end());
+        add(i.name + "$mux", "SLICE_MUX", conns, bels);
+    }
+}
+
+// --------------- 1c. RAM32X1D / RAM64X1D write-port grouping -> SLICEM ----
+// Slot allocation mirrors nextpnr pack_dram.cc: z descends from D=3, each new
+// slice burns the D6LUT on the write-address base cell, EXCEPT the first
+// member's SPO folds into that base (z==2 fold).  Capacity is 3 DPO-only or 2
+// dual-port per slice, not 4.  The _1 variants write on the FALLING edge and
+// are grouped SEPARATELY (the key includes the type).
+void Packer::phase1c_dram_groups()
+{
+    auto dram_kind = [](const std::string &t, int &abits, bool &inv) {
+        std::string u = upper(t);
+        if (u == "RAM32X1D") { abits = 5; inv = false; return true; }
+        if (u == "RAM32X1D_1") { abits = 5; inv = true; return true; }
+        if (u == "RAM64X1D") { abits = 6; inv = false; return true; }
+        if (u == "RAM64X1D_1") { abits = 6; inv = true; return true; }
+        return false;
+    };
+    using Key = std::tuple<std::string, int, int, std::vector<int>>;
+    std::map<Key, std::vector<int>> dgroups;
+    std::vector<Key> dg_order;
+    for (size_t k = 0; k < insts.size(); k++) {
+        int abits; bool inv;
+        if (!dram_kind(insts[k].type, abits, inv)) continue;
+        if (absorbed.count(insts[k].name)) continue;
+        std::vector<int> wa;
+        char buf[16];
+        for (int t = 0; t < abits; t++) {
+            snprintf(buf, sizeof(buf), "A%d", t);
+            wa.push_back(port_bit(int(k), buf, 0));
+        }
+        Key key{upper(insts[k].type), port_bit(int(k), "WCLK", 0), port_bit(int(k), "WE", 0), wa};
+        if (!dgroups.count(key)) dg_order.push_back(key);
+        dgroups[key].push_back(int(k));
+    }
+    for (auto &key : dg_order) {
+        auto &members = dgroups[key];
+        const std::string &ty = std::get<0>(key);
+        int wclk = std::get<1>(key), we = std::get<2>(key);
+        const std::vector<int> &wa = std::get<3>(key);
+        int abits; bool inv;
+        dram_kind(ty, abits, inv);
+        int slice_idx = 0, z = -1;
+        // current slice under construction: (inst, sp_slot, dp_slot); -1 = None
+        std::vector<std::tuple<int, int, int>> cur;
+        auto flush = [&]() {
+            if (!cur.empty()) {
+                int i0 = std::get<0>(cur.front());
+                std::vector<std::pair<std::string, int>> conns;
+                std::vector<std::pair<std::string, std::string>> bels;
+                auto put = [&](const std::string &kk, int v) { conns.emplace_back(kk, v); };
+                if (wclk != NK_NONE) put("WCLK", wclk);
+                if (we != NK_NONE) put("WE", we);
+                char buf[32];
+                for (size_t t = 0; t < wa.size(); t++)
+                    if (wa[t] != NK_NONE) {
+                        snprintf(buf, sizeof(buf), "WA%zu", t);
+                        put(buf, wa[t]);
+                    }
+                if (inv) put("WCLK_INV", NK_VCC); // polarity marker, no HPWL
+                for (auto &m : cur) {
+                    int ii = std::get<0>(m), sp = std::get<1>(m), dp = std::get<2>(m);
+                    int prim = sp >= 0 ? sp : (dp >= 0 ? dp : 3);
+                    bels.emplace_back(insts[ii].name, lane_letter(prim) + "6LUT");
+                    int v;
+                    if ((v = port_bit(ii, "D", 0)) != NK_NONE) put(lane_letter(prim) + "D", v);
+                    if (sp >= 0 && (v = port_bit(ii, "SPO", 0)) != NK_NONE)
+                        put(lane_letter(sp) + "SPO", v);
+                    if (dp >= 0) {
+                        if ((v = port_bit(ii, "DPO", 0)) != NK_NONE) put(lane_letter(dp) + "DPO", v);
+                        for (int t = 0; t < abits; t++) {
+                            snprintf(buf, sizeof(buf), "DPRA%d", t);
+                            if ((v = port_bit(ii, buf, 0)) != NK_NONE) {
+                                snprintf(buf, sizeof(buf), "%sDPRA%d", lane_letter(dp).c_str(), t);
+                                put(buf, v);
+                            }
+                        }
+                    }
+                }
+                snprintf(buf, sizeof(buf), "$dram%s%d", inv ? "_n" : "", slice_idx);
+                add(insts[i0].name + buf, "SLICEM_DRAM", conns, bels);
+                slice_idx++;
+                bump("DRAM-group->SLICEM_DRAM");
+            }
+            cur.clear();
+            z = -1;
+        };
+        for (int ii : members) {
+            auto has = [&](const char *p) { return is_net(port_bit(ii, p, 0)); };
+            bool spo = has("SPO"), dpo = has("DPO");
+            int zsz = (spo ? 1 : 0) + (dpo ? 1 : 0);
+            if (zsz > 0) { // dead RAM (no read port) falls to the generic path
+                if (z < 0 || z - zsz + 1 < 0) { flush(); z = 2; }
+                int sp_slot = -1;
+                if (spo) {
+                    if (z == 2) sp_slot = 3; // fold into the D6LUT base
+                    else { sp_slot = z; z--; }
+                }
+                int dp_slot = -1;
+                if (dpo) { dp_slot = z; z--; }
+                absorbed.insert(insts[ii].name);
+                bump(ty + " grouped");
+                cur.emplace_back(ii, sp_slot, dp_slot);
+            }
+        }
+        flush();
+    }
+}
+
+// ---------------------------- 1b. LUT + FF pairing -> SLICE_LOGIC ---------
+// A 7-series slice shares ONE clock + ONE CE + ONE SRUSEDMUX, so FFs with
+// differing control sets CANNOT share a slice.  CLOCK EDGE is part of the
+// control set: a negedge flop cannot share a half-slice with posedge flops,
+// and nothing complains until FASM -- after a full place AND route.
+struct CtrlSet
+{
+    int c = NK_NONE, ce = NK_NONE, srn = NK_NONE;
+    std::string srk;
+    bool negedge = false;
+    bool operator==(const CtrlSet &o) const
+    {
+        return c == o.c && ce == o.ce && srn == o.srn && srk == o.srk && negedge == o.negedge;
+    }
+    bool operator!=(const CtrlSet &o) const { return !(*this == o); }
+};
+
+void Packer::phase1b2_lut_ff_pairs()
+{
+    auto is_lut = [](const std::string &t) { return starts_with(upper(t), "LUT"); };
+    auto is_ff = [](const std::string &t) { return starts_with(upper(t), "FD"); };
+
+    int lane = 0, slice_no = 0;
+    std::vector<std::pair<std::string, int>> slice_conns;
+    std::vector<std::pair<std::string, std::string>> slice_bels;
+    bool have_cs = false;
+    CtrlSet cur_cs;
+    auto flush_slice = [&]() {
+        if (!slice_conns.empty()) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "logic_slice_%d", slice_no);
+            std::vector<std::pair<std::string, std::string>> b(slice_bels.rbegin(), slice_bels.rend());
+            std::vector<std::pair<std::string, int>> c(slice_conns.rbegin(), slice_conns.rend());
+            add(buf, "SLICE_LOGIC", c, b);
+            slice_no++;
+            slice_conns.clear();
+            slice_bels.clear();
+            lane = 0;
+            have_cs = false;
+        }
+    };
+    auto ff_cs = [&](int ii) {
+        CtrlSet cs;
+        int v;
+        if ((v = port_bit(ii, "R", 0)) != NK_NONE) { cs.srk = "R"; cs.srn = v; }
+        else if ((v = port_bit(ii, "S", 0)) != NK_NONE) { cs.srk = "S"; cs.srn = v; }
+        else if ((v = port_bit(ii, "PRE", 0)) != NK_NONE) { cs.srk = "PRE"; cs.srn = v; }
+        else if ((v = port_bit(ii, "CLR", 0)) != NK_NONE) { cs.srk = "CLR"; cs.srn = v; }
+        else { cs.srk = ""; cs.srn = NK_NONE; }
+        std::string u = upper(insts[ii].type);
+        cs.negedge = u.size() > 2 && u.compare(u.size() - 2, 2, "_1") == 0;
+        cs.c = port_bit(ii, "C", 0);
+        cs.ce = port_bit(ii, "CE", 0);
+        return cs;
+    };
+
+    // PACK_CRIT_FILE: run the critical FFs FIRST and let them win the LUT.
+    // Partitioning (not sorting) is deliberate -- a criticality sort would
+    // interleave control sets and flush on nearly every FF.
+    std::unordered_map<std::string, double> pack_crit;
+    if (const char *path = getenv("PACK_CRIT_FILE")) {
+        std::ifstream f(path);
+        if (!f) fprintf(stderr, "PACK_CRIT_FILE: %s: cannot open\n", path);
+        std::string line;
+        while (std::getline(f, line)) {
+            std::stringstream ss(line);
+            std::string nm, val;
+            if (!std::getline(ss, nm, '\t')) continue;
+            if (!std::getline(ss, val, '\t')) continue;
+            try { pack_crit[nm] = std::stod(val); } catch (...) {}
+        }
+    }
+    std::vector<int> ff_pass_order;
+    if (pack_crit.empty()) {
+        for (size_t k = 0; k < insts.size(); k++) ff_pass_order.push_back(int(k));
+    } else {
+        double crit_min = 0.5;
+        if (const char *s = getenv("PACK_CRIT_MIN")) { try { crit_min = std::stod(s); } catch (...) { crit_min = 0.5; } }
+        auto crit_of = [&](int ii) {
+            int nk = port_bit(ii, "D", 0);
+            if (!is_net(nk)) return 0.0;
+            auto dit = drv.find(nk);
+            if (dit == drv.end()) return 0.0;
+            auto cit = pack_crit.find(insts[std::get<0>(dit->second)].name);
+            return cit == pack_crit.end() ? 0.0 : cit->second;
+        };
+        std::vector<int> hot, cold;
+        int matched = 0, nff = 0;
+        for (size_t k = 0; k < insts.size(); k++) {
+            bool ff = is_ff(insts[k].type);
+            if (ff) nff++;
+            if (ff) {
+                int nk = port_bit(int(k), "D", 0);
+                if (is_net(nk)) {
+                    auto dit = drv.find(nk);
+                    if (dit != drv.end() && pack_crit.count(insts[std::get<0>(dit->second)].name)) matched++;
+                }
+            }
+            if (ff && crit_of(int(k)) >= crit_min) hot.push_back(int(k));
+            else cold.push_back(int(k));
+        }
+        // Report the JOIN RATE: two name spaces meet here and a silent 0%
+        // match would look exactly like "criticality did not help".
+        printf("crit-pack: %zu crit entries; %d/%d FFs have a known driver criticality; "
+               "%zu above %.2f packed first\n",
+               pack_crit.size(), matched, nff, hot.size(), crit_min);
+        ff_pass_order = hot;
+        ff_pass_order.insert(ff_pass_order.end(), cold.begin(), cold.end());
+    }
+
+    for (int ii : ff_pass_order) {
+        auto &i = insts[ii];
+        if (!is_ff(i.type) || absorbed.count(i.name)) continue;
+        CtrlSet cs = ff_cs(ii);
+        if (lane > 0 && !(have_cs && cur_cs == cs)) flush_slice();
+        cur_cs = cs;
+        have_cs = true;
+        std::string l = lane_letter(lane);
+        int dnet = port_bit(ii, "D", 0);
+        // absorb the driving LUT if present and free
+        if (is_net(dnet)) {
+            auto dit = drv.find(dnet);
+            if (dit != drv.end()) {
+                int dn = std::get<0>(dit->second);
+                if (is_lut(insts[dn].type) && !absorbed.count(insts[dn].name)) {
+                    absorbed.insert(insts[dn].name);
+                    bump("LUT+FF paired");
+                    slice_bels.insert(slice_bels.begin(), {insts[dn].name, l + "6LUT"});
+                    for (auto &pc : insts[dn].ports) {
+                        if (upper(pc.first) == "O") continue;
+                        if (pc.second.empty()) continue;
+                        slice_conns.insert(slice_conns.begin(), {l + pc.first, pc.second[0]});
+                    }
+                }
+            }
+        }
+        absorbed.insert(i.name);
+        bump("FF packed");
+        slice_bels.insert(slice_bels.begin(), {i.name, l + "FF"});
+        int v;
+        if ((v = port_bit(ii, "Q", 0)) != NK_NONE) slice_conns.insert(slice_conns.begin(), {l + "Q", v});
+        if ((v = port_bit(ii, "C", 0)) != NK_NONE) slice_conns.insert(slice_conns.begin(), {"CLK", v});
+        if ((v = port_bit(ii, "CE", 0)) != NK_NONE) slice_conns.insert(slice_conns.begin(), {"CE", v});
+        if ((v = port_bit(ii, "R", 0)) != NK_NONE) slice_conns.insert(slice_conns.begin(), {"SR", v});
+        else if ((v = port_bit(ii, "S", 0)) != NK_NONE) slice_conns.insert(slice_conns.begin(), {"SR", v});
+        lane++;
+        if (lane >= 4) flush_slice();
+    }
+    flush_slice();
+}
+
+// -------------------------- 2. dedicated sites: MMCM / BUFG / IO ----------
+void Packer::phase2_dedicated_sites()
+{
+    for (size_t k = 0; k < insts.size(); k++) {
+        auto &i = insts[k];
+        if (absorbed.count(i.name) || i.type == "GND" || i.type == "VCC") continue;
+        std::string lef;
+        if (!io_map(i.type, lef)) continue;
+        std::vector<std::pair<std::string, int>> conns;
+        for (auto &pc : i.ports)
+            if (!pc.second.empty()) conns.emplace_back(pc.first, pc.second[0]);
+        // IO is XDC pin-constrained (nextpnr pack_io); only clock sites get an
+        // explicit BEL suffix for the legaliser.
+        std::vector<std::pair<std::string, std::string>> bels;
+        if (lef == "BUFG") bels.emplace_back(i.name, "BUFGCTRL");
+        else if (lef == "BUFH") bels.emplace_back(i.name, "BUFH");
+        else if (lef == "MMCM") bels.emplace_back(i.name, "MMCME2_ADV");
+        add(i.name + "$site", lef, conns, bels);
+        absorbed.insert(i.name);
+        bump(i.type + "->" + lef);
+    }
+}
+
+// ------------------- 3a. leftover LUTs -> FILL THE SLICE (4 per slice) ----
+// One LUT per slice put 3064 of 3486 LUT-bearing slices at exactly ONE LUT
+// (mean 1.25 vs Vivado's 3.65 on the SAME netlist) and spread the design over
+// 4692 slices where Vivado used 1669.  Fracturing (TOPO_LUT_FRACTURE=1) is OFF
+// by default -- it MEASURED WORSE: 0 -> 342 skips, 120.35 -> 102.28 MHz.
+void Packer::phase3a_leftover_luts()
+{
+    bool frac_on = false;
+    if (const char *e = getenv("TOPO_LUT_FRACTURE")) frac_on = (strcmp(e, "1") == 0);
+
+    struct LutItem
+    {
+        std::string name;
+        std::vector<std::pair<std::string, int>> ports;
+        std::vector<int> ins; // sort_uniq of the non-O port netkeys
+    };
+    std::vector<LutItem> lut_items;
+    for (size_t k = 0; k < insts.size(); k++) {
+        auto &i = insts[k];
+        std::string l, s;
+        if (absorbed.count(i.name) || i.type == "GND" || i.type == "VCC" ||
+            hard_map(i.type, l, s) || slicem_map(i.type, l, s))
+            continue;
+        std::string u = upper(i.type);
+        if (!(starts_with(u, "LUT") || u == "INV")) continue;
+        LutItem it;
+        it.name = i.name;
+        for (auto &pc : i.ports)
+            if (!pc.second.empty()) it.ports.emplace_back(pc.first, pc.second[0]);
+        for (auto &pc : it.ports)
+            if (upper(pc.first) != "O") it.ins.push_back(pc.second);
+        std::sort(it.ins.begin(), it.ins.end());
+        it.ins.erase(std::unique(it.ins.begin(), it.ins.end()), it.ins.end());
+        lut_items.push_back(std::move(it));
+    }
+    std::unordered_map<std::string, size_t> idx_of;
+    for (size_t k = 0; k < lut_items.size(); k++) idx_of[lut_items[k].name] = k;
+
+    // greedy fracture pairing (widest first: a 5-input LUT has the fewest
+    // legal partners, so let it choose before the 1- and 2-input ones)
+    std::unordered_map<std::string, std::string> partner;
+    std::unordered_set<std::string> taken;
+    int npair = 0;
+    if (frac_on) {
+        std::unordered_map<int, std::vector<std::string>> by_net;
+        for (auto &it : lut_items)
+            if (it.ins.size() <= 5)
+                for (int k : it.ins) by_net[k].insert(by_net[k].begin(), it.name);
+        std::vector<size_t> order(lut_items.size());
+        for (size_t k = 0; k < order.size(); k++) order[k] = k;
+        std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+            return lut_items[a].ins.size() > lut_items[b].ins.size();
+        });
+        for (size_t oi : order) {
+            auto &it = lut_items[oi];
+            if (it.ins.size() > 5 || taken.count(it.name)) continue;
+            std::string best;
+            size_t best_lu = 0;
+            bool have = false;
+            for (int k : it.ins) {
+                auto bit = by_net.find(k);
+                if (bit == by_net.end()) continue;
+                for (auto &o : bit->second) {
+                    if (o == it.name || taken.count(o)) continue;
+                    auto oit = idx_of.find(o);
+                    if (oit == idx_of.end()) continue;
+                    auto &oi2 = lut_items[oit->second];
+                    if (oi2.ins.size() > 5) continue;
+                    std::vector<int> un = it.ins;
+                    un.insert(un.end(), oi2.ins.begin(), oi2.ins.end());
+                    std::sort(un.begin(), un.end());
+                    un.erase(std::unique(un.begin(), un.end()), un.end());
+                    if (un.size() > 5) continue;
+                    if (have && best_lu <= un.size()) continue;
+                    best = o;
+                    best_lu = un.size();
+                    have = true;
+                }
+            }
+            if (have) {
+                taken.insert(it.name);
+                taken.insert(best);
+                partner[it.name] = best;
+                npair++;
+            }
+        }
+    }
+
+    // emit: each unit (a fractured pair or a lone LUT) takes one lane
+    std::unordered_set<std::string> emitted;
+    struct GroupItem
+    {
+        std::string name;
+        std::vector<std::pair<std::string, int>> ports;
+        bool has_second = false;
+        std::string second_name;
+        std::vector<std::pair<std::string, int>> second_ports;
+    };
+    std::vector<GroupItem> lut_group;
+    int lut_slice = 0;
+    auto flush_luts = [&]() {
+        if (lut_group.empty()) return;
+        std::vector<std::pair<std::string, std::string>> bels;
+        std::vector<std::pair<std::string, int>> conns;
+        for (size_t k = 0; k < lut_group.size(); k++) {
+            std::string l = lane_letter(int(k));
+            bels.emplace_back(lut_group[k].name, l + "6LUT");
+            if (lut_group[k].has_second) bels.emplace_back(lut_group[k].second_name, l + "5LUT");
+        }
+        for (size_t k = 0; k < lut_group.size(); k++) {
+            std::string l = lane_letter(int(k));
+            for (auto &pc : lut_group[k].ports) conns.emplace_back(l + pc.first, pc.second);
+            if (lut_group[k].has_second)
+                for (auto &pc : lut_group[k].second_ports)
+                    conns.emplace_back(l + "5" + pc.first, pc.second);
+        }
+        char buf[32];
+        snprintf(buf, sizeof(buf), "lut_slice_%d", lut_slice);
+        add(buf, "SLICE_LOGIC", conns, bels);
+        lut_slice++;
+        lut_group.clear();
+    };
+    for (auto &it : lut_items) {
+        if (emitted.count(it.name)) continue;
+        emitted.insert(it.name);
+        GroupItem gi;
+        gi.name = it.name;
+        gi.ports = it.ports;
+        auto pit = partner.find(it.name);
+        if (pit != partner.end() && !emitted.count(pit->second)) {
+            emitted.insert(pit->second);
+            absorbed.insert(pit->second);
+            bump("LUT fractured (O5)");
+            gi.has_second = true;
+            gi.second_name = pit->second;
+            gi.second_ports = lut_items[idx_of[pit->second]].ports;
+        }
+        absorbed.insert(it.name);
+        bump("LUT packed into shared slice");
+        lut_group.push_back(std::move(gi));
+        if (lut_group.size() >= 4) flush_luts();
+    }
+    flush_luts();
+    if (npair > 0)
+        printf("lut-fracture: %d pair(s) share a LUT6 site (%zu LUTs -> %zu sites)\n", npair,
+               lut_items.size(), lut_items.size() - size_t(npair));
+}
+
+// ---------------- 3. leftover LUT / FF -> SLICE_LOGIC / SLICE_FF ----------
+void Packer::phase3_leftover()
+{
+    for (size_t k = 0; k < insts.size(); k++) {
+        auto &i = insts[k];
+        if (absorbed.count(i.name) || i.type == "GND" || i.type == "VCC") continue;
+        std::vector<std::pair<std::string, int>> conns;
+        for (auto &pc : i.ports)
+            if (!pc.second.empty()) conns.emplace_back(pc.first, pc.second[0]);
+        std::string u = upper(i.type);
+        std::string hlef, hsfx, mlef, msfx;
+        if (hard_map(i.type, hlef, hsfx)) {
+            add(i.name + "$hard", hlef, conns, {{i.name, hsfx}});
+            bump(i.type + "->" + hlef);
+        } else if (slicem_map(i.type, mlef, msfx)) {
+            add(i.name + "$m", mlef, conns, {{i.name, msfx}});
+            bump(i.type + "->" + mlef);
+        } else if (starts_with(u, "LUT") || u == "INV") {
+            add(i.name + "$logic", "SLICE_LOGIC", conns, {{i.name, "A6LUT"}});
+            bump("LUT->SLICE_LOGIC");
+        } else if (starts_with(u, "FD")) {
+            add(i.name + "$ff", "SLICE_FF", conns, {{i.name, "AFF"}});
+            bump("FF->SLICE_FF");
+        } else {
+            add(i.name + "$?", "UNKNOWN:" + i.type, conns);
+            bump("UNMAPPED " + i.type);
+        }
+        absorbed.insert(i.name);
+    }
+}
+
+void Packer::run()
+{
+    build_maps();
+    phase0_site_guided();
+    phase1_carry();
+    phase1a0_r256_groups();
+    phase1b_ram256_macro();
+    phase1a_mux();
+    phase1c_dram_groups();
+    phase1b2_lut_ff_pairs();
+    phase2_dedicated_sites();
+    phase3a_leftover_luts();
+    phase3_leftover();
+}
+
+// ------------------------------------------------------------- library ----
+// Read a yosys JSON netlist and pack it.  Picks the module with the most cells
+// as the top, exactly as the OCaml's bmodule_of_yosys_tree does.
+PackResult pack_to_lef_json(const std::string &path)
+{
+    PackResult res;
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        fprintf(stderr, "pack_to_lef: cannot open %s\n", path.c_str());
+        return res;
+    }
+    std::stringstream ss;
+    ss << f.rdbuf();
+    std::string src = ss.str();
+    JParser jp(src);
+    JPtr root = jp.parse();
+
+    JPtr mods = root->member("modules");
+    if (!mods || mods->k != JVal::OBJ) {
+        fprintf(stderr, "pack_to_lef: no modules in %s\n", path.c_str());
+        return res;
+    }
+    JPtr mj = nullptr;
+    size_t best = 0;
+    for (auto &kv : mods->obj) {
+        JPtr c = kv.second->member("cells");
+        size_t n = (c && c->k == JVal::OBJ) ? c->obj.size() : 0;
+        if (!mj || n > best) { mj = kv.second; best = n; }
+    }
+    JPtr cells = mj->member("cells");
+
+    Packer P;
+    if (cells && cells->k == JVal::OBJ) {
+        for (auto &kv : cells->obj) {
+            Inst in;
+            in.name = kv.first;
+            JPtr t = kv.second->member("type");
+            in.type = t ? t->str : "";
+            JPtr conns = kv.second->member("connections");
+            if (conns && conns->k == JVal::OBJ) {
+                for (auto &pc : conns->obj) {
+                    std::vector<int> bits;
+                    if (pc.second->k == JVal::ARR)
+                        for (auto &b : pc.second->arr) {
+                            if (b->k == JVal::NUM) bits.push_back(int(b->num));
+                            else if (b->k == JVal::STR && b->str == "1") bits.push_back(NK_VCC);
+                            else bits.push_back(NK_GND); // "0", "x", "z", anything
+                        }
+                    in.ports.emplace_back(pc.first, std::move(bits));
+                }
+            }
+            P.insts.push_back(std::move(in));
+        }
+    }
+    res.n_instances = P.insts.size();
+    P.run();
+    res.cells = std::move(P.packed);
+    res.report.assign(P.report.begin(), P.report.end());
+    std::stable_sort(res.report.begin(), res.report.end(),
+                     [](const std::pair<std::string, int> &a, const std::pair<std::string, int> &b) {
+                         return a.second > b.second;
+                     });
+    return res;
+}
+
+} // namespace lefpack

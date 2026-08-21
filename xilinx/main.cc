@@ -24,6 +24,7 @@
 #include "design_utils.h"
 #include "jsonwrite.h"
 #include "log.h"
+#include "placer_lef.h"
 #include "timing.h"
 
 USING_NEXTPNR_NAMESPACE
@@ -91,6 +92,16 @@ void UspCommandHandler::customAfterLoad(Context *ctx)
     }
     if (vm.count("fixed-routes"))
         ctx->settings[ctx->id("fixed-routes")] = vm["fixed-routes"].as<std::string>();
+
+    // --placer lef runs the place_lef transplant HERE rather than in the placer
+    // slot.  Its recognition packer works on LUT6/FDRE/CARRY4/MUXF7, and the
+    // placer slot runs after Arch::pack() has already replaced those with
+    // SLICE_LUTX/SLICE_FFX -- there would be nothing left to recognise.
+    if (vm.count("json") && ctx->settings.count(ctx->id("placer")) &&
+        ctx->settings[ctx->id("placer")].as_string() == "lef") {
+        if (!place_lef_prepass(ctx, vm["json"].as<std::string>()))
+            log_error("place_lef pre-pass failed.\n");
+    }
 }
 
 int main(int argc, char *argv[])
