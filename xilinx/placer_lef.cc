@@ -133,21 +133,58 @@ std::string getenv_str(const char *name, const std::string &dflt)
 // see what it actually reaches.
 enum AnchorClass
 {
-    ANCHOR_CLOCK, // reaches a global clock buffer, MMCM/PLL or a GT
-    ANCHOR_DATA,  // feeds or is fed by fabric logic
-    ANCHOR_SLOW,  // output-only, drives nothing further -- LEDs and status
+    // NOTE ON MMCM/PLL: they are NOT attractors.  An MMCM's output always goes
+    // through a BUFG onto the global clock network, so where the MMCM sits has
+    // no bearing on where the logic it clocks belongs -- its own position is
+    // constrained by its dedicated clock input pin and nothing else.  Treating
+    // it as an attractor pulled ethmin's anchor from (220,16) to (174,82),
+    // because two MMCMs sit at slice x=48 on the far side of the die from the
+    // transceiver.  They are classified ANCHOR_GLOBAL with the buffers.
+    ANCHOR_GT,     // a transceiver: fixed at the die edge, and its datapath is
+                   // the fastest and most fragile thing on the chip.  place_lef
+                   // anchors ethmin on the GT ALONE -- its log reads
+                   //   anchor=(220,16) bbox X[175..221] Y[0..61], 99% used
+                   // and (220,16) IS the GT's site.  Co-locating the logic with
+                   // the transceiver is the whole reason that design routes.
+    ANCHOR_CLOCK,  // an MMCM/PLL: fixed, worth being near, but not decisive
+    ANCHOR_DATA,   // feeds or is fed by fabric logic
+    ANCHOR_SLOW,   // output-only, drives nothing further -- LEDs and status
+    ANCHOR_GLOBAL, // a global clock buffer: its output reaches the WHOLE die, so
+                   // its position says nothing about where logic should sit
 };
 
 const char *anchor_class_name(AnchorClass c)
 {
     switch (c) {
+    case ANCHOR_GT:
+        return "GT";
     case ANCHOR_CLOCK:
-        return "clock/GT";
+        return "MMCM/PLL";
     case ANCHOR_DATA:
         return "data";
+    case ANCHOR_GLOBAL:
+        return "global-clk";
     default:
         return "slow";
     }
+}
+
+// BUFG/BUFH/BUFR drive global or regional clock networks that span the device.
+// Where the buffer sits is a routing detail, not a hint about where the logic it
+// clocks belongs.
+bool is_gt_cell(const std::string &t)
+{
+    return t.find("GTXE") != std::string::npos || t.find("GTHE") != std::string::npos ||
+           t.find("GTPE") != std::string::npos || t.find("IBUFDS_GTE") != std::string::npos;
+}
+
+bool is_global_clock_buffer(const std::string &t)
+{
+    // MMCM/PLL belong here too: their output reaches the fabric only via a
+    // BUFG, so they are global in exactly the sense that matters.
+    return t.find("BUFG") != std::string::npos || t.find("BUFH") != std::string::npos ||
+           t.find("BUFR") != std::string::npos || t.find("MMCM") != std::string::npos ||
+           t.find("PLLE") != std::string::npos;
 }
 
 bool is_clock_cell(const std::string &t)
@@ -172,13 +209,92 @@ bool is_fabric_cell(const std::string &t)
 // what this is for.  Only the IO buffer chain itself is followed
 // (PAD -> IBUF/OBUF -> IBUFDS/BUFG); the first fabric cell reached records that
 // the pin talks to logic and is not expanded past.
+// How many distinct nets tie this cell to the FABRIC?
+//
+// This is what actually distinguishes a transceiver from a status LED, and it
+// is measured rather than assumed: a GT carries a wide datapath into the MAC,
+// an LED carries one wire.  Weighting the centroid by it makes the design
+// gravitate to whatever it is most tightly coupled to -- the GT on ethmin, the
+// BRAM/DSP columns on a design with no transceiver -- with no per-design
+// constant to maintain.  A hand-set TOPO_ANCHOR_X/Y still wins when supplied.
+// The clock rate a net runs at, in MHz, from create_clock.  1.0 when unknown,
+// so an unconstrained net counts for something but never much.
+double net_clock_mhz(Context *ctx, NetInfo *net)
+{
+    // The net may BE a clock...
+    if (net->clkconstr) {
+        double ps = ctx->getDelayNS(net->clkconstr->period.maxDelay()) * 1000.0;
+        if (ps > 0.0)
+            return 1e6 / ps;
+    }
+    // ...or be launched/captured by flops in some domain.  Take the fastest
+    // domain it touches: that is the one whose delay budget is tightest.
+    double best = 1.0;
+    auto consider = [&](CellInfo *c) {
+        if (c == nullptr)
+            return;
+        for (auto &conn : c->ports) {
+            NetInfo *n2 = conn.second.net;
+            if (n2 == nullptr || !n2->clkconstr)
+                continue;
+            double ps = ctx->getDelayNS(n2->clkconstr->period.maxDelay()) * 1000.0;
+            if (ps > 0.0)
+                best = std::max(best, 1e6 / ps);
+        }
+    };
+    consider(net->driver.cell);
+    for (auto &u : net->users)
+        consider(u.cell);
+    return best;
+}
+
+// Coupling to the fabric, weighted by CLOCK RATE.
+//
+// Connectivity alone is not the whole story: a 125 MHz transceiver datapath and
+// a 25 MHz housekeeping bus of the same width are not equally urgent to keep
+// close, and on ethmin it was eth_tx_clk (125 MHz) that failed timing while the
+// slow domains passed comfortably.  Summing each fabric-touching net's clock
+// rate captures both -- width AND speed -- and needs no per-design constant.
+double fabric_coupling(Context *ctx, CellInfo *cell)
+{
+    std::set<IdString> seen;
+    double total = 0.0;
+    for (auto &conn : cell->ports) {
+        NetInfo *net = conn.second.net;
+        if (net == nullptr || !seen.insert(net->name).second)
+            continue;
+        bool touches_fabric = false;
+        if (net->driver.cell != nullptr && is_fabric_cell(net->driver.cell->type.str(ctx)))
+            touches_fabric = true;
+        for (auto &u : net->users)
+            if (u.cell != nullptr && is_fabric_cell(u.cell->type.str(ctx)))
+                touches_fabric = true;
+        if (touches_fabric)
+            total += net_clock_mhz(ctx, net);
+    }
+    return total;
+}
+
 AnchorClass classify_anchor_cell(Context *ctx, CellInfo *start)
 {
     // The cell may itself BE the clock resource -- a BUFG is one of the placed
     // non-SLICE cells that contributes to the anchor, and it was coming back as
     // "data" because only its neighbours were being tested.
-    if (is_clock_cell(start->type.str(ctx)))
-        return ANCHOR_CLOCK;
+    {
+        const std::string st = start->type.str(ctx);
+        // A GLOBAL clock buffer must not pull the design toward itself.  On
+        // ethmin the eight BUFGCTRLs all sit in the centre clock column at
+        // slice x=110 and, weighted like the transceiver, they outvoted it 8:2
+        // -- the anchor landed at (148,140), mid-die, and the design was placed
+        // 60 columns from the GT it exists to serve.  place_lef anchors on the
+        // hard blocks and puts ethmin at X[174..221], right beside the GT.
+        if (is_gt_cell(st))
+            return ANCHOR_GT;
+        if (is_global_clock_buffer(st))
+            return ANCHOR_GLOBAL;
+        if (is_clock_cell(st))
+            return ANCHOR_CLOCK;
+    }
 
     std::set<IdString> seen;
     std::vector<std::pair<CellInfo *, int>> queue{{start, 0}};
@@ -190,6 +306,10 @@ AnchorClass classify_anchor_cell(Context *ctx, CellInfo *start)
             continue;
         const std::string t = ci->type.str(ctx);
         if (ci != start) {
+            if (is_gt_cell(t))
+                return ANCHOR_GT;
+            if (is_global_clock_buffer(t))
+                return ANCHOR_GLOBAL;
             if (is_clock_cell(t))
                 return ANCHOR_CLOCK;
             if (is_fabric_cell(t)) {
@@ -398,6 +518,7 @@ bool placer_lef(Context *ctx)
         {
             int x, y;
             AnchorClass cls;
+            double coupling;
         };
         std::map<std::string, AnchorSite> site_pos;
         const bool dbg = getenv("TOPO_DEBUG_ANCHOR") != nullptr;
@@ -458,6 +579,7 @@ bool placer_lef(Context *ctx)
             if (prev != site_pos.end()) {
                 if (cls < prev->second.cls)
                     prev->second.cls = cls;
+                prev->second.coupling += fabric_coupling(ctx, ci);
                 continue;
             }
             const auto &xs = tilex_to_slicex.at(kx);
@@ -474,7 +596,7 @@ bool placer_lef(Context *ctx)
             // FE_TONEAREST mode, which is round-half-to-even.
             int px = int(std::nearbyint(double(acc) / double(xs.size())));
             int py = tiley_to_slicey.at(ky).front();
-            site_pos[site] = AnchorSite{px, py, cls};
+            site_pos[site] = AnchorSite{px, py, cls, fabric_coupling(ctx, ci)};
         }
 
         // WEIGHTED centroid.  An unweighted mean lets the slowest pins decide
@@ -484,15 +606,32 @@ bool placer_lef(Context *ctx)
         // hand-kept list of net names -- note that an LED classifies as `data`
         // (it is OBUF <- FF, so it does touch fabric); what demotes it is not
         // its own class but the clock's much larger weight.
+        // Deliberately dominant: on ethmin the GT must beat 3 MMCMs and 11
+        // pads combined, or the design drifts off the transceiver and the
+        // high-speed nets stop routing.
+        const float w_gt = getenv_float("TOPO_ANCHOR_W_GT", 4.0f);
         const float w_clk = getenv_float("TOPO_ANCHOR_W_CLK", 8.0f);
         const float w_data = getenv_float("TOPO_ANCHOR_W_DATA", 1.0f);
         const float w_slow = getenv_float("TOPO_ANCHOR_W_SLOW", 0.25f);
+        // Zero by default: a global clock buffer contributes NOTHING to where
+        // the design should sit.  Raise it only to reproduce an old placement.
+        const float w_global = getenv_float("TOPO_ANCHOR_W_GLOBAL", 0.0f);
         double wsum = 0.0, wx = 0.0, wy = 0.0;
         for (auto &kv : site_pos) {
-            float w = kv.second.cls == ANCHOR_CLOCK ? w_clk : (kv.second.cls == ANCHOR_DATA ? w_data : w_slow);
+            float w = kv.second.cls == ANCHOR_GT
+                              ? w_gt
+                              : (kv.second.cls == ANCHOR_CLOCK
+                                         ? w_clk
+                                         : (kv.second.cls == ANCHOR_DATA
+                                                    ? w_data
+                                                    : (kv.second.cls == ANCHOR_GLOBAL ? w_global : w_slow)));
             if (dbg)
-                log_info("placer_lef:   anchor site %-22s -> slice(%d,%d)  %-8s w=%.2f\n", kv.first.c_str(),
-                         kv.second.x, kv.second.y, anchor_class_name(kv.second.cls), w);
+                log_info("placer_lef:   anchor site %-22s -> slice(%d,%d)  %-10s coupling=%-9.0f w=%.0f\n",
+                         kv.first.c_str(), kv.second.x, kv.second.y, anchor_class_name(kv.second.cls),
+                         kv.second.coupling, w * float(std::max(1.0, kv.second.coupling)));
+            // Scale by measured coupling, so the class factor only expresses
+            // KIND and the design decides the rest.
+            w *= float(std::max(1.0, kv.second.coupling));
             wx += double(kv.second.x) * w;
             wy += double(kv.second.y) * w;
             wsum += w;

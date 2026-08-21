@@ -379,8 +379,10 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
             CellInfo *l6 = lts.cells[(i << 4) | BEL_6LUT];
             CellInfo *l5 = lts.cells[(i << 4) | BEL_5LUT];
             if ((l6 != nullptr && (l6->lutInfo.is_memory || l6->lutInfo.is_srl)) ||
-                (l5 != nullptr && (l5->lutInfo.is_memory || l5->lutInfo.is_srl)))
+                (l5 != nullptr && (l5->lutInfo.is_memory || l5->lutInfo.is_srl))) {
+                DBG();
                 return false;
+                }
         }
     }
     // A 5LUT bel has neither an A6 input nor an O6 output wire; a cell there
@@ -411,8 +413,10 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
                 drives_o6 = true;
         }
         if (in_used > 5 || drives_o6 || l5->lutInfo.output_count == 2 ||
-            get_net_or_empty(l5, id_A6) != nullptr || get_net_or_empty(l5, id_O6) != nullptr)
+            get_net_or_empty(l5, id_A6) != nullptr || get_net_or_empty(l5, id_O6) != nullptr) {
+            DBG();
             return false;
+            }
     }
     bool tile_is_memory = false;
     if (lts.cells[(3 << 4) | BEL_6LUT] != nullptr && lts.cells[(3 << 4) | BEL_6LUT]->lutInfo.is_memory)
@@ -464,10 +468,11 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
                     continue;
                 // UNCONSTR means NO positional constraint -- it does NOT mean
                 // "offset zero".  Conflating the two made this rule demand that
-                // any child with a parent share the parent's tile even when
-                // nothing asked for it, and it rejected a correctly packed
-                // carry slice (SLICE_X169Y172: count_cycle LUTs, GND di_luts on
-                // the 5LUT slots, FFs, CARRY4 at z=79).  Only enforce
+                // any child with a parent share the parent's tile, even when
+                // nothing had asked for that, and it rejected a perfectly good
+                // carry slice: SLICE_X169Y172 held a complete, correctly packed
+                // CARRY4 (count_cycle LUTs, GND di_luts on the 5LUT slots, FFs,
+                // CARRY4 at z=79) and was refused anyway.  Only enforce
                 // co-location where the constraint EXPLICITLY says offset 0.
                 auto tile_local = [](const CellInfo *c) {
                     return c->constr_x == 0 && c->constr_y == 0;
@@ -523,10 +528,12 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
             if (lut6 != nullptr) {
                 if (!is_slicem && (lut6->lutInfo.is_memory || lut6->lutInfo.is_srl)) {
                     DBG_RT();
+                    DBG();
                     return false; // Memory and SRLs only valid in SLICEMs
                 }
                 if (lut6->lutInfo.is_srl && (i >= 4)) {
                     DBG_RT();
+                    DBG();
                     return false;
                 }
                 if (lut6->lutInfo.is_memory || lut6->lutInfo.is_srl) {
@@ -872,6 +879,7 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
         } else if (!lts.eights[i].valid) {
             if (dbg_validity_runtime)
                 log_info("  invalid-arm: cached eights[%d].valid=false\n", i);
+            DBG();
             return false;
         }
     }
@@ -905,6 +913,7 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
                         continue;
                     if (ff->ffInfo.is_latch && k == 1) {
                         DBG_RT();
+                        DBG();
                         return false;
                     }
                     if (found_ff[0] || found_ff[1]) {
@@ -912,34 +921,41 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
                             if (dbg_validity_runtime)
                                 log_info("  invalid-arm: ctrlset clk %s: %s vs %s\n", nameOf(ff),
                                          ff->ffInfo.clk ? nameOf(ff->ffInfo.clk) : "-", clk ? nameOf(clk) : "-");
+                            DBG();
                             return false;
                         }
                         if (ff->ffInfo.sr != sr) {
                             if (dbg_validity_runtime)
                                 log_info("  invalid-arm: ctrlset sr %s: %s vs %s\n", nameOf(ff),
                                          ff->ffInfo.sr ? nameOf(ff->ffInfo.sr) : "-", sr ? nameOf(sr) : "-");
+                            DBG();
                             return false;
                         }
                         if (ff->ffInfo.ce != ce) {
                             if (dbg_validity_runtime)
                                 log_info("  invalid-arm: ctrlset ce %s: %s vs %s\n", nameOf(ff),
                                          ff->ffInfo.ce ? nameOf(ff->ffInfo.ce) : "-", ce ? nameOf(ce) : "-");
+                            DBG();
                             return false;
                         }
                         if (ff->ffInfo.is_clkinv != clkinv) {
                             DBG_RT();
+                            DBG();
                             return false;
                         }
                         if (ff->ffInfo.is_srinv != srinv) {
                             DBG_RT();
+                            DBG();
                             return false;
                         }
                         if (ff->ffInfo.is_latch != islatch) {
                             DBG_RT();
+                            DBG();
                             return false;
                         }
                         if (ff->ffInfo.ffsync != ffsync) {
                             DBG_RT();
+                            DBG();
                             return false;
                         }
                     } else {
@@ -948,6 +964,7 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
                             if (dbg_validity_runtime)
                                 log_info("  invalid-arm: wclk %s: clk %s vs wclk %s\n", nameOf(ff),
                                          clk ? nameOf(clk) : "-", wclk ? nameOf(wclk) : "-");
+                            DBG();
                             return false;
                         }
                         sr = ff->ffInfo.sr;
@@ -964,6 +981,7 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
         } else if (!lts.halfs[i].valid) {
             if (dbg_validity_runtime)
                 log_info("  invalid-arm: cached halfs[%d].valid=false\n", i);
+            DBG();
             return false;
         }
     }
@@ -1103,8 +1121,22 @@ bool Arch::isBelLocationValid(BelId bel) const
         LogicTileStatus &lts = *(tileStatus[bel.tile].lts);
         if (xc7) {
             bool v = xc7_logic_tile_valid(belTileType, lts);
-            if (!v && dbg_validity_runtime)
+            if (!v && dbg_validity_runtime) {
                 log_info("  invalid-check: xc7_logic_tile_valid=false (type %s)\n", belTileType.c_str(this));
+                // Was that a CACHED verdict or a fresh one?  A cached false
+                // prints no invalid-arm, which is indistinguishable from a
+                // fresh false whose arm we failed to log.  Re-evaluate with
+                // every section forced dirty: if it now comes back TRUE the
+                // cache was stale, and if it comes back false the arm that
+                // fires is the real reason.
+                for (int i = 0; i < 8; i++) {
+                    lts.eights[i].dirty = true;
+                    lts.halfs[i].dirty = true;
+                }
+                bool v2 = xc7_logic_tile_valid(belTileType, lts);
+                log_info("  invalid-check: forced re-evaluation says %s\n",
+                         v2 ? "VALID -- the cached verdict was STALE" : "still invalid (arm above is the reason)");
+            }
             return v;
         } else
             return xcu_logic_tile_valid(belTileType, lts);
@@ -1144,6 +1176,37 @@ bool Arch::isValidBelForCell(CellInfo *cell, BelId bel) const
 {
     if (usp_bel_hard_unavail(bel))
         return false;
+    // CONTROL SETS, at candidate-selection time.  Every flop in a slice half
+    // shares one clock, one clock-enable and one set/reset, and that rule lived
+    // ONLY in the tile-level check -- which the placer consults when it moves a
+    // cell, but not when it first chooses one.  Initial placement was therefore
+    // control-set blind: it scattered flops of different domains into the same
+    // half and left the annealer to repair thousands of conflicts, and any it
+    // failed to repair surfaced only at the final sweep:
+    //   invalid-arm: ctrlset clk core.dma.tx_run_FDRE_Q: clk_mac vs clk_sys
+    // Rejecting the candidate is far cheaper than un-picking it later, and it
+    // is the same reasoning the 5LUT and SLICEM gates below are built on.
+    // A cell that arrived with a BEL attribute is trusted, as everywhere else.
+    if (xc7 && cell->type == id_SLICE_FFX && !cell->attrs.count(id("BEL"))) {
+        int z = locInfo(bel).bel_data[bel.index].z;
+        int half = (z >> 4) / 4;
+        LogicTileStatus *lts = tileStatus[bel.tile].lts;
+        if (lts != nullptr) {
+            for (int i = half * 4; i < half * 4 + 4; i++) {
+                for (int slot : {BEL_FF, BEL_FF2}) {
+                    CellInfo *other = lts->cells[(i << 4) | slot];
+                    if (other == nullptr || other == cell || other->type != id_SLICE_FFX)
+                        continue;
+                    if (other->ffInfo.clk != cell->ffInfo.clk || other->ffInfo.ce != cell->ffInfo.ce ||
+                        other->ffInfo.sr != cell->ffInfo.sr || other->ffInfo.is_clkinv != cell->ffInfo.is_clkinv ||
+                        other->ffInfo.is_srinv != cell->ffInfo.is_srinv ||
+                        other->ffInfo.is_latch != cell->ffInfo.is_latch ||
+                        other->ffInfo.ffsync != cell->ffInfo.ffsync)
+                        return false;
+                }
+            }
+        }
+    }
     // A MUXF8 may only sit on an F8MUX bel, and a MUXF7 only on F7AMUX/F7BMUX.
     //
     // On every other family that is enforced by the TYPE: pack.cc gives
@@ -1190,6 +1253,18 @@ bool Arch::isValidBelForCell(CellInfo *cell, BelId bel) const
         !cell->attrs.count(id("BEL"))) {
         IdString tt = getBelTileType(bel);
         if (tt != id_CLBLM_L && tt != id_CLBLM_R)
+            return false;
+        // ...and it must be the SLICEM ITSELF, not merely a slice in a CLBLM
+        // TILE.  A CLBLM holds TWO slices, one SLICEM and one SLICEL, so the
+        // tile-type test above passes for both and a distributed-RAM cell
+        // landing in the SLICEL half has no write port at all:
+        //   ERROR: No wire found for port CLK on destination cell
+        //          core.soc.cpu.cpuregs.0.2/DPR0_0
+        // (that cell was at SLICE_X149Y150/A5LUT).  Ask the bel whether it
+        // actually has the pins, rather than inferring capability from the
+        // tile: the device model knows, and this cannot drift the way a
+        // site-naming convention can.
+        if (getBelPinWire(bel, id_CLK) == WireId())
             return false;
     }
     // A LUT that uses any 6LUT-only physical pin -- the A6 input or the O6

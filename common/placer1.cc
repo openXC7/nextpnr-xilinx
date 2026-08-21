@@ -338,6 +338,15 @@ class SAPlacer
                 for (auto &cell : ctx->cells) {
                     CellInfo *ci = cell.second.get();
                     if (ci->bel == BelId()) {
+                        if (ci->constr_parent != nullptr) {
+                            CellInfo *r = ci;
+                            while (r->constr_parent != nullptr)
+                                r = r->constr_parent;
+                            log_info("    orphan '%s' (%s): root '%s' is %s, tile-local=%s\n", ctx->nameOf(ci),
+                                     ci->type.c_str(ctx), ctx->nameOf(r),
+                                     r->bel == BelId() ? "UNPLACED" : ctx->getBelName(r->bel).c_str(ctx),
+                                     cluster_is_tile_local(r) ? "yes" : "no");
+                        }
                         // Inherit the ROOT's region.  A constrained child has
                         // none of its own (only roots are given one), so an
                         // orphan placed here would be free to land anywhere on
@@ -356,6 +365,33 @@ class SAPlacer
                 }
                 if (orphans > 0)
                     log_info("  placed %d cluster child(ren) whose root could not seat them\n", orphans);
+            }
+            // SPLIT THE LISTS FOR ANNEALING.  `autoplaced` has served as the
+            // initial-placement worklist; from here it is the SA MOVE LIST, and
+            // the two want different contents.  A cluster root must move as a
+            // UNIT -- try_swap_chain, driven by chain_basis -- because moving
+            // one member on its own splits the cluster.
+            //
+            // chain_basis was populated ONLY in the refinement branch and in
+            // the legalise-relative-constraints refresh, never on a fresh
+            // placement, so try_swap_chain was simply never called here.  With
+            // individual moves of tile-local cluster members also refused (as
+            // they must be), every clustered cell was frozen for the whole
+            // anneal -- and a LUT+FF pair is a cluster, so SA could not move
+            // the flops it needs to move to resolve a control-set conflict:
+            //   invalid-arm: ctrlset ce ...mem_addr_FDRE_Q_23: <net> vs -
+            // Freezing them was never the intent; moving them ATOMICALLY is.
+            {
+                std::vector<CellInfo *> singles;
+                for (auto ci : autoplaced) {
+                    if (!ci->constr_children.empty())
+                        chain_basis.push_back(ci);
+                    else
+                        singles.push_back(ci);
+                }
+                autoplaced = std::move(singles);
+                log_info("  SA move lists: %d single cell(s), %d cluster root(s)\n", int(autoplaced.size()),
+                         int(chain_basis.size()));
             }
             if (cfg.budgetBased && cfg.slack_redist_iter > 0)
                 assign_budget(ctx);
@@ -531,6 +567,11 @@ class SAPlacer
             // Recalculate total metric entirely to avoid rounding errors
             // accumulating over time
             curr_wirelen_cost = total_wirelen_cost();
+            rudy_init();
+            site_density_init();
+            longline_init();
+            cohesion_init();
+            cost_banner_logged = true;
             curr_timing_cost = total_timing_cost();
             last_wirelen_cost = curr_wirelen_cost;
             last_timing_cost = curr_timing_cost;
@@ -621,17 +662,19 @@ class SAPlacer
                 return false;
             if (!ctx->checkBelAvail(tb) || !claimed.insert(tb).second)
                 return false;
-            // Deliberately NOT isValidBelForCell(child, tb).  This predicate
-            // exists to predict whether bind_constr_children can seat the
-            // cluster, and that binder tests only type and availability -- so
-            // adding a legality test here makes the gate STRICTER THAN THE
-            // BINDER IT GUARDS and rejects placements that would work.  On
-            // ethmin it refused every CARRY4 site in the region over one
-            // packer-made VCC LUT:
-            //   at SLICE_X155Y191/CARRY4: child '$PACKER_VCC_NET$LUT$1696'
-            //      (SLICE_LUTX) -> isValidBelForCell refused the child
-            // Genuine illegality is still caught afterwards by the tile-level
-            // isBelLocationValid, which is where slice rules belong.
+            // The child must be LEGAL there, not merely unoccupied.  Nothing
+            // downstream re-checks: bind_constr_children seats children
+            // directly, so an illegal one survives to the final sweep and is
+            // rejected there, far too late to move -- e.g. a flop landing in a
+            // slice half whose other flops use a different clock enable:
+            //   invalid-arm: ctrlset ce ...mem_addr_FDRE_Q_23: <net> vs -
+            // This check was removed earlier because it refused every CARRY4
+            // site over a packer-made VCC LUT that drives O6 and was pinned to
+            // a 5LUT slot.  That was a real defect and it is now fixed at
+            // source (pack.cc maps a 5LUT-constrained LUT's output to O5), so
+            // the gate no longer over-rejects and can do its job.
+            if (!ctx->isValidBelForCell(child, tb))
+                return false;
             if (!constr_children_fit(child, cl, claimed))
                 return false;
         }
@@ -737,13 +780,14 @@ class SAPlacer
                     //   constr_z = (z << 4) | (o5 ? BEL_5LUT : BEL_6LUT)
                     // -- and the binder respects that for CHILDREN, imposing
                     // the root's half bits (constr_z | (rootLoc.z & ~0x3F)).
-                    // Nothing applied it to the ROOT, which was chosen on bel
-                    // TYPE alone: the RV32 register file's DPR0_0 roots landed
-                    // on C5LUT and B5LUT when their own constraint named a
-                    // different slot, so every sibling's position was computed
-                    // from a root in the wrong place and nine could not be
-                    // seated at all.  Only the low 6 bits are the cell's
-                    // business; bit 6 up is the slice half, left free.
+                    // Nothing was applying it to the ROOT, which was chosen on
+                    // bel TYPE alone: the RV32 register file's DPR0_0 roots
+                    // landed on C5LUT and B5LUT when their own constraint asked
+                    // for a different slot, so every sibling's position was
+                    // computed from a root in the wrong place and nine of them
+                    // could not be seated at all.
+                    // Only the low 6 bits are the cell's business; bit 6 up is
+                    // the slice half, which the root is free to choose.
                     if (cell->constr_abs_z &&
                         (ctx->getBelLocation(bel).z & 0x3F) != (cell->constr_z & 0x3F))
                         return;
@@ -759,6 +803,17 @@ class SAPlacer
                             best_bel = bel;
                         }
                     } else {
+                        // NO RIPUP for a tile-local cluster root.  Ripping up
+                        // the occupant frees the ROOT's bel but not its
+                        // children's, so the binder finds those still taken,
+                        // leaves them unbound (it must not abort -- see
+                        // bind_constr_children), and they resurface as orphans
+                        // placed on their own, away from their parent.  That is
+                        // where the 9 stragglers came from, and each one is a
+                        // split cluster the validity check then refuses.  Such
+                        // a cluster needs a clean fit or none.
+                        if (!cell->constr_children.empty() && cluster_is_tile_local(cell))
+                            return;
                         uint64_t score = ctx->rng64();
                         CellInfo *bound_cell = ctx->getBoundBelCell(bel);
                         if (score <= best_ripup_score && bound_cell->belStrength < STRENGTH_STRONG) {
@@ -900,11 +955,26 @@ class SAPlacer
         // long since committed and the run dies with
         //   ERROR: post-placement validity check failed for Bel ... (no cell)
         // Refusing the move is the only place the rule can be enforced cheaply.
-        if (is_in_tile_local_cluster(cell))
+        // A constrained CHILD never moves on its own -- not even during
+        // legalisation, which is where this used to leak.  The guard above is
+        // gated on !require_legal, so once legalisation starts, SA is free to
+        // relocate individual cluster members; for a carry chain that walks the
+        // S-LUTs off the bels their constraints name.  On ethmin all 936
+        // S-driver LUTs carried a correct CONSTR_PARENT (offset X=0 Y=-5 from a
+        // root at SLICE_X202Y10, i.e. SLICE_X202Y15 where the CARRY4 sits) and
+        // only 33.5% ended up there -- the rest scattered to X206Y15, X198Y16,
+        // X202Y23.  A CARRY4's S input can only be driven by the LUT in its own
+        // slice, so each one that wanders is an arc no router can close.
+        //
+        // The previous form of this check only covered TILE-LOCAL clusters,
+        // which a carry chain is not (its children carry row offsets), so it
+        // protected mux trees and LUT+FF pairs and left carries exposed.
+        // Clusters move as a unit through try_swap_chain on their root.
+        if (cell->constr_parent != nullptr || is_in_tile_local_cluster(cell))
             return false;
         BelId oldBel = cell->bel;
         CellInfo *other_cell = ctx->getBoundBelCell(newBel);
-        if (other_cell != nullptr && is_in_tile_local_cluster(other_cell))
+        if (other_cell != nullptr && (other_cell->constr_parent != nullptr || is_in_tile_local_cluster(other_cell)))
             return false;
         if (!require_legal && other_cell != nullptr &&
             (is_constrained(other_cell) || other_cell->belStrength > STRENGTH_WEAK)) {
@@ -955,6 +1025,26 @@ class SAPlacer
             new_dist += get_constraints_distance(ctx, other_cell);
         delta = lambda * (moveChange.timing_delta / std::max<double>(last_timing_cost, epsilon)) +
                 (1 - lambda) * (double(moveChange.wirelen_delta) / std::max<double>(last_wirelen_cost, epsilon));
+        // Congestion, normalised like the wirelength term so the weight is
+        // scale-free across designs.
+        if (cong_w > 0.0)
+            delta += cong_w * congestion_delta(moveChange) / std::max<double>(last_wirelen_cost, epsilon);
+        if (site_w > 0.0) {
+            sd_moves.clear();
+            sd_moves.emplace_back(oldBel, newBel);
+            if (other_cell != nullptr)
+                sd_moves.emplace_back(newBel, oldBel);
+            delta += site_w * site_density_delta(sd_moves) / std::max<double>(last_wirelen_cost, epsilon);
+        }
+        if (coh_w > 0.0) {
+            coh_moves.clear();
+            coh_moves.emplace_back(cell, ctx->getBelLocation(oldBel), ctx->getBelLocation(newBel));
+            if (other_cell != nullptr)
+                coh_moves.emplace_back(other_cell, ctx->getBelLocation(newBel), ctx->getBelLocation(oldBel));
+            delta += coh_w * cohesion_delta() / std::max<double>(last_wirelen_cost, epsilon);
+        }
+        if (ll_w > 0.0)
+            delta += ll_w * longline_delta(moveChange) / std::max<double>(last_wirelen_cost, epsilon);
         delta += (cfg.constraintWeight / temp) * (new_dist - old_dist) / last_wirelen_cost;
         if (cfg.netShareWeight > 0)
             delta += -cfg.netShareWeight * (net_delta_score / std::max<double>(total_net_share, epsilon));
@@ -1095,6 +1185,23 @@ class SAPlacer
         compute_cost_changes(moveChange);
         delta = lambda * (moveChange.timing_delta / last_timing_cost) +
                 (1 - lambda) * (double(moveChange.wirelen_delta) / last_wirelen_cost);
+        if (cong_w > 0.0)
+            delta += cong_w * congestion_delta(moveChange) / std::max<double>(last_wirelen_cost, 1e-20);
+        if (site_w > 0.0) {
+            sd_moves.clear();
+            for (const auto &mm : moves_made)
+                sd_moves.emplace_back(mm.second, mm.first->bel);
+            delta += site_w * site_density_delta(sd_moves) / std::max<double>(last_wirelen_cost, 1e-20);
+        }
+        if (ll_w > 0.0)
+            delta += ll_w * longline_delta(moveChange) / std::max<double>(last_wirelen_cost, 1e-20);
+        if (coh_w > 0.0) {
+            coh_moves.clear();
+            for (const auto &mm : moves_made)
+                coh_moves.emplace_back(mm.first, ctx->getBelLocation(mm.second),
+                                       ctx->getBelLocation(mm.first->bel));
+            delta += coh_w * cohesion_delta() / std::max<double>(last_wirelen_cost, 1e-20);
+        }
         if (cfg.netShareWeight > 0) {
             delta +=
                     cfg.netShareWeight * (orig_share_cost - total_net_share) / std::max<double>(total_net_share, 1e-20);
@@ -1561,8 +1668,485 @@ class SAPlacer
         }
     }
 
+    // ===== RUDY global-routing congestion =====================================
+    // Ported from place_lef_core.ml:1785.  Bin the die; spread each multi-pin
+    // net's HPWL uniformly over the bins its bounding box covers (a wire-density
+    // estimate); the cost is the demand ABOVE a per-bin capacity.  Wirelength
+    // alone does not stop a region filling past what the router can serve, and
+    // that is precisely how this placer produced an ethmin placement that met
+    // every timing constraint and left 2959 arcs unroutable, concentrated on
+    // high-fanout nets (mem_rdata, dbg_reg_pc, pcpi_rs1, crc_state).
+    //
+    // Knobs match place_lef's so a setting can be carried across:
+    //   TOPO_CONG_W    weight (0 = off, place_route_open.sh uses 6)
+    //   TOPO_CONG_BIN  bin edge in tiles (default 6, the script uses 5)
+    //   TOPO_CONG_CAP  per-bin demand capacity (default 20, the script uses 8)
+    double cong_w = 0.0, cong_cap = 20.0;
+    int cong_bin = 6, nbx = 1, nby = 1;
+    std::vector<double> rudy;
+    std::vector<std::pair<int, double>> pending_cong; // bin deltas of the move under test
+    bool cost_banner_logged = false; // ONE flag for every cost-model banner:
+                                     // these all print from the per-temperature
+                                     // rebuild, so each new term must share it
+
+    static double getenv_dbl(const char *name, double dflt)
+    {
+        if (const char *e = getenv(name))
+            return atof(e);
+        return dflt;
+    }
+
+    // ===== SITE DENSITY ======================================================
+    // place_lef_core.ml:1803, and its comment is the rationale: RUDY measures
+    // WIRE density and "does NOT stop bins filling to 100% site occupancy --
+    // and a fully-packed bin has no room for routing/relays, which is what
+    // actually makes the datapath corner unroutable."  Exactly the symptom left
+    // after co-location was fixed: short arcs failing into slices whose local
+    // input routing is over-subscribed (two different nets both unable to reach
+    // SLICE_X211Y63).
+    //
+    //   TOPO_SITE_W     weight (0 = off; ethmin's own flow uses 300)
+    //   TOPO_SITE_FRAC  target occupancy fraction (ethmin uses 0.55)
+    double site_w = 0.0, site_frac = 0.55;
+    std::vector<int> site_cells;  // cells bound per SLICE site
+    std::vector<int> bin_occ;     // sites in use per bin
+    std::vector<double> bin_cap;  // sites in bin * site_frac
+    std::vector<std::pair<int, int>> pending_occ; // bin deltas of the move under test
+    std::vector<std::pair<BelId, BelId>> sd_moves; // (from,to) bels of the move under test
+    // Scratch for the per-move delta functions.  These run on EVERY evaluated
+    // move -- millions per anneal -- so they must not allocate.  A std::map here
+    // took SA from 147s to 709s with a single term enabled; place_lef does the
+    // same arithmetic on flat arrays in 132s for its whole program.  Indexed by
+    // bin, with a touched-list so only the entries used are cleared.
+    std::vector<double> scratch_a, scratch_b;
+    std::vector<int> touched_a, touched_b;
+
+    int site_index(const Loc &l) const { return (l.y * (max_x + 1) + l.x) * 2 + ((l.z >> 6) & 1); }
+    int bin_of(const Loc &l) const
+    {
+        int bx = l.x / cong_bin, by = l.y / cong_bin;
+        if (bx < 0 || bx >= nbx || by < 0 || by >= nby)
+            return -1;
+        return by * nbx + bx;
+    }
+
+    // ===== LONG-LINE / TRACK RESOURCE MODEL ==================================
+    // place_lef_core.ml:1843.  Its rationale is the one that fits the failures
+    // left after co-location and density: "RUDY treats all wire as fungible,
+    // but a long net consumes SCARCE long-distance tracks (7-series LH/LV long
+    // lines) in the corridor it crosses -- which is exactly what nextpnr's
+    // router exhausts on the long spans we fail on, and what HPWL/RUDY miss."
+    //
+    // Cut-based demand: for each net, every VERTICAL cut inside its bounding box
+    // carries one unit of HORIZONTAL track demand, spread over the rows it might
+    // route through; every HORIZONTAL cut carries one unit of VERTICAL demand,
+    // spread over columns.  Overflow is demand above the tracks available.
+    //
+    //   TOPO_LL_W     weight (0 = off; ethmin's flow uses 8)
+    //   TOPO_LL_HCAP  horizontal tracks per cut/band (ethmin: 5)
+    //   TOPO_LL_VCAP  vertical   tracks per cut/band (ethmin: 5)
+    double ll_w = 0.0, ll_hcap = 5.0, ll_vcap = 5.0;
+    std::vector<double> llh, llv;
+    std::vector<std::pair<int, double>> pending_llh, pending_llv;
+
+    // ===== MODULE COHESION ===================================================
+    // place_lef_core.ml:1857.  Pull cells of the same hierarchical module toward
+    // their module centroid.  Its comment states the tension this resolves: the
+    // density penalty "spreads global density but also scatters coupled logic
+    // (e.g. i_arp's 48-bit sender_mac readback smeared over 37 columns -> its
+    // mux nets can't route).  Cohesion keeps each module compact while density
+    // only punishes UNRELATED modules sharing a bin."
+    //
+    // That is the measured symptom here: after the anchor and region work the
+    // two placements agree on ENVELOPE (bbox 222x62 vs 222x66, 3.99 vs 4.10
+    // cells/site) but share only 21.8% of each cell's 8 nearest neighbours.
+    // Same box, different arrangement inside it.
+    //
+    //   TOPO_COH_W      weight (0 = off; ethmin's flow uses 10)
+    //   TOPO_COH_DEPTH  0 = strip the last hierarchy component; K>0 = cut at
+    //                   the Kth separator, so a deep vendor IP block becomes ONE
+    //                   module instead of hundreds of per-register-bank groups
+    double coh_w = 0.0;
+    int coh_depth = 0;
+    std::vector<int> coh_mod;            // cell udata -> module id
+    std::vector<int> coh_cnt;            // cells per module
+    std::vector<int64_t> coh_sx, coh_sy; // centroid sums
+    std::vector<std::tuple<CellInfo *, Loc, Loc>> coh_moves;
+
+    static std::string module_key(const std::string &name, int depth)
+    {
+        if (depth <= 0) {
+            size_t cut = name.find_last_of("./");
+            return cut == std::string::npos || cut == 0 ? name : name.substr(0, cut);
+        }
+        int seen = 0;
+        for (size_t i = 0; i < name.size(); i++)
+            if (name[i] == '.' || name[i] == '/') {
+                if (++seen >= depth)
+                    return name.substr(0, i);
+            }
+        size_t cut = name.find_last_of("./");
+        return cut == std::string::npos || cut == 0 ? name : name.substr(0, cut);
+    }
+
+    void cohesion_init()
+    {
+        coh_w = getenv_dbl("TOPO_COH_W", 0.0);
+        if (coh_w <= 0.0)
+            return;
+        coh_depth = int(getenv_dbl("TOPO_COH_DEPTH", 0));
+        // Uses CellInfo::udata as a dense index.  Safe here: placer1 indexes
+        // NETS by udata, never cells, and placer_heap (the only other user)
+        // assigns its own and does not run alongside sa.
+        std::unordered_map<std::string, int> ids;
+        coh_mod.assign(ctx->cells.size() + 1, -1);
+        coh_cnt.clear();
+        coh_sx.clear();
+        coh_sy.clear();
+        int next_udata = 0;
+        for (auto &cell : ctx->cells) {
+            CellInfo *ci = cell.second.get();
+            ci->udata = next_udata++;
+            if (int(coh_mod.size()) <= ci->udata)
+                coh_mod.resize(ci->udata + 1, -1);
+            auto key = module_key(ci->name.str(ctx), coh_depth);
+            auto it = ids.find(key);
+            int id;
+            if (it == ids.end()) {
+                id = int(coh_cnt.size());
+                ids[key] = id;
+                coh_cnt.push_back(0);
+                coh_sx.push_back(0);
+                coh_sy.push_back(0);
+            } else
+                id = it->second;
+            coh_mod[ci->udata] = id;
+            if (ci->bel != BelId()) {
+                Loc l = ctx->getBelLocation(ci->bel);
+                coh_cnt[id]++;
+                coh_sx[id] += l.x;
+                coh_sy[id] += l.y;
+            }
+        }
+        log_info("  cohesion on: %d modules, weight %.2f, depth %d\n", int(coh_cnt.size()), coh_w, coh_depth);
+    }
+
+    // Change in each moved cell's Manhattan distance to its module centroid.
+    // The centroid is held FIXED within the move, which is the standard
+    // treatment and keeps the delta cheap.
+    double cohesion_delta()
+    {
+        if (coh_w <= 0.0)
+            return 0.0;
+        double d = 0.0;
+        for (auto &m : coh_moves) {
+            CellInfo *ci = std::get<0>(m);
+            if (ci == nullptr || ci->udata < 0 || ci->udata >= int(coh_mod.size()))
+                continue;
+            int mo = coh_mod[ci->udata];
+            if (mo < 0 || coh_cnt[mo] <= 1)
+                continue;
+            int cx = int(coh_sx[mo] / coh_cnt[mo]), cy = int(coh_sy[mo] / coh_cnt[mo]);
+            const Loc &o = std::get<1>(m), &n2 = std::get<2>(m);
+            d += double((std::abs(n2.x - cx) + std::abs(n2.y - cy)) - (std::abs(o.x - cx) + std::abs(o.y - cy)));
+        }
+        return d;
+    }
+
+    void cohesion_commit()
+    {
+        if (coh_w <= 0.0)
+            return;
+        for (auto &m : coh_moves) {
+            CellInfo *ci = std::get<0>(m);
+            if (ci == nullptr || ci->udata < 0 || ci->udata >= int(coh_mod.size()))
+                continue;
+            int mo = coh_mod[ci->udata];
+            if (mo < 0)
+                continue;
+            const Loc &o = std::get<1>(m), &n2 = std::get<2>(m);
+            coh_sx[mo] += n2.x - o.x;
+            coh_sy[mo] += n2.y - o.y;
+        }
+        coh_moves.clear();
+    }
+
+    void longline_init()
+    {
+        ll_w = getenv_dbl("TOPO_LL_W", 0.0);
+        if (ll_w <= 0.0)
+            return;
+        ll_hcap = getenv_dbl("TOPO_LL_HCAP", double(cong_bin));
+        ll_vcap = getenv_dbl("TOPO_LL_VCAP", double(cong_bin));
+        llh.assign(size_t(nbx) * nby, 0.0);
+        llv.assign(size_t(nbx) * nby, 0.0);
+        for (size_t i = 0; i < net_bounds.size(); i++)
+            ll_spread(net_bounds[i], +1.0, [&](int i2, double a) { llh[i2] += a; },
+                      [&](int i2, double a) { llv[i2] += a; });
+        if (!cost_banner_logged)
+            log_info("  long-line model on: hcap %.1f, vcap %.1f, weight %.2f\n", ll_hcap, ll_vcap, ll_w);
+    }
+
+    template <typename FH, typename FV> void ll_spread(const BoundingBox &b, double sign, FH accH, FV accV)
+    {
+        if (b.x1 < b.x0 || b.y1 < b.y0)
+            return;
+        int bx0 = b.x0 / cong_bin, bx1 = b.x1 / cong_bin;
+        int by0 = b.y0 / cong_bin, by1 = b.y1 / cong_bin;
+        int nrow = by1 - by0 + 1, ncol = bx1 - bx0 + 1;
+        // vertical cuts -> horizontal track demand, shared by the rows crossed
+        for (int cx = bx0 + 1; cx <= bx1; cx++)
+            for (int by = by0; by <= by1; by++)
+                if (cx >= 0 && cx < nbx && by >= 0 && by < nby)
+                    accH(by * nbx + cx, sign / double(nrow));
+        // horizontal cuts -> vertical track demand, shared by the columns crossed
+        for (int cy = by0 + 1; cy <= by1; cy++)
+            for (int bx = bx0; bx <= bx1; bx++)
+                if (bx >= 0 && bx < nbx && cy >= 0 && cy < nby)
+                    accV(cy * nbx + bx, sign / double(ncol));
+    }
+
+    double longline_delta(MoveChangeData &md)
+    {
+        if (ll_w <= 0.0)
+            return 0.0;
+        pending_llh.clear();
+        pending_llv.clear();
+        if (scratch_a.size() != llh.size())
+            scratch_a.assign(llh.size(), 0.0);
+        if (scratch_b.size() != llv.size())
+            scratch_b.assign(llv.size(), 0.0);
+        auto accH = [&](int i, double a) {
+            if (scratch_a[i] == 0.0)
+                touched_a.push_back(i);
+            scratch_a[i] += a;
+        };
+        auto accV = [&](int i, double a) {
+            if (scratch_b[i] == 0.0)
+                touched_b.push_back(i);
+            scratch_b[i] += a;
+        };
+        auto touched = [&](decltype(NetInfo::udata) bc) {
+            ll_spread(net_bounds[bc], -1.0, accH, accV);
+            ll_spread(md.new_net_bounds[bc], +1.0, accH, accV);
+        };
+        for (const auto &bc : md.bounds_changed_nets_x)
+            touched(bc);
+        for (const auto &bc : md.bounds_changed_nets_y)
+            touched(bc);
+        double delta = 0.0;
+        for (int i : touched_a) {
+            double d = scratch_a[i];
+            scratch_a[i] = 0.0;
+            if (d == 0.0)
+                continue;
+            double before = llh[i];
+            delta += ov(before + d, ll_hcap) - ov(before, ll_hcap);
+            pending_llh.emplace_back(i, d);
+        }
+        touched_a.clear();
+        for (int i : touched_b) {
+            double d = scratch_b[i];
+            scratch_b[i] = 0.0;
+            if (d == 0.0)
+                continue;
+            double before = llv[i];
+            delta += ov(before + d, ll_vcap) - ov(before, ll_vcap);
+            pending_llv.emplace_back(i, d);
+        }
+        touched_b.clear();
+        return delta;
+    }
+
+    void site_density_init()
+    {
+        site_w = getenv_dbl("TOPO_SITE_W", 0.0);
+        if (site_w <= 0.0)
+            return;
+        site_frac = getenv_dbl("TOPO_SITE_FRAC", 0.55);
+        site_cells.assign(size_t(max_x + 1) * (max_y + 1) * 2, 0);
+        bin_occ.assign(size_t(nbx) * nby, 0);
+        bin_cap.assign(size_t(nbx) * nby, 0.0);
+        // Capacity is the number of SLICE sites the bin actually contains --
+        // a fixed per-bin constant would be wrong, because the grid is not
+        // uniform (clock and IO columns hold no slice at all).
+        std::set<int> counted;
+        for (auto bel : ctx->getBels()) {
+            if (ctx->getBelType(bel) != id_SLICE_LUTX)
+                continue;
+            Loc l = ctx->getBelLocation(bel);
+            int si = site_index(l), b = bin_of(l);
+            if (b < 0 || !counted.insert(si).second)
+                continue;
+            bin_cap[b] += site_frac;
+        }
+        for (auto &cell : ctx->cells) {
+            CellInfo *ci = cell.second.get();
+            if (ci->bel == BelId())
+                continue;
+            Loc l = ctx->getBelLocation(ci->bel);
+            int si = site_index(l), b = bin_of(l);
+            if (b < 0 || si < 0 || si >= int(site_cells.size()))
+                continue;
+            if (site_cells[si]++ == 0)
+                bin_occ[b]++;
+        }
+    }
+
+    static double sov(double occ, double cap) { return occ > cap ? occ - cap : 0.0; }
+
+    // Occupancy change from moving one cell between two bels (either may be
+    // invalid).  Returns the weighted overflow delta and stashes bin changes.
+    double site_density_delta(const std::vector<std::pair<BelId, BelId>> &moves)
+    {
+        if (site_w <= 0.0)
+            return 0.0;
+        pending_occ.clear();
+        std::map<int, int> docc;
+        auto touch = [&](BelId bel, int d) {
+            if (bel == BelId())
+                return;
+            Loc l = ctx->getBelLocation(bel);
+            int si = site_index(l), b = bin_of(l);
+            if (b < 0 || si < 0 || si >= int(site_cells.size()))
+                return;
+            int before = site_cells[si];
+            int after = before + d;
+            if (before == 0 && after > 0)
+                docc[b] += 1;
+            else if (before > 0 && after == 0)
+                docc[b] -= 1;
+            site_cells[si] = after; // provisional; rolled back below
+        };
+        for (auto &m : moves)
+            touch(m.first, -1);
+        for (auto &m : moves)
+            touch(m.second, +1);
+        // roll the provisional site counts back -- the move may be rejected
+        for (auto &m : moves) {
+            if (m.second != BelId())
+                site_cells[site_index(ctx->getBelLocation(m.second))] -= 1;
+            if (m.first != BelId())
+                site_cells[site_index(ctx->getBelLocation(m.first))] += 1;
+        }
+        double delta = 0.0;
+        for (auto &kv : docc) {
+            if (kv.second == 0)
+                continue;
+            double before = double(bin_occ[kv.first]);
+            delta += sov(before + kv.second, bin_cap[kv.first]) - sov(before, bin_cap[kv.first]);
+            pending_occ.emplace_back(kv.first, kv.second);
+        }
+        return delta;
+    }
+
+    void site_density_commit(const std::vector<std::pair<BelId, BelId>> &moves)
+    {
+        if (site_w <= 0.0)
+            return;
+        for (auto &m : moves) {
+            if (m.first != BelId())
+                site_cells[site_index(ctx->getBelLocation(m.first))] -= 1;
+            if (m.second != BelId())
+                site_cells[site_index(ctx->getBelLocation(m.second))] += 1;
+        }
+        for (auto &pc : pending_occ)
+            bin_occ[pc.first] += pc.second;
+        pending_occ.clear();
+    }
+
+    void rudy_init()
+    {
+        cong_w = getenv_dbl("TOPO_CONG_W", 0.0);
+        if (cong_w <= 0.0)
+            return;
+        cong_bin = std::max(1, int(getenv_dbl("TOPO_CONG_BIN", 6)));
+        cong_cap = getenv_dbl("TOPO_CONG_CAP", 20.0);
+        nbx = max_x / cong_bin + 1;
+        nby = max_y / cong_bin + 1;
+        rudy.assign(size_t(nbx) * nby, 0.0);
+        for (size_t i = 0; i < net_bounds.size(); i++)
+            rudy_spread(net_bounds[i], +1.0, [&](int b, double a) { rudy[b] += a; });
+        // Announce once.  This runs from the per-temperature "recalculate
+        // totals to avoid rounding drift" block -- the right place to rebuild
+        // the map, the wrong place to print.
+        if (!cost_banner_logged) {
+            log_info("  RUDY congestion on: %dx%d bins of %d, cap %.1f, weight %.2f\n", nbx, nby, cong_bin, cong_cap,
+                     cong_w);
+        }
+    }
+
+    // Spread one net's wire demand over the bins its bbox covers.
+    template <typename F> void rudy_spread(const BoundingBox &b, double sign, F acc)
+    {
+        if (b.x1 < b.x0 || b.y1 < b.y0)
+            return;
+        double hpwl = double((b.x1 - b.x0) + (b.y1 - b.y0));
+        if (hpwl <= 0.0)
+            return; // a net inside one tile congests nothing
+        int bx0 = b.x0 / cong_bin, bx1 = b.x1 / cong_bin;
+        int by0 = b.y0 / cong_bin, by1 = b.y1 / cong_bin;
+        double k = double((bx1 - bx0 + 1) * (by1 - by0 + 1));
+        double a = sign * hpwl / k;
+        for (int by = by0; by <= by1; by++)
+            for (int bx = bx0; bx <= bx1; bx++)
+                if (bx >= 0 && bx < nbx && by >= 0 && by < nby)
+                    acc(by * nbx + bx, a);
+    }
+
+    static double ov(double d, double cap) { return d > cap ? d - cap : 0.0; }
+
+    // Overflow change this move would cause, WITHOUT mutating rudy: the move may
+    // still be rejected.  The per-bin deltas are stashed and applied on commit.
+    double congestion_delta(MoveChangeData &md)
+    {
+        if (cong_w <= 0.0)
+            return 0.0;
+        pending_cong.clear();
+        if (scratch_a.size() != rudy.size()) {
+            scratch_a.assign(rudy.size(), 0.0);
+            touched_a.reserve(256);
+        }
+        auto acc = [&](int b, double a) {
+            if (scratch_a[b] == 0.0)
+                touched_a.push_back(b);
+            scratch_a[b] += a;
+        };
+        auto touched = [&](decltype(NetInfo::udata) bc) {
+            rudy_spread(net_bounds[bc], -1.0, acc);
+            rudy_spread(md.new_net_bounds[bc], +1.0, acc);
+        };
+        for (const auto &bc : md.bounds_changed_nets_x)
+            touched(bc);
+        for (const auto &bc : md.bounds_changed_nets_y)
+            touched(bc);
+        double delta = 0.0;
+        for (int b : touched_a) {
+            double d = scratch_a[b];
+            scratch_a[b] = 0.0;
+            if (d == 0.0)
+                continue;
+            double before = rudy[b];
+            delta += ov(before + d, cong_cap) - ov(before, cong_cap);
+            pending_cong.emplace_back(b, d);
+        }
+        touched_a.clear();
+        return delta;
+    }
+
     void commit_cost_changes(MoveChangeData &md)
     {
+        for (const auto &pc : pending_cong)
+            rudy[pc.first] += pc.second;
+        pending_cong.clear();
+        site_density_commit(sd_moves);
+        sd_moves.clear();
+        for (const auto &pc : pending_llh)
+            llh[pc.first] += pc.second;
+        for (const auto &pc : pending_llv)
+            llv[pc.first] += pc.second;
+        pending_llh.clear();
+        pending_llv.clear();
         for (const auto &bc : md.bounds_changed_nets_x)
             net_bounds[bc] = md.new_net_bounds[bc];
         for (const auto &bc : md.bounds_changed_nets_y)
