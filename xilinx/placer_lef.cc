@@ -63,6 +63,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
+#include <functional>
 #include <climits>
 #include <map>
 #include <set>
@@ -1330,6 +1331,20 @@ static bool place_lef_place(Context *ctx, lefpack::PackResult &r, std::vector<Le
         }
     log_info("  phase C: %d unit(s) placed constructively, %d unplaceable\n", nconstr,
              nconstr_fail);
+    auto total_hpwl = [&](int &worst) {
+        long h = 0;
+        worst = 0;
+        for (size_t n = 0; n < nnets; n++) {
+            int w = net_hpwl(int(n));
+            h += w;
+            worst = std::max(worst, w);
+        }
+        return h;
+    };
+    {
+        int worst = 0;
+        log_info("SA seed HPWL=%ld\n", total_hpwl(worst));
+    }
 
     // ---- Phase D: simulated annealing over movable units ------------------
     std::vector<int> mv;
@@ -1343,17 +1358,155 @@ static bool place_lef_place(Context *ctx, lefpack::PackResult &r, std::vector<Le
     const int m = int(mv.size());
     if (m > 0) {
         const double cong_w = getenv_float("TOPO_CONG_W", 0.0f);
+        const double site_w = getenv_float("TOPO_SITE_W", 0.0f);
+        const double ll_w = getenv_float("TOPO_LL_W", 0.0f);
         const double coh_w = getenv_float("TOPO_COH_W", 0.0f);
-        const bool cong_on = cong_w > 0.0;
-        const bool coh_on = coh_w > 0.0;
+        const bool cong_on = cong_w > 0.0, site_on = site_w > 0.0;
+        const bool ll_on = ll_w > 0.0, coh_on = coh_w > 0.0;
+        const int cong_bin = std::max(1, int(getenv_float("TOPO_CONG_BIN", 6.0f)));
+        const double cong_cap = getenv_float("TOPO_CONG_CAP", 20.0f);
+        const double site_frac = getenv_float("TOPO_SITE_FRAC", 0.80f);
+        const double hcap = getenv_float("TOPO_LL_HCAP", float(cong_bin));
+        const double vcap = getenv_float("TOPO_LL_VCAP", float(cong_bin));
+
         long moves = long(getenv_float("TOPO_SA_MOVES", 0.0f));
         if (moves <= 0)
             moves = std::max(200000L, 150L * m);
+        // Co-scale the temperature with cong_w: the accept test uses
+        // delta = HPWL_delta + cong_w*dcong, so a large cong_w inflates deltas
+        // and at a fixed t0 FREEZES the anneal -- more weight producing less
+        // overflow reduction, which is the inversion this scaling removes.
         const double ctemp = cong_on ? std::max(1.0, cong_w) : 1.0;
         const double t0 = getenv_float("TOPO_SA_T0", float(8.0 * ctemp));
         const double tend = getenv_float("TOPO_SA_TEND", float(0.05 * ctemp));
         const double alpha = std::pow(tend / t0, 1.0 / double(std::max(1L, moves)));
         double t = t0;
+
+        // ---- bin grid over the region (shared by all three area terms) ----
+        int cbx0 = INT_MAX, cby0 = INT_MAX, cbx1 = INT_MIN, cby1 = INT_MIN;
+        for (auto *s2 : region) {
+            cbx0 = std::min(cbx0, s2->sx);
+            cby0 = std::min(cby0, s2->sy);
+            cbx1 = std::max(cbx1, s2->sx);
+            cby1 = std::max(cby1, s2->sy);
+        }
+        const int nbx = (cbx1 - cbx0) / cong_bin + 1;
+        const int nby = (cby1 - cby0) / cong_bin + 1;
+        const int nbin = nbx * nby;
+        auto bin_idx = [&](int x, int y) {
+            int bx = (x - cbx0) / cong_bin, by = (y - cby0) / cong_bin;
+            return (bx >= 0 && bx < nbx && by >= 0 && by < nby) ? by * nbx + bx : -1;
+        };
+        std::vector<double> rudy(nbin, 0.0), hcut(nbin, 0.0), vcut(nbin, 0.0);
+        std::vector<int> occbin(nbin, 0);
+        // per-bin site capacity from the REAL site count: the coord grid packs
+        // more than one slice per unit, so a fixed cap would be meaningless.
+        std::vector<double> sitecap(nbin, 0.0);
+        for (auto *s2 : region) {
+            int b = bin_idx(s2->sx, s2->sy);
+            if (b >= 0)
+                sitecap[b] += site_frac;
+        }
+        auto ov = [&](double d) { return d > cong_cap ? d - cong_cap : 0.0; };
+        auto sov = [&](int b, int o) {
+            double f = double(o);
+            return f > sitecap[b] ? f - sitecap[b] : 0.0;
+        };
+        auto hov = [&](double d) { return d > hcap ? d - hcap : 0.0; };
+        auto vov = [&](double d) { return d > vcap ? d - vcap : 0.0; };
+
+        auto net_bbox = [&](int nid, int &mnx, int &mxx, int &mny, int &mxy) {
+            mnx = INT_MAX; mxx = INT_MIN; mny = INT_MAX; mxy = INT_MIN;
+            int cnt = 0;
+            for (int i : net_cells[nid])
+                if (is_placed(i)) {
+                    cnt++;
+                    mnx = std::min(mnx, pos_x[i]); mxx = std::max(mxx, pos_x[i]);
+                    mny = std::min(mny, pos_y[i]); mxy = std::max(mxy, pos_y[i]);
+                }
+            return cnt;
+        };
+        // RUDY: spread a net's HPWL uniformly over the bins its bbox covers.
+        auto net_rudy_acc = [&](int nid, double sign, std::function<void(int, double)> acc) {
+            int mnx, mxx, mny, mxy;
+            if (net_bbox(nid, mnx, mxx, mny, mxy) < 2)
+                return;
+            double hpwl = double((mxx - mnx) + (mxy - mny));
+            int bx0 = (mnx - cbx0) / cong_bin, bx1 = (mxx - cbx0) / cong_bin;
+            int by0 = (mny - cby0) / cong_bin, by1 = (mxy - cby0) / cong_bin;
+            double k2 = double((bx1 - bx0 + 1) * (by1 - by0 + 1));
+            double a2 = sign * hpwl / k2;
+            for (int by = by0; by <= by1; by++)
+                for (int bx = bx0; bx <= bx1; bx++)
+                    if (bx >= 0 && bx < nbx && by >= 0 && by < nby)
+                        acc(by * nbx + bx, a2);
+        };
+        // Long-line / track demand: RUDY treats all wire as fungible, but a long
+        // net consumes SCARCE LH/LV tracks in the corridor it crosses -- which is
+        // what the router actually exhausts.  Cut-based: every vertical cut in a
+        // net's bbox carries 1 unit of HORIZONTAL demand spread over its rows,
+        // every horizontal cut 1 unit of VERTICAL demand spread over its columns.
+        auto net_track_acc = [&](int nid, double sign, std::function<void(int, double)> hacc,
+                                 std::function<void(int, double)> vacc) {
+            int mnx, mxx, mny, mxy;
+            if (net_bbox(nid, mnx, mxx, mny, mxy) < 2)
+                return;
+            int bx0 = (mnx - cbx0) / cong_bin, bx1 = (mxx - cbx0) / cong_bin;
+            int by0 = (mny - cby0) / cong_bin, by1 = (mxy - cby0) / cong_bin;
+            double nrows = double(by1 - by0 + 1), ncols = double(bx1 - bx0 + 1);
+            for (int bxc = bx0; bxc <= bx1 - 1; bxc++)
+                for (int by = by0; by <= by1; by++)
+                    if (bxc >= 0 && bxc < nbx && by >= 0 && by < nby)
+                        hacc(by * nbx + bxc, sign / nrows);
+            for (int byc = by0; byc <= by1 - 1; byc++)
+                for (int bx = bx0; bx <= bx1; bx++)
+                    if (bx >= 0 && bx < nbx && byc >= 0 && byc < nby)
+                        vacc(byc * nbx + bx, sign / ncols);
+        };
+        auto total_overflow = [&]() {
+            double a2 = 0;
+            for (double d : rudy)
+                a2 += ov(d);
+            return a2;
+        };
+        auto track_overflow = [&]() {
+            double a2 = 0;
+            for (double d : hcut)
+                a2 += hov(d);
+            for (double d : vcut)
+                a2 += vov(d);
+            return a2;
+        };
+
+        if (cong_on) {
+            for (size_t n = 0; n < nnets; n++)
+                net_rudy_acc(int(n), 1.0, [&](int b, double a2) { rudy[b] += a2; });
+            log_info("congestion: %dx%d bins (size %d), cap %.0f, initial overflow=%.0f\n", nbx,
+                     nby, cong_bin, cong_cap, total_overflow());
+        }
+        if (site_on) {
+            for (size_t i = 0; i < ncells; i++)
+                if (movable[i] && is_placed(i)) {
+                    int b = bin_idx(pos_x[i], pos_y[i]);
+                    if (b >= 0)
+                        occbin[b]++;
+                }
+            int peak = 0;
+            for (int o : occbin)
+                peak = std::max(peak, o);
+            double peakcap = 0;
+            for (double c2 : sitecap)
+                peakcap = std::max(peakcap, c2);
+            log_info("site-density: target fill=%.2f, peak cap=%.1f/bin, initial peak occ=%d\n",
+                     site_frac, peakcap, peak);
+        }
+        if (ll_on) {
+            for (size_t n = 0; n < nnets; n++)
+                net_track_acc(int(n), 1.0, [&](int b, double a2) { hcut[b] += a2; },
+                              [&](int b, double a2) { vcut[b] += a2; });
+            log_info("long-line: hcap=%.1f vcap=%.1f, initial track overflow=%.0f\n", hcap, vcap,
+                     track_overflow());
+        }
 
         // module cohesion: pull same-parent-module units to their centroid
         std::vector<int> mod_of(ncells, -1);
@@ -1366,8 +1519,8 @@ static bool place_lef_place(Context *ctx, lefpack::PackResult &r, std::vector<Le
                 const std::string &n = r.cells[i].pc_name;
                 std::string key;
                 size_t nsep = 0;
-                for (char c : n)
-                    if (c == '.' || c == '/')
+                for (char c2 : n)
+                    if (c2 == '.' || c2 == '/')
                         nsep++;
                 if (coh_depth <= 0 || nsep <= size_t(coh_depth)) {
                     size_t cut = n.find_last_of("./");
@@ -1400,17 +1553,17 @@ static bool place_lef_place(Context *ctx, lefpack::PackResult &r, std::vector<Le
                     msy[mod_of[i]] += pos_y[i];
                     mcnt[mod_of[i]]++;
                 }
-            log_info("  cohesion: %zu modules, w=%.1f\n", mod_ids.size(), coh_w);
+            log_info("cohesion: %zu modules, w=%.1f\n", mod_ids.size(), coh_w);
         }
 
         std::vector<int> stamp(nnets, 0);
         int stamp_ctr = 0;
         long accepted = 0;
-        const long prog_every = std::max(1L, moves / 10);
+        const long prog_every = std::max(1L, moves / 20);
         for (long mvno = 1; mvno <= moves; mvno++) {
             if (mvno % prog_every == 0)
-                log_info("    SA %3ld%%  moves=%ld/%ld  accepted=%ld  temp=%.3f\n",
-                         100 * mvno / moves, mvno, moves, accepted, t);
+                log_info("  SA %3ld%%  moves=%ld/%ld  accepted=%ld  temp=%.2f\n", 100 * mvno / moves,
+                         mvno, moves, accepted, t);
             int i = mv[rng.int_(m)];
             LefSite *s = region[rng.int_(int(region.size()))];
             LefSite &si = sites[cell_site[i]];
@@ -1429,8 +1582,8 @@ static bool place_lef_place(Context *ctx, lefpack::PackResult &r, std::vector<Le
                     // delta over the union of the affected units' nets
                     stamp_ctr++;
                     std::vector<int> nets;
-                    for (int c : moved)
-                        for (int nid : cell_nets[c])
+                    for (int c2 : moved)
+                        for (int nid : cell_nets[c2])
                             if (stamp[nid] != stamp_ctr) {
                                 stamp[nid] = stamp_ctr;
                                 nets.push_back(nid);
@@ -1438,8 +1591,17 @@ static bool place_lef_place(Context *ctx, lefpack::PackResult &r, std::vector<Le
                     double before = 0;
                     for (int nid : nets)
                         before += net_w[nid] * net_hpwl(nid);
-                    for (int c : moved)
-                        olds.push_back({pos_x[c], pos_y[c]});
+                    // accumulate the affected nets' OLD demand, negated
+                    std::map<int, double> cmap, hmap, vmap;
+                    if (cong_on)
+                        for (int nid : nets)
+                            net_rudy_acc(nid, -1.0, [&](int b, double a2) { cmap[b] += a2; });
+                    if (ll_on)
+                        for (int nid : nets)
+                            net_track_acc(nid, -1.0, [&](int b, double a2) { hmap[b] += a2; },
+                                          [&](int b, double a2) { vmap[b] += a2; });
+                    for (int c2 : moved)
+                        olds.push_back({pos_x[c2], pos_y[c2]});
                     for (size_t q = 0; q < moved.size(); q++) {
                         pos_x[moved[q]] = newpos[q].first;
                         pos_y[moved[q]] = newpos[q].second;
@@ -1447,29 +1609,78 @@ static bool place_lef_place(Context *ctx, lefpack::PackResult &r, std::vector<Le
                     double after = 0;
                     for (int nid : nets)
                         after += net_w[nid] * net_hpwl(nid);
+                    // add the NEW demand -> the maps now hold per-bin deltas
+                    if (cong_on)
+                        for (int nid : nets)
+                            net_rudy_acc(nid, 1.0, [&](int b, double a2) { cmap[b] += a2; });
+                    if (ll_on)
+                        for (int nid : nets)
+                            net_track_acc(nid, 1.0, [&](int b, double a2) { hmap[b] += a2; },
+                                          [&](int b, double a2) { vmap[b] += a2; });
+                    double dcong = 0;
+                    if (cong_on)
+                        for (auto &kv : cmap)
+                            dcong += ov(rudy[kv.first] + kv.second) - ov(rudy[kv.first]);
+                    double dtrack = 0;
+                    if (ll_on) {
+                        for (auto &kv : hmap)
+                            dtrack += hov(hcut[kv.first] + kv.second) - hov(hcut[kv.first]);
+                        for (auto &kv : vmap)
+                            dtrack += vov(vcut[kv.first] + kv.second) - vov(vcut[kv.first]);
+                    }
+                    // site occupancy: -1 at each moved unit's old bin, +1 at its
+                    // new bin (a swap cancels)
+                    std::map<int, int> omap;
+                    if (site_on)
+                        for (size_t q = 0; q < moved.size(); q++) {
+                            int bo = bin_idx(olds[q].first, olds[q].second);
+                            int bn = bin_idx(newpos[q].first, newpos[q].second);
+                            if (bo >= 0)
+                                omap[bo] -= 1;
+                            if (bn >= 0)
+                                omap[bn] += 1;
+                        }
+                    double sdelta = 0;
+                    if (site_on)
+                        for (auto &kv : omap)
+                            sdelta += sov(kv.first, occbin[kv.first] + kv.second) -
+                                      sov(kv.first, occbin[kv.first]);
                     double dcoh = 0;
                     if (coh_on)
                         for (size_t q = 0; q < moved.size(); q++) {
-                            int c = moved[q], mo = mod_of[c];
+                            int c2 = moved[q], mo = mod_of[c2];
                             if (mo < 0 || mcnt[mo] <= 1)
                                 continue;
                             int cx = int(msx[mo] / mcnt[mo]), cy = int(msy[mo] / mcnt[mo]);
-                            dcoh += (std::abs(pos_x[c] - cx) + std::abs(pos_y[c] - cy)) -
+                            dcoh += (std::abs(pos_x[c2] - cx) + std::abs(pos_y[c2] - cy)) -
                                     (std::abs(olds[q].first - cx) + std::abs(olds[q].second - cy));
                         }
-                    double delta = (after - before) + coh_w * dcoh;
+                    double delta = (after - before) + cong_w * dcong + site_w * sdelta +
+                                   ll_w * dtrack + coh_w * dcoh;
                     // `||` short-circuits, so a downhill move consumes NO random
                     // number -- getting this wrong desynchronises the sequence.
                     bool accept = delta <= 0.0 || rng.float_(1.0) < std::exp(-delta / t);
                     if (accept) {
                         accepted++;
+                        if (cong_on)
+                            for (auto &kv : cmap)
+                                rudy[kv.first] += kv.second;
+                        if (site_on)
+                            for (auto &kv : omap)
+                                occbin[kv.first] += kv.second;
+                        if (ll_on) {
+                            for (auto &kv : hmap)
+                                hcut[kv.first] += kv.second;
+                            for (auto &kv : vmap)
+                                vcut[kv.first] += kv.second;
+                        }
                         if (coh_on)
                             for (size_t q = 0; q < moved.size(); q++) {
-                                int c = moved[q], mo = mod_of[c];
+                                int c2 = moved[q], mo = mod_of[c2];
                                 if (mo < 0)
                                     continue;
-                                msx[mo] += pos_x[c] - olds[q].first;
-                                msy[mo] += pos_y[c] - olds[q].second;
+                                msx[mo] += pos_x[c2] - olds[q].first;
+                                msy[mo] += pos_y[c2] - olds[q].second;
                             }
                         if (j == -1) {
                             si.used = false;
@@ -1493,8 +1704,18 @@ static bool place_lef_place(Context *ctx, lefpack::PackResult &r, std::vector<Le
             }
             t *= alpha;
         }
-        log_info("  phase D: SA %ld/%ld moves accepted (%.1f%%)\n", accepted, moves,
+        log_info("SA: %ld/%ld moves accepted (%.1f%%)\n", accepted, moves,
                  100.0 * double(accepted) / double(moves));
+        if (cong_on)
+            log_info("congestion: final overflow=%.0f\n", total_overflow());
+        if (ll_on)
+            log_info("long-line: final track overflow=%.0f\n", track_overflow());
+    }
+
+    {
+        int worst = 0;
+        long h = total_hpwl(worst);
+        log_info("total HPWL = %ld (SLICE-hops), worst net = %d\n", h, worst);
     }
 
     // ---- emit -------------------------------------------------------------
