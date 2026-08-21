@@ -305,7 +305,7 @@ int CommandHandler::executeMain(std::unique_ptr<Context> ctx)
     }
 #endif
     if (vm.count("json")) {
-        std::string filename = vm["json"].as<std::string>();
+        std::string filename = customRewriteJson(ctx.get(), vm["json"].as<std::string>());
         std::ifstream f(filename);
         if (!parse_json(f, filename, ctx.get()))
             log_error("Loading design failed.\n");

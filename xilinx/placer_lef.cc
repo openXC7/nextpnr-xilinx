@@ -1912,7 +1912,7 @@ static bool place_lef_place(Context *ctx, lefpack::PackResult &r, std::vector<Le
     return true;
 }
 
-bool place_lef_prepass(Context *ctx, const std::string &json_path)
+std::string place_lef_transplant(Context *ctx, const std::string &json_path)
 {
     // NETLIST PREPASSES.  place_lef mutates the netlist before packing and the
     // DOWNSTREAM consumes the mutated copy -- that is why nothing needs to be
@@ -1921,8 +1921,8 @@ bool place_lef_prepass(Context *ctx, const std::string &json_path)
     // equivalent of place_lef's TOPO_FT_JSON) and pack the mutated tree.
     lefpack::Netlist *nl = lefpack::netlist_load(json_path);
     if (nl == nullptr) {
-        log_error("place_lef pre-pass: cannot read '%s'\n", json_path.c_str());
-        return false;
+        log_error("place_lef: cannot read '%s'\n", json_path.c_str());
+        return std::string();
     }
     {
         lefpack::PrepassStats ps = lefpack::netlist_prepasses(nl);
@@ -1943,8 +1943,8 @@ bool place_lef_prepass(Context *ctx, const std::string &json_path)
         if (const char *ft = getenv("PACK_LEF_FT_JSON")) {
             if (!lefpack::netlist_write(nl, ft)) {
                 lefpack::netlist_free(nl);
-                log_error("place_lef pre-pass: cannot write '%s'\n", ft);
-                return false;
+                log_error("place_lef: cannot write '%s'\n", ft);
+                return std::string();
             }
             log_info("  wrote the mutated netlist to %s -- carry_stamp and the router MUST read "
                      "this one, not the original\n",
@@ -1954,8 +1954,8 @@ bool place_lef_prepass(Context *ctx, const std::string &json_path)
     lefpack::PackResult r = lefpack::pack_netlist(nl);
     if (r.cells.empty()) {
         lefpack::netlist_free(nl);
-        log_error("place_lef pre-pass: packed NO cells from '%s'\n", json_path.c_str());
-        return false;
+        log_error("place_lef: packed NO cells from '%s'\n", json_path.c_str());
+        return std::string();
     }
 
     log_info("place_lef pre-pass: %zu instances -> %zu packed units\n", r.n_instances,
@@ -1985,8 +1985,13 @@ bool place_lef_prepass(Context *ctx, const std::string &json_path)
     // nextpnr's own parser.  Two name spaces meet here, and a silent mismatch
     // would look exactly like "the transplant did nothing" -- so it is measured
     // and it is fatal, not a warning.
+    // NOTE: when the transplant runs from customRewriteJson the netlist has not
+    // been parsed yet, so ctx is empty and there is nothing to join against --
+    // and nothing to check, because nextpnr will parse the STAMPED netlist this
+    // produces, so every cell exists by construction.
     size_t matched = 0, missing = 0;
     std::string first_missing;
+    if (!ctx->cells.empty()) {
     for (auto &c : r.cells)
         for (auto &b : c.pc_bels) {
             if (ctx->cells.count(ctx->id(b.first)))
@@ -1997,12 +2002,13 @@ bool place_lef_prepass(Context *ctx, const std::string &json_path)
                 missing++;
             }
         }
-    log_info("  join rate: %zu/%zu unit members resolve to a ctx cell (%.1f%%)\n", matched,
-             matched + missing, 100.0 * double(matched) / double(matched + missing));
-    if (missing > 0)
-        log_warning("  %zu member(s) did NOT resolve, first '%s' -- the placement cannot be "
-                    "stamped onto them\n",
-                    missing, first_missing.c_str());
+        log_info("  join rate: %zu/%zu unit members resolve to a ctx cell (%.1f%%)\n", matched,
+                 matched + missing, 100.0 * double(matched) / double(matched + missing));
+        if (missing > 0)
+            log_warning("  %zu member(s) did NOT resolve, first '%s' -- the placement cannot be "
+                        "stamped onto them\n",
+                        missing, first_missing.c_str());
+    }
 
     // Database dump.  bels.txt is the same shape place_lef writes, so the
     // downstream (carry_stamp.py -> route) stays byte-identical to the OCaml
@@ -2046,9 +2052,22 @@ bool place_lef_prepass(Context *ctx, const std::string &json_path)
         log_info("  wrote unit membership to %s\n", out);
     }
 
+    // Derive where the stamped netlist goes: an explicit PACK_LEF_STAMPED_JSON
+    // wins, else beside the input.  place_lef_place writes it.
+    std::string stamped = getenv_str("PACK_LEF_STAMPED_JSON", "");
+    if (stamped.empty()) {
+        stamped = json_path;
+        size_t dot = stamped.rfind(".json");
+        if (dot != std::string::npos && dot + 5 == stamped.size())
+            stamped = stamped.substr(0, dot);
+        stamped += ".lefstamped.json";
+        setenv("PACK_LEF_STAMPED_JSON", stamped.c_str(), 1);
+    }
     bool ok = place_lef_place(ctx, r, sites, nl);
     lefpack::netlist_free(nl);
-    return ok;
+    if (!ok)
+        return std::string();
+    return stamped;
 }
 
 NEXTPNR_NAMESPACE_END

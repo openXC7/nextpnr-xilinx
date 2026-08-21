@@ -45,6 +45,13 @@ class CommandHandler
     virtual po::options_description getArchOptions() = 0;
     virtual void validate(){};
     virtual void customAfterLoad(Context *ctx){};
+    // Rewrite the JSON path BEFORE it is parsed.  Lets an arch run a netlist
+    // transform and hand nextpnr the transformed file, so the cells it adds
+    // exist in ctx as ordinary parsed cells -- no mirroring required.
+    virtual std::string customRewriteJson(Context *ctx, const std::string &filename)
+    {
+        return filename;
+    };
     virtual void customBitstream(Context *ctx){};
     void conflicting_options(const boost::program_options::variables_map &vm, const char *opt1, const char *opt2);
 
