@@ -87,6 +87,32 @@ struct PrepassStats
 // replicate_shared_carry, materialise_const_drivers, normalise_init.
 PrepassStats netlist_prepasses(Netlist *n);
 
+// ---- carry_stamp ---------------------------------------------------------
+// The port of carry_stamp.py.  SVS stamps only the CARRY4 anchor, and
+// nextpnr-xilinx has NO site-level LUT routethru, so a CARRY4 S-input driven by
+// a non-LUT (a FF's Q via the AX bypass, or a GND const) cannot bind.  This
+// lays out each stamped CARRY4's whole slice explicitly.  Not cosmetic: ~2140
+// cells on ethmin.
+struct CarryStampStats
+{
+    int n_buf = 0;   // S inputs given an inserted LUT1 buffer
+    int n_slut = 0;  // S driving LUTs stamped into the carry's own slot
+    int n_ff = 0;    // sum FFs stamped
+    int n_di = 0;    // DI const/passthrough 5LUTs
+    int n_fb = 0;    // same-slot FF->LUT feedback relays (CARRY_FB_NETS only)
+    size_t total_cells = 0;
+    bool collision = false;
+    std::string collision_msg;
+};
+
+// `bels` is the placement, in the order the placer emitted it ("<SITE>/<BEL>"
+// per primitive).  `slice_sites` supplies the legal SLICE site names for the
+// neighbour-bel search -- from nextpnr's chipdb, replacing carry_stamp.py's
+// CARRY_FLOORPLAN read.  Honours CARRY_STAMP_AVOID_CI and CARRY_FB_NETS.
+CarryStampStats netlist_carry_stamp(Netlist *n,
+                                    const std::vector<std::pair<std::string, std::string>> &bels,
+                                    const std::vector<std::string> &slice_sites);
+
 } // namespace lefpack
 
 #endif

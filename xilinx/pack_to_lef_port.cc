@@ -1788,6 +1788,499 @@ static int normalise_init(JPtr mj)
     return nfix;
 }
 
+// ===================== carry_stamp ========================================
+// Port of carry_stamp.py.  Operates on the same tree, AFTER placement, using
+// the placer's bels.  See the header for why it is not optional.
+// ==========================================================================
+static const char *SLOT = "ABCD";
+
+CarryStampStats carry_stamp_tree(JPtr mj, const std::vector<std::pair<std::string, std::string>> &bels,
+                                 const std::set<std::string> &known_sites)
+{
+    CarryStampStats st;
+    JPtr cells = mj->member("cells");
+    if (!cells || cells->k != JVal::OBJ) return st;
+
+    // CARRY_STAMP_AVOID_CI: don't use the DEDICATED incoming carry (CI = the
+    // previous CARRY4.CO) as the don't-care local input for a const-forced
+    // S/DI LUT.  Reading it forces that CO onto general routing, where it
+    // collides with the previous slice's sum O[k] on the single position-k
+    // output mux (DMUX over-commit -> 128 unroutable nets).
+    const char *aci = getenv("CARRY_STAMP_AVOID_CI");
+    const bool AVOID_CI = aci != nullptr && aci[0] != '\0' && strcmp(aci, "0") != 0;
+
+    std::unordered_map<std::string, JPtr> byname;
+    for (auto &c : cells->obj) byname[c.first] = c.second;
+
+    // 1) apply the plain BEL stamps from the placement
+    for (auto &b : bels) {
+        auto it = byname.find(b.first);
+        if (it == byname.end()) continue;
+        JPtr at = it->second->member("attributes");
+        if (!at || at->k != JVal::OBJ) { at = jobj(); set_member(it->second, "attributes", at); }
+        set_member(at, "BEL", jstr(b.second));
+    }
+
+    // GND/VCC-driven net bits.  With NEXTPNR_JSON_CONST_STRINGS=1 constants ALSO
+    // appear as the string bits "0"/"1" directly on pins; treat both uniformly.
+    std::set<int> gnd_bits, vcc_bits;
+    for (auto &c : cells->obj) {
+        std::string t = type_of(c.second);
+        if (t != "GND" && t != "VCC") continue;
+        std::set<int> &tgt = (t == "GND") ? gnd_bits : vcc_bits;
+        JPtr conns = c.second->member("connections");
+        if (conns && conns->k == JVal::OBJ)
+            for (auto &pc : conns->obj)
+                for (int b : bits_of(pc.second)) tgt.insert(b);
+    }
+    // a "bit" here is either an int net or a const string; -1 marks "not an int"
+    auto is_gnd_bit = [&](JPtr e, size_t i) {
+        if (!e || e->k != JVal::ARR || i >= e->arr.size()) return false;
+        JPtr v = e->arr[i];
+        if (v->k == JVal::STR) return v->str == "0";
+        return v->k == JVal::NUM && gnd_bits.count(int(v->num)) > 0;
+    };
+    auto is_vcc_bit = [&](JPtr e, size_t i) {
+        if (!e || e->k != JVal::ARR || i >= e->arr.size()) return false;
+        JPtr v = e->arr[i];
+        if (v->k == JVal::STR) return v->str == "1";
+        return v->k == JVal::NUM && vcc_bits.count(int(v->num)) > 0;
+    };
+    auto int_at = [](JPtr e, size_t i) { // -1 if absent or not an int
+        if (!e || e->k != JVal::ARR || i >= e->arr.size()) return -1;
+        return e->arr[i]->k == JVal::NUM ? int(e->arr[i]->num) : -1;
+    };
+
+    // driver of each integer net bit -> (cell, type, port)
+    std::unordered_map<int, std::tuple<std::string, std::string, std::string>> drv;
+    for (auto &c : cells->obj) {
+        JPtr conns = c.second->member("connections");
+        if (!conns || conns->k != JVal::OBJ) continue;
+        for (auto &pc : conns->obj)
+            if (port_is_output(c.second, pc.first))
+                for (int b : bits_of(pc.second))
+                    drv[b] = std::make_tuple(c.first, type_of(c.second), pc.first);
+    }
+
+    // Global fallback net for const-LUT inputs: a const generator (INIT 00/11)
+    // ignores its input, so any net routable on GENERAL interconnect works.
+    // Highest-fanout NON-CLOCK net (clock nets ride dedicated routing and will
+    // not reach a LUT data pin).
+    std::map<int, int> fan;
+    std::set<int> clk;
+    for (auto &c : cells->obj) {
+        JPtr conns = c.second->member("connections");
+        if (!conns || conns->k != JVal::OBJ) continue;
+        for (auto &pc : conns->obj)
+            for (int b : bits_of(pc.second)) {
+                fan[b]++;
+                if (pc.first == "CLK" || pc.first == "C" || pc.first == "WCLK") clk.insert(b);
+            }
+    }
+    int GLOBAL_FALLBACK_NET = -1;
+    {
+        int best = -1, bestn = 0;
+        for (auto &kv : fan)
+            if (!clk.count(kv.first) && kv.second > bestn) { bestn = kv.second; best = kv.first; }
+        GLOBAL_FALLBACK_NET = best;
+    }
+    int maxbit = max_bit(mj);
+
+    std::unordered_map<std::string, std::string> occupied; // bel -> cell
+    std::set<std::string> carry_sites;
+    for (auto &c : cells->obj) {
+        JPtr at = c.second->member("attributes");
+        JPtr b = at && at->k == JVal::OBJ ? at->member("BEL") : nullptr;
+        if (!b || b->k != JVal::STR || b->str.empty()) continue;
+        occupied[b->str] = c.first;
+        if (b->str.size() > 7 && b->str.compare(b->str.size() - 7, 7, "/CARRY4") == 0)
+            carry_sites.insert(b->str.substr(0, b->str.find('/')));
+    }
+    auto claim = [&](const std::string &bel, const std::string &who) {
+        auto it = occupied.find(bel);
+        if (it != occupied.end() && it->second != who) return false;
+        occupied[bel] = who;
+        return true;
+    };
+
+    // A CARRY4 slice's 6LUT slots are reserved for its OWN S/DI buffers; do not
+    // borrow one for a neighbour's DIgnd const.
+    auto free_neighbour_lut_global = [&](const std::string &site) -> std::string {
+        int x, y;
+        if (sscanf(site.c_str(), "SLICE_X%dY%d", &x, &y) != 2) return "";
+        static const int d[10][2] = {{1,0},{-1,0},{0,1},{0,-1},{1,1},{-1,1},{1,-1},{-1,-1},{2,0},{-2,0}};
+        for (auto &dd : d) {
+            std::string ns = "SLICE_X" + std::to_string(x + dd[0]) + "Y" + std::to_string(y + dd[1]);
+            if (!known_sites.empty() && !known_sites.count(ns)) continue;
+            if (carry_sites.count(ns)) continue;
+            for (int sl = 0; sl < 4; sl++) {
+                std::string bel = ns + "/" + SLOT[sl] + std::string("6LUT");
+                if (!occupied.count(bel)) return bel;
+            }
+        }
+        return "";
+    };
+
+    auto mk_lut = [&](const std::string &type, const std::vector<std::pair<std::string, JPtr>> &conns,
+                      const std::string &init, const std::string &bel) {
+        JPtr cell = jobj();
+        set_member(cell, "type", jstr(type));
+        JPtr dirs = jobj();
+        for (auto &pc : conns) set_member(dirs, pc.first, jstr(pc.first == "O" ? "output" : "input"));
+        set_member(cell, "port_directions", dirs);
+        JPtr cc = jobj();
+        for (auto &pc : conns) set_member(cc, pc.first, pc.second);
+        set_member(cell, "connections", cc);
+        JPtr par = jobj();
+        set_member(par, "INIT", jstr(init));
+        set_member(cell, "parameters", par);
+        JPtr at = jobj();
+        set_member(at, "BEL", jstr(bel));
+        set_member(cell, "attributes", at);
+        return cell;
+    };
+    auto cell_inputs = [&](const std::string &nm, std::vector<int> &out) {
+        auto it = byname.find(nm);
+        if (it == byname.end()) return;
+        JPtr conns = it->second->member("connections");
+        if (!conns || conns->k != JVal::OBJ) return;
+        for (const char *pp : {"I0", "I1", "I2", "I3", "I4", "I5"}) {
+            JPtr v = conns->member(pp);
+            int b = int_at(v, 0);
+            if (b >= 0) out.push_back(b);
+        }
+    };
+
+    // sum-FF lookup: first FD* in CELL ORDER whose D[0] is this bit (the Python
+    // scans cells in order and breaks on the first match)
+    std::unordered_map<int, std::string> ff_by_d;
+    for (auto &c : cells->obj) {
+        if (!starts_with(type_of(c.second), "FD")) continue;
+        JPtr conns = c.second->member("connections");
+        if (!conns || conns->k != JVal::OBJ) continue;
+        int d = int_at(conns->member("D"), 0);
+        if (d >= 0 && !ff_by_d.count(d)) ff_by_d[d] = c.first;
+    }
+
+    std::vector<std::pair<std::string, JPtr>> new_cells;
+    // snapshot: the Python iterates list(cells.items()), i.e. the ORIGINAL list
+    std::vector<std::pair<std::string, JPtr>> snapshot = cells->obj;
+    for (auto &c : snapshot) {
+        if (type_of(c.second) != "CARRY4") continue;
+        JPtr at = c.second->member("attributes");
+        JPtr bj = at && at->k == JVal::OBJ ? at->member("BEL") : nullptr;
+        if (!bj || bj->k != JVal::STR) continue;
+        const std::string bel = bj->str;
+        if (bel.size() < 7 || bel.compare(bel.size() - 7, 7, "/CARRY4") != 0) continue;
+        const std::string site = bel.substr(0, bel.find('/'));
+        const std::string &cn = c.first;
+        JPtr conns = c.second->member("connections");
+        if (!conns || conns->k != JVal::OBJ) continue;
+        JPtr S = conns->member("S"), O = conns->member("O"), DI = conns->member("DI");
+
+        // a real routable net already present at this slice, for const LUT inputs
+        auto slice_local_net = [&]() -> int {
+            int best = -1;
+            if (S && S->k == JVal::ARR)
+                for (size_t i = 0; i < S->arr.size(); i++) {
+                    int sb2 = int_at(S, i);
+                    if (sb2 < 0 || gnd_bits.count(sb2)) continue;
+                    auto d2 = drv.find(sb2);
+                    if (d2 != drv.end() && starts_with(std::get<1>(d2->second), "FD"))
+                        return sb2; // FF-driven S bit: ideal
+                    if (AVOID_CI && best < 0) best = sb2;
+                }
+            if (AVOID_CI) {
+                if (best >= 0) return best;
+                int v = int_at(conns->member("CYINIT"), 0);
+                if (v >= 0 && !gnd_bits.count(v)) {
+                    auto d = drv.find(v);
+                    if (d == drv.end() || std::get<1>(d->second) != "CARRY4") return v;
+                }
+            } else {
+                for (const char *pn : {"CYINIT", "CI"}) {
+                    int v = int_at(conns->member(pn), 0);
+                    if (v >= 0 && !gnd_bits.count(v)) return v;
+                }
+            }
+            return GLOBAL_FALLBACK_NET;
+        };
+
+        int slot_in[4] = {-1, -1, -1, -1};
+        // --- S inputs ---
+        if (S && S->k == JVal::ARR) {
+            JPtr newS = deep_copy(S);
+            for (size_t k = 0; k < S->arr.size() && k < 4; k++) {
+                std::string slot6 = site + "/" + SLOT[k] + std::string("6LUT");
+                int sb = int_at(S, k);
+                bool is_gnd = is_gnd_bit(S, k), is_vcc = is_vcc_bit(S, k);
+                auto d = sb >= 0 ? drv.find(sb) : drv.end();
+                if (d != drv.end() && starts_with(std::get<1>(d->second), "LUT")) {
+                    // LUT-driven: stamp that S-LUT into THIS carry's slot -- but
+                    // only if it is not already committed elsewhere.  CARRY4.S[k]
+                    // is a DEDICATED same-slice connection, so one LUT cannot
+                    // serve two carries; when it is placed elsewhere, fall
+                    // through and buffer locally.
+                    const std::string &dn = std::get<0>(d->second);
+                    JPtr dat = byname[dn]->member("attributes");
+                    JPtr dbel = dat && dat->k == JVal::OBJ ? dat->member("BEL") : nullptr;
+                    bool free_here = !occupied.count(slot6) || occupied[slot6] == dn;
+                    if ((!dbel || dbel->k != JVal::STR || dbel->str == slot6) && free_here) {
+                        claim(slot6, dn);
+                        if (!dat || dat->k != JVal::OBJ) {
+                            dat = jobj();
+                            set_member(byname[dn], "attributes", dat);
+                        }
+                        set_member(dat, "BEL", jstr(slot6));
+                        std::vector<int> ins;
+                        cell_inputs(dn, ins);
+                        if (!ins.empty()) slot_in[k] = ins[0];
+                        st.n_slut++;
+                        continue;
+                    }
+                }
+                int onet = ++maxbit;
+                std::string bufname = cn + "$Srt$" + std::to_string(k);
+                JPtr buf;
+                if (is_gnd || is_vcc) {
+                    // S=GND/VCC: const generator fed by a LOCAL net, INIT 00/11;
+                    // needs no global GND/VCC routing.
+                    int src = slice_local_net();
+                    if (src < 0) continue;
+                    buf = mk_lut("LUT1", {{"I0", bit_list({src})}, {"O", bit_list({onet})}},
+                                 is_vcc ? "11" : "00", slot6);
+                    slot_in[k] = src;
+                } else {
+                    if (sb < 0) continue;
+                    // FF / external -> identity buffer passing the driver to S
+                    buf = mk_lut("LUT1", {{"I0", bit_list({sb})}, {"O", bit_list({onet})}}, "10",
+                                 slot6);
+                    slot_in[k] = sb;
+                }
+                claim(slot6, bufname);
+                new_cells.emplace_back(bufname, buf);
+                byname[bufname] = buf;
+                newS->arr[k] = jint(onet);
+                st.n_buf++;
+            }
+            set_member(conns, "S", newS);
+        }
+
+        // --- DI ---
+        std::vector<int> pending_gnd_di, pending_vcc_di;
+        if (DI && DI->k == JVal::ARR) {
+            JPtr newDI = deep_copy(DI);
+            for (size_t k = 0; k < DI->arr.size() && k < 4; k++) {
+                bool is_gnd = is_gnd_bit(DI, k), is_vcc = is_vcc_bit(DI, k);
+                int db = int_at(DI, k);
+                if (db < 0 && !is_gnd && !is_vcc) continue;
+                auto d = db >= 0 ? drv.find(db) : drv.end();
+                if (d != drv.end() && !is_gnd && !is_vcc) {
+                    const std::string &dt = std::get<1>(d->second);
+                    // LUT1-5-driven DI: nextpnr adopts the driver into the 5LUT.
+                    // A LUT6 has no O5, so that one still needs a buffer.
+                    if (dt == "LUT1" || dt == "LUT2" || dt == "LUT3" || dt == "LUT4" || dt == "LUT5")
+                        continue;
+                }
+                std::string slot5 = site + "/" + SLOT[k] + std::string("5LUT");
+                if (occupied.count(slot5)) continue;
+                std::string slot6 = site + "/" + SLOT[k] + std::string("6LUT");
+                std::vector<int> occ_ins;
+                auto oit = occupied.find(slot6);
+                if (oit != occupied.end()) cell_inputs(oit->second, occ_ins);
+                std::set<int> occ_set(occ_ins.begin(), occ_ins.end());
+                if (!is_gnd && !is_vcc) {
+                    // fracture legality: the 5LUT shares A1-A5 with the 6LUT
+                    if (!occ_set.count(db) && occ_set.size() + 1 > 5) continue;
+                }
+                int onet = ++maxbit;
+                JPtr buf;
+                std::string tag;
+                if (is_gnd || is_vcc) {
+                    // ILLEGAL when the occupant uses >=6 inputs (Vivado 18-608):
+                    // the fractured LUT's O6 reads the upper INIT half with A6
+                    // tied high while the 5LUT OVERWRITES the lower half,
+                    // corrupting the LUT6 in hardware -- this silently broke the
+                    // SGMII AN comparators and the link never came up.
+                    if (occ_set.size() >= 6 || slot_in[k] < 0) {
+                        (is_vcc ? pending_vcc_di : pending_gnd_di).push_back(int(k));
+                        continue;
+                    }
+                    tag = is_vcc ? "DIvcc" : "DIgnd";
+                    buf = mk_lut("LUT1", {{"I0", bit_list({slot_in[k]})}, {"O", bit_list({onet})}},
+                                 is_vcc ? "11" : "00", slot5);
+                } else {
+                    // PIN-ALIGN with the 6LUT occupant: nextpnr pin-maps each
+                    // fractured LUT's I0->A1, I1->A2..., so a different net on I0
+                    // double-books sitewire A1 (the whole "->A1 unroutable" class).
+                    tag = "DIrt";
+                    if (occ_set.size() >= 6) continue;
+                    auto pos = std::find(occ_ins.begin(), occ_ins.end(), db);
+                    if (pos != occ_ins.end()) occ_ins.erase(pos, occ_ins.end());
+                    if (occ_ins.size() + 1 > 5) continue;
+                    size_t n_in = occ_ins.size() + 1;
+                    std::string init = std::string(size_t(1) << (n_in - 1), '1') +
+                                       std::string(size_t(1) << (n_in - 1), '0');
+                    std::vector<std::pair<std::string, JPtr>> cc;
+                    for (size_t i = 0; i < occ_ins.size(); i++)
+                        cc.emplace_back("I" + std::to_string(i), bit_list({occ_ins[i]}));
+                    cc.emplace_back("I" + std::to_string(n_in - 1), bit_list({db}));
+                    cc.emplace_back("O", bit_list({onet}));
+                    buf = mk_lut("LUT" + std::to_string(n_in), cc, init, slot5);
+                }
+                std::string bufname = cn + "$" + tag + "$" + std::to_string(k);
+                claim(slot5, bufname);
+                new_cells.emplace_back(bufname, buf);
+                byname[bufname] = buf;
+                newDI->arr[k] = jint(onet);
+                st.n_di++;
+            }
+            // per-carry const in a NEIGHBOUR slice; DI enters via the AX bypass
+            for (int pass = 0; pass < 2; pass++) {
+                std::vector<int> &pend = pass ? pending_vcc_di : pending_gnd_di;
+                if (pend.empty()) continue;
+                int src = slice_local_net();
+                std::string rbel = src >= 0 ? free_neighbour_lut_global(site) : "";
+                if (rbel.empty()) continue;
+                int onet = ++maxbit;
+                std::string gname = cn + (pass ? "$DIvccx" : "$DIgndx");
+                JPtr buf = mk_lut("LUT1", {{"I0", bit_list({src})}, {"O", bit_list({onet})}},
+                                  pass ? "11" : "00", rbel);
+                new_cells.emplace_back(gname, buf);
+                byname[gname] = buf;
+                occupied[rbel] = gname;
+                for (int k : pend) {
+                    newDI->arr[k] = jint(onet);
+                    st.n_di++;
+                }
+            }
+            set_member(conns, "DI", newDI);
+        }
+
+        // --- O outputs: sum FF (FD* consuming O[k] on D) ---
+        if (O && O->k == JVal::ARR)
+            for (size_t k = 0; k < O->arr.size() && k < 4; k++) {
+                int ob = int_at(O, k);
+                if (ob < 0) continue;
+                auto fit = ff_by_d.find(ob);
+                if (fit == ff_by_d.end()) continue;
+                JPtr fc = byname[fit->second];
+                JPtr fat = fc->member("attributes");
+                if (fat && fat->k == JVal::OBJ && fat->member("BEL")) continue; // already placed
+                std::string slotff = site + "/" + SLOT[k] + std::string("FF");
+                if (!claim(slotff, fit->second)) continue; // slot taken; leave to nextpnr
+                if (!fat || fat->k != JVal::OBJ) { fat = jobj(); set_member(fc, "attributes", fat); }
+                set_member(fat, "BEL", jstr(slotff));
+                st.n_ff++;
+            }
+    }
+
+    // --- same-slot FF->LUT feedback relays ---------------------------------
+    // The chipdb cannot route a same-slot Q->imux bounce (AQ->A1 fails at any
+    // visit cap), so relay through an identity LUT1 in a NEIGHBOUR slice.
+    // TARGETED ONLY: blanket relaying of all 388 same-slot feedbacks REGRESSED
+    // 13 -> 65 skips, so only nets named in $CARRY_FB_NETS are relayed.
+    std::set<std::string> fb_nets;
+    if (const char *fbf = getenv("CARRY_FB_NETS")) {
+        std::ifstream f(fbf);
+        std::string line;
+        while (std::getline(f, line)) {
+            while (!line.empty() && isspace((unsigned char)line.back())) line.pop_back();
+            if (!line.empty()) fb_nets.insert(line);
+        }
+    }
+    if (!fb_nets.empty()) {
+        std::set<std::string> ksites = known_sites;
+        for (auto &kv : occupied) ksites.insert(kv.first.substr(0, kv.first.find('/')));
+        std::unordered_map<int, std::string> bit2name;
+        JPtr nn = mj->member("netnames");
+        if (nn && nn->k == JVal::OBJ)
+            for (auto &n : nn->obj)
+                for (int b : bits_of(n.second->member("bits")))
+                    if (!bit2name.count(b)) bit2name[b] = n.first;
+        auto free_neighbour_lut = [&](const std::string &site) -> std::string {
+            int x, y;
+            if (sscanf(site.c_str(), "SLICE_X%dY%d", &x, &y) != 2) return "";
+            static const int d[8][2] = {{1,0},{-1,0},{0,1},{0,-1},{1,1},{-1,1},{1,-1},{-1,-1}};
+            for (auto &dd : d) {
+                std::string ns = "SLICE_X" + std::to_string(x + dd[0]) + "Y" + std::to_string(y + dd[1]);
+                if (!ksites.count(ns) || carry_sites.count(ns)) continue;
+                for (int sl = 0; sl < 4; sl++) {
+                    std::string bel = ns + "/" + SLOT[sl] + std::string("6LUT");
+                    if (!occupied.count(bel)) return bel;
+                }
+            }
+            return "";
+        };
+        std::vector<std::pair<std::string, JPtr>> scan = cells->obj;
+        scan.insert(scan.end(), new_cells.begin(), new_cells.end());
+        std::vector<std::pair<std::string, JPtr>> relays;
+        for (auto &c : scan) {
+            JPtr at = c.second->member("attributes");
+            JPtr bj = at && at->k == JVal::OBJ ? at->member("BEL") : nullptr;
+            if (!bj || bj->k != JVal::STR) continue;
+            const std::string &b = bj->str;
+            size_t sl = b.find('/');
+            if (sl == std::string::npos || b.size() < 5 || b.compare(b.size() - 4, 4, "6LUT") != 0)
+                continue;
+            if (!starts_with(type_of(c.second), "LUT")) continue;
+            std::string site = b.substr(0, sl);
+            char slot_letter = b[sl + 1];
+            JPtr conns = c.second->member("connections");
+            if (!conns || conns->k != JVal::OBJ) continue;
+            for (auto &pc : conns->obj) {
+                if (pc.first == "O") continue;
+                int v = int_at(pc.second, 0);
+                if (v < 0) continue;
+                auto d = drv.find(v);
+                if (d == drv.end() || !starts_with(std::get<1>(d->second), "FD")) continue;
+                auto dc = byname.find(std::get<0>(d->second));
+                if (dc == byname.end()) continue;
+                JPtr dat = dc->second->member("attributes");
+                JPtr dbj = dat && dat->k == JVal::OBJ ? dat->member("BEL") : nullptr;
+                std::string want = site + "/" + std::string(1, slot_letter) + "FF";
+                if (!dbj || dbj->k != JVal::STR || dbj->str != want) continue;
+                auto bn = bit2name.find(v);
+                if (bn == bit2name.end() || !fb_nets.count(bn->second)) continue;
+                std::string rbel = free_neighbour_lut(site);
+                if (rbel.empty()) continue;
+                int onet = ++maxbit;
+                std::string rname = c.first + "$fbrelay$" + pc.first;
+                relays.emplace_back(rname, mk_lut("LUT1",
+                                                  {{"I0", bit_list({v})}, {"O", bit_list({onet})}},
+                                                  "10", rbel));
+                occupied[rbel] = rname;
+                pc.second = bit_list({onet});
+                st.n_fb++;
+            }
+        }
+        for (auto &r : relays) cells->obj.push_back(r);
+    }
+
+    for (auto &nc : new_cells) cells->obj.push_back(nc);
+    st.total_cells = cells->obj.size();
+    return st;
+}
+
+CarryStampStats netlist_carry_stamp(Netlist *n,
+                                    const std::vector<std::pair<std::string, std::string>> &bels,
+                                    const std::vector<std::string> &slice_sites)
+{
+    CarryStampStats st;
+    if (!n || !n->root) return st;
+    JPtr mods = n->root->member("modules");
+    if (!mods || mods->k != JVal::OBJ) return st;
+    JPtr mj = nullptr;
+    size_t best = 0;
+    for (auto &kv : mods->obj) {
+        JPtr c = kv.second->member("cells");
+        size_t cnt = (c && c->k == JVal::OBJ) ? c->obj.size() : 0;
+        if (!mj || cnt > best) { mj = kv.second; best = cnt; }
+    }
+    std::set<std::string> ks(slice_sites.begin(), slice_sites.end());
+    return carry_stamp_tree(mj, bels, ks);
+}
+
 // ---- JSON writer ----------------------------------------------------------
 static void json_escape(std::string &out, const std::string &s)
 {

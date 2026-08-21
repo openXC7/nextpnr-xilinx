@@ -978,7 +978,8 @@ static std::string group_key(const std::string &n)
 // The unit is the object throughout: a move relocates a whole packed SLICE,
 // never an individual LUT or FF.  That is the entire point of the transplant.
 // =========================================================================
-static bool place_lef_place(Context *ctx, lefpack::PackResult &r, std::vector<LefSite> &sites)
+static bool place_lef_place(Context *ctx, lefpack::PackResult &r, std::vector<LefSite> &sites,
+                            lefpack::Netlist *nl)
 {
     const size_t ncells = r.cells.size();
     const double fill = getenv_float("TOPO_REGION_FILL", 0.65f);
@@ -1876,6 +1877,38 @@ static bool place_lef_place(Context *ctx, lefpack::PackResult &r, std::vector<Le
              bels_path.c_str(), nstamp, nskipped, nunplaced);
     if (nunplaced > 0)
         log_warning("  %d primitive(s) got NO stamp because their unit is unplaced\n", nunplaced);
+
+    // ---- carry_stamp -------------------------------------------------------
+    // Same placement, applied to the netlist tree: nextpnr-xilinx has no
+    // site-level LUT routethru, so every stamped CARRY4's slice has to be laid
+    // out explicitly.  This is what carry_stamp.py did as a separate process.
+    {
+        std::vector<std::pair<std::string, std::string>> bl;
+        for (size_t i = 0; i < ncells; i++) {
+            if (r.cells[i].pc_bels.empty() || !is_placed(i))
+                continue;
+            if (!stamp_all && skip_kind(kind_of_lef(r.cells[i].pc_lef)))
+                continue;
+            for (auto &b : r.cells[i].pc_bels)
+                bl.emplace_back(b.first, sites[cell_site[i]].name + "/" + b.second);
+        }
+        std::vector<std::string> slice_sites;
+        for (auto &s2 : sites)
+            if (s2.kind == "SLICE")
+                slice_sites.push_back(s2.name);
+        lefpack::CarryStampStats cs = lefpack::netlist_carry_stamp(nl, bl, slice_sites);
+        log_info("carry slices completed: %d S-buffers, %d S-LUTs, %d sum-FFs, %d DI-gnd 5LUTs\n",
+                 cs.n_buf, cs.n_slut, cs.n_ff, cs.n_di);
+        if (cs.n_fb > 0)
+            log_info("same-slot feedback relays: %d\n", cs.n_fb);
+        log_info("total cells now: %zu\n", cs.total_cells);
+        if (const char *sj = getenv("PACK_LEF_STAMPED_JSON")) {
+            if (!lefpack::netlist_write(nl, sj))
+                log_error("place_lef: cannot write PACK_LEF_STAMPED_JSON '%s'\n", sj);
+            else
+                log_info("  wrote the stamped netlist to %s\n", sj);
+        }
+    }
     return true;
 }
 
@@ -1891,8 +1924,7 @@ bool place_lef_prepass(Context *ctx, const std::string &json_path)
         log_error("place_lef pre-pass: cannot read '%s'\n", json_path.c_str());
         return false;
     }
-    const char *ft = getenv("PACK_LEF_FT_JSON");
-    if (ft != nullptr) {
+    {
         lefpack::PrepassStats ps = lefpack::netlist_prepasses(nl);
         log_info("place_lef prepasses: %d wide-mux pin(s) given their own LUT (%d of them "
                  "shared with a non-mux consumer), %d shared MUXF7 subtree(s) replicated, "
@@ -1907,18 +1939,21 @@ bool place_lef_prepass(Context *ctx, const std::string &json_path)
             log_warning("  %d wide-mux data pin(s) LEFT ALONE (driver is not a LUT) -- each "
                         "will fail to route\n",
                         ps.mux_skipped);
-        if (!lefpack::netlist_write(nl, ft)) {
-            lefpack::netlist_free(nl);
-            log_error("place_lef pre-pass: cannot write '%s'\n", ft);
-            return false;
+        // Optional dump of the PRE-carry_stamp netlist, for the three-step flow.
+        if (const char *ft = getenv("PACK_LEF_FT_JSON")) {
+            if (!lefpack::netlist_write(nl, ft)) {
+                lefpack::netlist_free(nl);
+                log_error("place_lef pre-pass: cannot write '%s'\n", ft);
+                return false;
+            }
+            log_info("  wrote the mutated netlist to %s -- carry_stamp and the router MUST read "
+                     "this one, not the original\n",
+                     ft);
         }
-        log_info("  wrote the mutated netlist to %s -- carry_stamp and the router MUST read "
-                 "this one, not the original\n",
-                 ft);
     }
     lefpack::PackResult r = lefpack::pack_netlist(nl);
-    lefpack::netlist_free(nl);
     if (r.cells.empty()) {
+        lefpack::netlist_free(nl);
         log_error("place_lef pre-pass: packed NO cells from '%s'\n", json_path.c_str());
         return false;
     }
@@ -2011,7 +2046,9 @@ bool place_lef_prepass(Context *ctx, const std::string &json_path)
         log_info("  wrote unit membership to %s\n", out);
     }
 
-    return place_lef_place(ctx, r, sites);
+    bool ok = place_lef_place(ctx, r, sites, nl);
+    lefpack::netlist_free(nl);
+    return ok;
 }
 
 NEXTPNR_NAMESPACE_END
