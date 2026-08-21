@@ -1881,7 +1881,43 @@ static bool place_lef_place(Context *ctx, lefpack::PackResult &r, std::vector<Le
 
 bool place_lef_prepass(Context *ctx, const std::string &json_path)
 {
-    lefpack::PackResult r = lefpack::pack_to_lef_json(json_path);
+    // NETLIST PREPASSES.  place_lef mutates the netlist before packing and the
+    // DOWNSTREAM consumes the mutated copy -- that is why nothing needs to be
+    // mirrored into ctx: the cells these add only have to exist in the netlist
+    // handed to the route run.  So write it out (PACK_LEF_FT_JSON, the
+    // equivalent of place_lef's TOPO_FT_JSON) and pack the mutated tree.
+    lefpack::Netlist *nl = lefpack::netlist_load(json_path);
+    if (nl == nullptr) {
+        log_error("place_lef pre-pass: cannot read '%s'\n", json_path.c_str());
+        return false;
+    }
+    const char *ft = getenv("PACK_LEF_FT_JSON");
+    if (ft != nullptr) {
+        lefpack::PrepassStats ps = lefpack::netlist_prepasses(nl);
+        log_info("place_lef prepasses: %d wide-mux pin(s) given their own LUT (%d of them "
+                 "shared with a non-mux consumer), %d shared MUXF7 subtree(s) replicated, "
+                 "%d constant mux input(s) materialised, %d carry chain(s) replicated "
+                 "(%d rungs)\n",
+                 ps.muxdup, ps.mux_exclusive, ps.muxf7_rep, ps.consts, ps.carry_chains,
+                 ps.carry_rungs);
+        // A pin LEFT ALONE is a wide-mux data pin that must be driven from its
+        // own slice and cannot be -- it will fail to route on every seed, so
+        // say so rather than letting it surface later as a skipped arc.
+        if (ps.mux_skipped > 0)
+            log_warning("  %d wide-mux data pin(s) LEFT ALONE (driver is not a LUT) -- each "
+                        "will fail to route\n",
+                        ps.mux_skipped);
+        if (!lefpack::netlist_write(nl, ft)) {
+            lefpack::netlist_free(nl);
+            log_error("place_lef pre-pass: cannot write '%s'\n", ft);
+            return false;
+        }
+        log_info("  wrote the mutated netlist to %s -- carry_stamp and the router MUST read "
+                 "this one, not the original\n",
+                 ft);
+    }
+    lefpack::PackResult r = lefpack::pack_netlist(nl);
+    lefpack::netlist_free(nl);
     if (r.cells.empty()) {
         log_error("place_lef pre-pass: packed NO cells from '%s'\n", json_path.c_str());
         return false;

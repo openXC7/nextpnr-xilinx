@@ -1188,26 +1188,641 @@ void Packer::run()
     phase3_leftover();
 }
 
-// ------------------------------------------------------------- library ----
-// Read a yosys JSON netlist and pack it.  Picks the module with the most cells
-// as the top, exactly as the OCaml's bmodule_of_yosys_tree does.
-PackResult pack_to_lef_json(const std::string &path)
+// ===================== NETLIST PREPASSES ===================================
+// place_lef mutates the netlist BEFORE packing and writes the result out; the
+// downstream (carry_stamp.py, the router) consumes the mutated netlist.  These
+// three are ported verbatim from place_lef_core.ml, in its own pipeline order.
+// ===========================================================================
+
+struct Netlist
 {
-    PackResult res;
+    JPtr root;
+};
+
+// ---- small tree helpers ---------------------------------------------------
+static JPtr jstr(const std::string &v) { auto j = std::make_shared<JVal>(); j->k = JVal::STR; j->str = v; return j; }
+static JPtr jint(int v) { auto j = std::make_shared<JVal>(); j->k = JVal::NUM; j->num = v; return j; }
+static JPtr jobj() { auto j = std::make_shared<JVal>(); j->k = JVal::OBJ; return j; }
+static JPtr jarr() { auto j = std::make_shared<JVal>(); j->k = JVal::ARR; return j; }
+
+static void set_member(JPtr o, const std::string &k, JPtr v)
+{
+    for (auto &kv : o->obj)
+        if (kv.first == k) { kv.second = v; return; }
+    o->obj.emplace_back(k, v);
+}
+static JPtr deep_copy(JPtr v)
+{
+    auto o = std::make_shared<JVal>();
+    o->k = v->k; o->str = v->str; o->num = v->num; o->bol = v->bol;
+    for (auto &kv : v->obj) o->obj.emplace_back(kv.first, deep_copy(kv.second));
+    for (auto &e : v->arr) o->arr.push_back(deep_copy(e));
+    return o;
+}
+// Only INTEGER bits; a "0"/"1"/"x"/"z" string is a constant, not a net.
+static std::vector<int> bits_of(JPtr e)
+{
+    std::vector<int> out;
+    if (e && e->k == JVal::ARR)
+        for (auto &b : e->arr)
+            if (b->k == JVal::NUM) out.push_back(int(b->num));
+    return out;
+}
+static JPtr bit_list(const std::vector<int> &bs)
+{
+    JPtr a = jarr();
+    for (int b : bs) a->arr.push_back(jint(b));
+    return a;
+}
+static std::string type_of(JPtr cj)
+{
+    JPtr t = cj->member("type");
+    return (t && t->k == JVal::STR) ? t->str : std::string();
+}
+static bool port_is_output(JPtr cj, const std::string &p)
+{
+    JPtr d = cj->member("port_directions");
+    if (!d || d->k != JVal::OBJ) return false;
+    JPtr v = d->member(p);
+    return v && v->k == JVal::STR && v->str == "output";
+}
+static bool is_lut_type(const std::string &t) { return starts_with(upper(t), "LUT"); }
+static bool is_widemux(const std::string &t) { return t == "MUXF7" || t == "MUXF8"; }
+
+// Highest net id in use, so clones can take fresh ones.
+static int max_bit(JPtr mj)
+{
+    int mx = 1;
+    JPtr cells = mj->member("cells");
+    if (cells && cells->k == JVal::OBJ)
+        for (auto &c : cells->obj) {
+            JPtr conns = c.second->member("connections");
+            if (conns && conns->k == JVal::OBJ)
+                for (auto &pc : conns->obj)
+                    for (int b : bits_of(pc.second)) mx = std::max(mx, b);
+        }
+    JPtr nn = mj->member("netnames");
+    if (nn && nn->k == JVal::OBJ)
+        for (auto &n : nn->obj)
+            for (int b : bits_of(n.second->member("bits"))) mx = std::max(mx, b);
+    return mx;
+}
+static JPtr make_netname(const std::vector<int> &bs)
+{
+    JPtr n = jobj();
+    set_member(n, "hide_name", jint(1));
+    set_member(n, "bits", bit_list(bs));
+    set_member(n, "attributes", jobj());
+    return n;
+}
+static void append_cells(JPtr mj, std::vector<std::pair<std::string, JPtr>> &extra)
+{
+    if (extra.empty()) return;
+    JPtr cells = mj->member("cells");
+    for (auto &e : extra) cells->obj.emplace_back(e.first, e.second);
+}
+static void append_netnames(JPtr mj, std::vector<std::pair<std::string, JPtr>> &extra)
+{
+    if (extra.empty()) return;
+    JPtr nn = mj->member("netnames");
+    if (!nn || nn->k != JVal::OBJ) { nn = jobj(); set_member(mj, "netnames", nn); }
+    for (auto &e : extra) nn->obj.emplace_back(e.first, e.second);
+}
+
+// ---- split_degenerate_muxf -----------------------------------------------
+// Every wide-mux data pin needs a LUT of its OWN, in its own lane of its own
+// slice.  Two pins sharing one driver is unsatisfiable whether they are I0/I1
+// of the SAME mux (opt_merge collapsed an identical pair) or pins of two
+// DIFFERENT muxes: a single instance cannot sit in two lanes.  First claimant
+// keeps the original, every later one gets a clone.
+//
+// It also clones when the driver is shared with any NON-mux consumer, because
+// CARRY4 absorbs its S-LUTs (pack rule 1) BEFORE the mux group (rule 1a), so a
+// LUT shared between a MUXF7 data pin and a CARRY4.S pin is always lost to the
+// carry chain and the mux pin then has to be fed from another slice -- which
+// the dedicated F7/F8 path cannot do.
+static void split_degenerate_muxf(JPtr mj, PrepassStats &st)
+{
+    JPtr cells = mj->member("cells");
+    if (!cells || cells->k != JVal::OBJ || cells->obj.empty()) return;
+
+    std::unordered_map<std::string, JPtr> byname;
+    std::unordered_map<int, std::pair<std::string, std::string>> drv;
+    for (auto &c : cells->obj) {
+        byname[c.first] = c.second;
+        JPtr conns = c.second->member("connections");
+        if (!conns || conns->k != JVal::OBJ) continue;
+        for (auto &pc : conns->obj)
+            if (port_is_output(c.second, pc.first))
+                for (int b : bits_of(pc.second)) drv[b] = {c.first, pc.first};
+    }
+    int mx = max_bit(mj);
+
+    // consumers per bit, split into wide-mux data pins and everything else
+    std::unordered_map<int, int> nuse, muxuse;
+    for (auto &c : cells->obj) {
+        bool ismux = is_widemux(type_of(c.second));
+        JPtr conns = c.second->member("connections");
+        if (!conns || conns->k != JVal::OBJ) continue;
+        for (auto &pc : conns->obj) {
+            if (port_is_output(c.second, pc.first)) continue;
+            for (int b : bits_of(pc.second)) {
+                nuse[b]++;
+                if (ismux && (pc.first == "I0" || pc.first == "I1")) muxuse[b]++;
+            }
+        }
+    }
+    // a module port is a consumer too
+    JPtr ports = mj->member("ports");
+    if (ports && ports->k == JVal::OBJ)
+        for (auto &p : ports->obj)
+            for (int b : bits_of(p.second->member("bits"))) nuse[b]++;
+
+    std::vector<std::pair<std::string, JPtr>> extra, extranets;
+    auto clone_driver = [&](int b) -> int {
+        auto it = drv.find(b);
+        if (it == drv.end()) { st.mux_skipped++; return -1; }
+        const std::string &dn = it->second.first, &dp = it->second.second;
+        auto bit = byname.find(dn);
+        if (bit == byname.end() || !is_lut_type(type_of(bit->second))) {
+            // Driver is not a LUT -- a MUXF7 feeding a MUXF8 data pin, an FF, a
+            // hard-block output.  Cloning it is not an option (that would change
+            // the design).  The OCaml's MUXSPLIT_BUF branch is DEFAULT OFF and
+            // stays unported: a bare LUT1 buffer measured WORSE (skips 4 -> 6,
+            // userclk2 155 -> 116.67 MHz) because the constraint is not "a LUT
+            // exists" but "a LUT in the mux's OWN slice", and a freshly-named
+            // buffer is not associated with the mux so it lands elsewhere.
+            st.mux_skipped++;
+            return -1;
+        }
+        int fresh = ++mx;
+        JPtr clone = deep_copy(bit->second);
+        JPtr cc = clone->member("connections");
+        if (cc && cc->k == JVal::OBJ) set_member(cc, dp, bit_list({fresh}));
+        std::string nm = dn + "$muxdup";
+        int k = 1;
+        while (byname.count(nm)) { k++; nm = dn + "$muxdup" + std::to_string(k); }
+        byname[nm] = clone;
+        extra.emplace_back(nm, clone);
+        extranets.emplace_back(nm + "." + dp, make_netname({fresh}));
+        st.muxdup++;
+        return fresh;
+    };
+
+    std::set<int> claimed;
+    for (auto &c : cells->obj) {
+        if (!is_widemux(type_of(c.second))) continue;
+        JPtr conns = c.second->member("connections");
+        if (!conns || conns->k != JVal::OBJ) continue;
+        for (const char *pin : {"I0", "I1"}) {
+            JPtr e = conns->member(pin);
+            if (!e) continue;
+            std::vector<int> bs = bits_of(e);
+            if (bs.size() != 1) continue;
+            int b = bs[0];
+            int total = nuse.count(b) ? nuse[b] : 0;
+            int nmux = muxuse.count(b) ? muxuse[b] : 0;
+            bool stolen = (total - nmux) > 0;
+            if (stolen || claimed.count(b)) {
+                int fresh = clone_driver(b);
+                if (fresh >= 0) {
+                    if (stolen) st.mux_exclusive++;
+                    claimed.insert(fresh);
+                    set_member(conns, pin, bit_list({fresh}));
+                }
+            } else
+                claimed.insert(b);
+        }
+    }
+    append_cells(mj, extra);
+    append_netnames(mj, extranets);
+}
+
+// ---- replicate_shared_muxf7 ----------------------------------------------
+// Same fault as the shared carry chain, in the other dedicated-path structure.
+// A MUXF7's output reaches a MUXF8 data pin over the F7->F8 path INSIDE one
+// slice, so it can feed exactly one MUXF8.  When opt_merge shares a MUXF7
+// between two MUXF8s, at most one is reachable and the other shows up as
+//   SITEWIRE/.../F7BMUX_OUT -> SITEWIRE/.../F7AMUX_OUT
+// Keep the first consumer on the original and give every later one a private
+// clone of the MUXF7 and both its feeding LUTs.
+static void replicate_shared_muxf7(JPtr mj, PrepassStats &st)
+{
+    JPtr cells = mj->member("cells");
+    if (!cells || cells->k != JVal::OBJ || cells->obj.empty()) return;
+
+    std::unordered_map<std::string, JPtr> byname;
+    for (auto &c : cells->obj) byname[c.first] = c.second;
+    int mx = max_bit(mj);
+
+    std::unordered_map<int, std::pair<std::string, std::string>> drv;
+    // MUXF8 consumers per bit, in CELL ORDER (the OCaml prepends then reverses)
+    std::map<int, std::vector<std::pair<std::string, std::string>>> f8_users;
+    for (auto &c : cells->obj) {
+        bool is_f8 = type_of(c.second) == "MUXF8";
+        JPtr conns = c.second->member("connections");
+        if (!conns || conns->k != JVal::OBJ) continue;
+        for (auto &pc : conns->obj) {
+            bool out = port_is_output(c.second, pc.first);
+            for (int b : bits_of(pc.second)) {
+                if (out)
+                    drv[b] = {c.first, pc.first};
+                else if (is_f8 && (pc.first == "I0" || pc.first == "I1"))
+                    f8_users[b].emplace_back(c.first, pc.first);
+            }
+        }
+    }
+
+    std::vector<std::pair<std::string, JPtr>> extra;
+    std::vector<std::tuple<std::string, std::string, int>> rewire;
+    // The OCaml iterates a Hashtbl here, whose order is UNSPECIFIED; each bit
+    // is independent, so ascending bit order is equivalent and deterministic.
+    for (auto &fu : f8_users) {
+        int b = fu.first;
+        auto &users = fu.second;
+        if (users.size() <= 1) continue;
+        auto dit = drv.find(b);
+        if (dit == drv.end()) continue;
+        const std::string &mn = dit->second.first;
+        auto mit = byname.find(mn);
+        if (mit == byname.end() || type_of(mit->second) != "MUXF7") continue;
+
+        for (size_t i = 1; i < users.size(); i++) { // first consumer keeps the original
+            int nb = ++mx;
+            JPtr m7 = deep_copy(mit->second);
+            JPtr conns = m7->member("connections");
+            JPtr orig = mit->second->member("connections");
+            if (conns && conns->k == JVal::OBJ) {
+                set_member(conns, "O", bit_list({nb}));
+                for (const char *pin : {"I0", "I1"}) {
+                    std::vector<int> ib = bits_of(orig->member(pin));
+                    if (ib.size() != 1) continue;
+                    auto ldit = drv.find(ib[0]);
+                    if (ldit == drv.end()) continue;
+                    const std::string &ln = ldit->second.first;
+                    auto lit = byname.find(ln);
+                    if (lit == byname.end() || !is_lut_type(type_of(lit->second))) continue;
+                    int lb = ++mx;
+                    JPtr lclone = deep_copy(lit->second);
+                    JPtr lc = lclone->member("connections");
+                    if (lc && lc->k == JVal::OBJ)
+                        for (auto &lp : lc->obj)
+                            if (upper(lp.first) == "O") lp.second = bit_list({lb});
+                    extra.emplace_back(ln + "_rep" + std::to_string(i) + "_" + pin, lclone);
+                    set_member(conns, pin, bit_list({lb}));
+                }
+            }
+            extra.emplace_back(mn + "_rep" + std::to_string(i) + "_m7", m7);
+            rewire.emplace_back(users[i].first, users[i].second, nb);
+            st.muxf7_rep++;
+        }
+    }
+    for (auto &rw : rewire) {
+        auto it = byname.find(std::get<0>(rw));
+        if (it == byname.end()) continue;
+        JPtr conns = it->second->member("connections");
+        if (conns && conns->k == JVal::OBJ)
+            set_member(conns, std::get<1>(rw), bit_list({std::get<2>(rw)}));
+    }
+    append_cells(mj, extra);
+}
+
+// ---- replicate_shared_carry ----------------------------------------------
+// COUT->CIN is a dedicated point-to-point wire reaching only the slice directly
+// above, so when a CARRY4's CO[3] feeds MORE THAN ONE downstream CI at most one
+// of them can be reached through the cascade.  Give every extra user its own
+// clone of the whole chain from the root down, S/DI driving LUTs included, so
+// each cascade is private.
+static void replicate_shared_carry(JPtr mj, PrepassStats &st)
+{
+    JPtr cells = mj->member("cells");
+    if (!cells || cells->k != JVal::OBJ || cells->obj.empty()) return;
+
+    std::unordered_map<std::string, JPtr> byname;
+    for (auto &c : cells->obj) byname[c.first] = c.second;
+    int mx = max_bit(mj);
+
+    // driver map: bit -> (cell, port, index-within-port)
+    std::unordered_map<int, std::tuple<std::string, std::string, int>> drv;
+    for (auto &c : cells->obj) {
+        JPtr conns = c.second->member("connections");
+        if (!conns || conns->k != JVal::OBJ) continue;
+        for (auto &pc : conns->obj)
+            if (port_is_output(c.second, pc.first)) {
+                std::vector<int> bs = bits_of(pc.second);
+                for (size_t i = 0; i < bs.size(); i++)
+                    drv[bs[i]] = std::make_tuple(c.first, pc.first, int(i));
+            }
+    }
+    auto conn_bits = [&](const std::string &cn, const char *port) {
+        std::vector<int> out;
+        auto it = byname.find(cn);
+        if (it == byname.end()) return out;
+        JPtr conns = it->second->member("connections");
+        if (!conns || conns->k != JVal::OBJ) return out;
+        return bits_of(conns->member(port));
+    };
+    auto co3 = [&](const std::string &cn) {
+        std::vector<int> b = conn_bits(cn, "CO");
+        return b.size() == 4 ? b[3] : -1;
+    };
+    auto ci_of = [&](const std::string &cn) {
+        std::vector<int> b = conn_bits(cn, "CI");
+        return b.empty() ? -1 : b[0];
+    };
+    // CI consumers per bit
+    std::unordered_map<int, std::vector<std::string>> ci_users;
+    for (auto &c : cells->obj)
+        if (type_of(c.second) == "CARRY4") {
+            int b = ci_of(c.first);
+            if (b >= 0) ci_users[b].insert(ci_users[b].begin(), c.first);
+        }
+
+    std::vector<std::pair<std::string, JPtr>> extra;
+    std::vector<std::tuple<std::string, std::string, int>> rewire;
+    for (auto &c : cells->obj) {
+        if (type_of(c.second) != "CARRY4") continue;
+        int b = co3(c.first);
+        if (b < 0) continue;
+        auto uit = ci_users.find(b);
+        if (uit == ci_users.end() || uit->second.size() <= 1) continue;
+
+        // walk back from this cell to the root of its cascade
+        std::vector<std::string> chain;
+        {
+            std::string cur = c.first;
+            std::set<std::string> guard;
+            for (;;) {
+                chain.insert(chain.begin(), cur);
+                if (!guard.insert(cur).second) break;
+                int cb = ci_of(cur);
+                if (cb < 0) break;
+                auto dit = drv.find(cb);
+                if (dit == drv.end()) break;
+                if (std::get<1>(dit->second) != "CO" || std::get<2>(dit->second) != 3) break;
+                const std::string &pn = std::get<0>(dit->second);
+                if (!byname.count(pn) || type_of(byname[pn]) != "CARRY4") break;
+                if (guard.count(pn)) break;
+                cur = pn;
+            }
+        }
+        std::vector<std::string> users(uit->second.rbegin(), uit->second.rend());
+        for (size_t ui = 0; ui < users.size(); ui++) {
+            if (ui == 0) continue; // first user keeps the original cascade
+            st.carry_chains++;
+            int prev_co = -1;
+            for (auto &rung : chain) {
+                st.carry_rungs++;
+                JPtr rj = byname[rung];
+                JPtr rconns = rj->member("connections");
+                if (!rconns || rconns->k != JVal::OBJ) continue;
+                JPtr clone = deep_copy(rj);
+                JPtr cc = clone->member("connections");
+                // fresh CO bits for this clone
+                std::vector<int> newco;
+                for (size_t q = 0; q < bits_of(rconns->member("CO")).size(); q++) newco.push_back(++mx);
+                if (!newco.empty()) set_member(cc, "CO", bit_list(newco));
+                // sum outputs: fresh nets, unused by the clone
+                {
+                    std::vector<int> o = bits_of(rconns->member("O")), no;
+                    for (size_t q = 0; q < o.size(); q++) no.push_back(++mx);
+                    if (!no.empty()) set_member(cc, "O", bit_list(no));
+                }
+                // CI: chain to our own clone; the root keeps the original net
+                if (prev_co >= 0) set_member(cc, "CI", bit_list({prev_co}));
+                // clone the S/DI driving LUTs so the copy is independent
+                for (const char *pin : {"S", "DI"}) {
+                    JPtr e = rconns->member(pin);
+                    if (!e) continue;
+                    std::vector<int> nb;
+                    for (int ib : bits_of(e)) {
+                        auto dit = drv.find(ib);
+                        if (dit == drv.end()) { nb.push_back(ib); continue; }
+                        const std::string &ln = std::get<0>(dit->second);
+                        auto lit = byname.find(ln);
+                        if (lit == byname.end() || !is_lut_type(type_of(lit->second))) {
+                            nb.push_back(ib);
+                            continue;
+                        }
+                        int fresh = ++mx;
+                        JPtr lclone = deep_copy(lit->second);
+                        JPtr lc = lclone->member("connections");
+                        if (lc && lc->k == JVal::OBJ)
+                            for (auto &lp : lc->obj)
+                                if (upper(lp.first) == "O") lp.second = bit_list({fresh});
+                        extra.emplace_back(ln + "_carrep" + std::to_string(ui), lclone);
+                        nb.push_back(fresh);
+                    }
+                    set_member(cc, pin, bit_list(nb));
+                }
+                if (!newco.empty()) prev_co = newco.back();
+                extra.emplace_back(rung + "_carrep" + std::to_string(ui), clone);
+            }
+            if (prev_co >= 0) rewire.emplace_back(users[ui], "CI", prev_co);
+        }
+    }
+    for (auto &rw : rewire) {
+        auto it = byname.find(std::get<0>(rw));
+        if (it == byname.end()) continue;
+        JPtr conns = it->second->member("connections");
+        if (conns && conns->k == JVal::OBJ)
+            set_member(conns, std::get<1>(rw), bit_list({std::get<2>(rw)}));
+    }
+    append_cells(mj, extra);
+}
+
+// ---- materialise_const_drivers -------------------------------------------
+// A MUXF7/MUXF8 whose I0/I1 is tied to a constant has no cell driving that pin,
+// so nextpnr's packer INVENTS one ($PACKER_GND_NET$LUT$n) which place_lef never
+// placed -- "ERROR: Found unbound cell".  Give the packer nothing to invent.
+//
+// I0 is driven from a FLIP-FLOP Q, not from the constant it replaced: tying it
+// to the constant makes the timing engine see the const network arriving at a
+// cell that drives it, and leaving it dangling invites the packer to tie it to
+// a constant itself, recreating the cell this pass exists to remove.  INIT
+// ignores I0, so any driven net works; pick the FF whose name shares the
+// longest prefix with the mux so the extra load stays local.
+static void materialise_const_drivers(JPtr mj, PrepassStats &st)
+{
+    JPtr cells = mj->member("cells");
+    if (!cells || cells->k != JVal::OBJ || cells->obj.empty()) return;
+    int mx = max_bit(mj);
+
+    std::vector<std::pair<std::string, int>> ff_qs;
+    for (auto &c : cells->obj) {
+        if (!starts_with(type_of(c.second), "FD")) continue;
+        JPtr conns = c.second->member("connections");
+        if (!conns || conns->k != JVal::OBJ) continue;
+        std::vector<int> q = bits_of(conns->member("Q"));
+        if (q.size() == 1) ff_qs.emplace_back(c.first, q[0]);
+    }
+    auto pick_ff_for = [&](const std::string &cn) {
+        int best = -1;
+        size_t bestlen = 0;
+        bool have = false;
+        for (auto &f : ff_qs) {
+            size_t n = std::min(cn.size(), f.first.size()), i = 0;
+            while (i < n && cn[i] == f.first[i]) i++;
+            if (!have || i > bestlen) { have = true; bestlen = i; best = f.second; }
+        }
+        return best;
+    };
+
+    std::vector<std::pair<std::string, JPtr>> extra;
+    for (auto &c : cells->obj) {
+        if (!is_widemux(type_of(c.second))) continue;
+        JPtr conns = c.second->member("connections");
+        if (!conns || conns->k != JVal::OBJ) continue;
+        for (auto &pc : conns->obj) {
+            if (pc.first != "I0" && pc.first != "I1") continue;
+            JPtr e = pc.second;
+            if (!e || e->k != JVal::ARR || e->arr.size() != 1) continue;
+            if (e->arr[0]->k != JVal::STR) continue;
+            const std::string &k = e->arr[0]->str;
+            if (k != "0" && k != "1") continue;
+            int nb = ++mx;
+            JPtr lut = jobj();
+            set_member(lut, "hide_name", jint(0));
+            set_member(lut, "type", jstr("LUT1"));
+            JPtr params = jobj();
+            set_member(params, "INIT", jstr(k == "0" ? "2'h0" : "2'h3"));
+            set_member(lut, "parameters", params);
+            JPtr dirs = jobj();
+            set_member(dirs, "I0", jstr("input"));
+            set_member(dirs, "O", jstr("output"));
+            set_member(lut, "port_directions", dirs);
+            JPtr lc = jobj();
+            int q = pick_ff_for(c.first);
+            if (q >= 0)
+                set_member(lc, "I0", bit_list({q}));
+            else {
+                JPtr a = jarr();
+                a->arr.push_back(jstr(k));
+                set_member(lc, "I0", a);
+            }
+            set_member(lc, "O", bit_list({nb}));
+            set_member(lut, "connections", lc);
+            extra.emplace_back(c.first + "_const_" + pc.first, lut);
+            pc.second = bit_list({nb});
+            st.consts++;
+        }
+    }
+    append_cells(mj, extra);
+}
+
+// ---- JSON writer ----------------------------------------------------------
+static void json_escape(std::string &out, const std::string &s)
+{
+    for (char c : s) {
+        switch (c) {
+        case '"': out += "\\\""; break;
+        case '\\': out += "\\\\"; break;
+        case '\n': out += "\\n"; break;
+        case '\t': out += "\\t"; break;
+        case '\r': out += "\\r"; break;
+        default:
+            if ((unsigned char)c < 0x20) {
+                char b[8];
+                snprintf(b, sizeof(b), "\\u%04x", c);
+                out += b;
+            } else
+                out += c;
+        }
+    }
+}
+static void json_dump(std::string &out, JPtr v, int indent)
+{
+    std::string pad(indent * 2, ' '), pad2((indent + 1) * 2, ' ');
+    switch (v->k) {
+    case JVal::OBJ:
+        if (v->obj.empty()) { out += "{}"; return; }
+        out += "{\n";
+        for (size_t i = 0; i < v->obj.size(); i++) {
+            out += pad2 + "\"";
+            json_escape(out, v->obj[i].first);
+            out += "\": ";
+            json_dump(out, v->obj[i].second, indent + 1);
+            if (i + 1 < v->obj.size()) out += ",";
+            out += "\n";
+        }
+        out += pad + "}";
+        return;
+    case JVal::ARR: {
+        out += "[ ";
+        for (size_t i = 0; i < v->arr.size(); i++) {
+            json_dump(out, v->arr[i], indent + 1);
+            if (i + 1 < v->arr.size()) out += ", ";
+        }
+        out += " ]";
+        return;
+    }
+    case JVal::STR: out += "\""; json_escape(out, v->str); out += "\""; return;
+    case JVal::NUM: {
+        char b[32];
+        if (v->num == double(int64_t(v->num)))
+            snprintf(b, sizeof(b), "%lld", (long long)v->num);
+        else
+            snprintf(b, sizeof(b), "%g", v->num);
+        out += b;
+        return;
+    }
+    case JVal::BOOL: out += v->bol ? "true" : "false"; return;
+    default: out += "null"; return;
+    }
+}
+
+Netlist *netlist_load(const std::string &path)
+{
     std::ifstream f(path, std::ios::binary);
     if (!f) {
         fprintf(stderr, "pack_to_lef: cannot open %s\n", path.c_str());
-        return res;
+        return nullptr;
     }
     std::stringstream ss;
     ss << f.rdbuf();
     std::string src = ss.str();
     JParser jp(src);
-    JPtr root = jp.parse();
+    Netlist *n = new Netlist;
+    n->root = jp.parse();
+    return n;
+}
+void netlist_free(Netlist *n) { delete n; }
 
+bool netlist_write(Netlist *n, const std::string &path)
+{
+    if (!n || !n->root) return false;
+    std::string out;
+    json_dump(out, n->root, 0);
+    out += "\n";
+    std::ofstream f(path, std::ios::binary);
+    if (!f) return false;
+    f << out;
+    return bool(f);
+}
+
+PrepassStats netlist_prepasses(Netlist *n)
+{
+    PrepassStats st;
+    if (!n || !n->root) return st;
+    JPtr mods = n->root->member("modules");
+    if (!mods || mods->k != JVal::OBJ) return st;
+    // place_lef's own order (innermost first in run): split_degenerate_muxf,
+    // then replicate_shared_carry, then materialise_const_drivers.
+    for (auto &m : mods->obj) split_degenerate_muxf(m.second, st);
+    for (auto &m : mods->obj) replicate_shared_muxf7(m.second, st);
+    for (auto &m : mods->obj) replicate_shared_carry(m.second, st);
+    for (auto &m : mods->obj) materialise_const_drivers(m.second, st);
+    return st;
+}
+
+// Pick the top (most cells) and pack it -- shared by pack_netlist and the
+// file-based entry point.
+static PackResult pack_tree(JPtr root)
+{
+    PackResult res;
     JPtr mods = root->member("modules");
     if (!mods || mods->k != JVal::OBJ) {
-        fprintf(stderr, "pack_to_lef: no modules in %s\n", path.c_str());
+        fprintf(stderr, "pack_to_lef: no modules\n");
         return res;
     }
     JPtr mj = nullptr;
@@ -1250,6 +1865,27 @@ PackResult pack_to_lef_json(const std::string &path)
                      [](const std::pair<std::string, int> &a, const std::pair<std::string, int> &b) {
                          return a.second > b.second;
                      });
+    return res;
+}
+
+PackResult pack_netlist(Netlist *n)
+{
+    PackResult res;
+    if (!n || !n->root) return res;
+    return pack_tree(n->root);
+}
+
+// ------------------------------------------------------------- library ----
+// Read a yosys JSON netlist and pack it, WITHOUT the prepasses -- this is the
+// entry point tools/pack_to_lef regression-tests against the OCaml packer, so
+// it must keep seeing the netlist exactly as pack_to_lef.ml would.
+PackResult pack_to_lef_json(const std::string &path)
+{
+    PackResult res;
+    Netlist *n = netlist_load(path);
+    if (!n) return res;
+    res = pack_tree(n->root);
+    netlist_free(n);
     return res;
 }
 

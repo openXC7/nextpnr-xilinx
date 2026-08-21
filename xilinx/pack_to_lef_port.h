@@ -58,6 +58,34 @@ struct PackResult
 // PACK_CRIT_FILE, PACK_CRIT_MIN and TOPO_LUT_FRACTURE from the environment.
 PackResult pack_to_lef_json(const std::string &path);
 
+// ---- netlist prepasses ---------------------------------------------------
+// place_lef MUTATES THE NETLIST before packing and writes the result out
+// (TOPO_FT_JSON); carry_stamp.py and the router then consume the MUTATED
+// netlist, not the original.  That is why these are JSON->JSON in the OCaml,
+// and why nothing has to be mirrored into nextpnr's ctx: the cells they add
+// only need to exist in the netlist handed to the ROUTE run.
+struct Netlist;
+
+Netlist *netlist_load(const std::string &path);
+void netlist_free(Netlist *n);
+bool netlist_write(Netlist *n, const std::string &path);
+PackResult pack_netlist(Netlist *n);
+
+struct PrepassStats
+{
+    int muxdup = 0;       // wide-mux data pins given their own cloned LUT
+    int mux_exclusive = 0; // ...of which were shared with a non-mux consumer
+    int mux_skipped = 0;  // driver is not a LUT: UNROUTABLE BY CONSTRUCTION
+    int muxf7_rep = 0;   // shared MUXF7 subtrees replicated for extra MUXF8 consumers
+    int consts = 0;       // constant MUXF7/F8 inputs given a real LUT1
+    int carry_chains = 0; // shared carry chains replicated
+    int carry_rungs = 0;
+};
+
+// Runs, in place_lef's own order: split_degenerate_muxf, replicate_shared_muxf7,
+// replicate_shared_carry, materialise_const_drivers.
+PrepassStats netlist_prepasses(Netlist *n);
+
 } // namespace lefpack
 
 #endif
