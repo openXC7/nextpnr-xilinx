@@ -823,6 +823,37 @@ struct Arch : BaseCtx
                 ts.eights[i].dirty = true;
             break;
         }
+
+        // CROSS-TILE INVALIDATION.  Everything above dirties only THIS bel's
+        // tile, which is correct while every validity rule is tile-local.  It
+        // is not: a tile-local CLUSTER (a MUXF7/F8 tree, a LUT+FF pair) is only
+        // legal with all its members in one slice, so the validity of the
+        // PARENT's tile depends on where the CHILD sits.  Move the child and
+        // the parent's tile keeps its cached verdict -- and a tile that was
+        // marked invalid while the cluster was briefly apart stays invalid for
+        // the rest of the run even after the cause has gone.  That is a stale
+        // cache reporting a tile bad with no rule firing:
+        //   Info:  invalid-check: xc7_logic_tile_valid=false (type CLBLM_L)
+        //   ERROR: post-placement validity check failed for Bel
+        //          'SLICE_X168Y172/A5FF' (no cell)
+        // -- no invalid-arm line, because nothing was re-evaluated.
+        // So when a clustered cell moves, dirty its relatives' tiles too.
+        if (cell != nullptr && (cell->constr_parent != nullptr || !cell->constr_children.empty())) {
+            auto dirty_tile_of = [&](const CellInfo *rel) {
+                if (rel == nullptr || rel->bel == BelId() || rel->bel.tile == bel.tile)
+                    return;
+                auto &rtts = tileStatus[rel->bel.tile];
+                if (rtts.lts == nullptr)
+                    return;
+                for (int i = 0; i < 8; i++) {
+                    rtts.lts->eights[i].dirty = true;
+                    rtts.lts->halfs[i].dirty = true;
+                }
+            };
+            dirty_tile_of(cell->constr_parent);
+            for (auto ch : cell->constr_children)
+                dirty_tile_of(ch);
+        }
     }
 
     void updateBramBel(BelId bel, CellInfo *cell)

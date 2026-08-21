@@ -24,6 +24,7 @@
 #include "design_utils.h"
 #include "jsonwrite.h"
 #include "log.h"
+#include "placer_lef.h"
 #include "timing.h"
 
 USING_NEXTPNR_NAMESPACE
@@ -37,6 +38,7 @@ class UspCommandHandler : public CommandHandler
     void setupArchContext(Context *ctx) override{};
     void customBitstream(Context *ctx) override;
     void customAfterLoad(Context *ctx) override;
+    std::string customRewriteJson(Context *ctx, const std::string &filename) override;
 
   protected:
     po::options_description getArchOptions() override;
@@ -89,8 +91,44 @@ void UspCommandHandler::customAfterLoad(Context *ctx)
             ctx->parseXdc(in);
         }
     }
+    // The transplant's own clock constraints, parsed AFTER the user's --xdc so
+    // an explicit constraint still wins.  nextpnr cannot derive a BUFG-output
+    // clock, and without these every clock silently falls back to --freq.
+    if (const char *cx = getenv("TOPO_CLOCKS_XDC")) {
+        std::ifstream in(cx);
+        if (in) {
+            ctx->parseXdc(in);
+            log_info("place_lef: applied generated clock constraints from %s\n", cx);
+        }
+    }
     if (vm.count("fixed-routes"))
         ctx->settings[ctx->id("fixed-routes")] = vm["fixed-routes"].as<std::string>();
+}
+
+// --placer lef: run the whole place_lef transplant HERE, before the netlist is
+// parsed, and hand nextpnr the STAMPED netlist instead of the original.
+//
+// This is what makes it a single invocation.  The transplant's packer
+// recognises LUT6/FDRE/CARRY4/MUXF7, so it cannot run in the placer slot --
+// Arch::pack() would already have replaced those.  And its prepasses and
+// carry_stamp ADD cells ($muxdup, _const_, _carrep, $Srt, $DIgnd, ...), which
+// have to exist in ctx.  Parsing the transformed file gives both for free: no
+// cell mirroring, and every BEL attribute arrives as an ordinary parsed
+// attribute.  The placer setting is then rewritten to "sa", whose constraints
+// pass binds the stamped cells at STRENGTH_USER.
+std::string UspCommandHandler::customRewriteJson(Context *ctx, const std::string &filename)
+{
+    if (!ctx->settings.count(ctx->id("placer")) ||
+        ctx->settings[ctx->id("placer")].as_string() != "lef")
+        return filename;
+    std::string stamped = place_lef_transplant(ctx, filename);
+    if (stamped.empty())
+        log_error("place_lef transplant failed.\n");
+    log_info("place_lef: loading the stamped netlist %s (placer -> sa, which honours the "
+             "stamps)\n",
+             stamped.c_str());
+    ctx->settings[ctx->id("placer")] = std::string("sa");
+    return stamped;
 }
 
 int main(int argc, char *argv[])

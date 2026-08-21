@@ -223,6 +223,48 @@ void XilinxPacker::pack_luts()
     }
     lut_rules[ctx->id("LUT6_2")] = lut_rules[ctx->id("LUT6")];
     generic_xform(lut_rules, true);
+
+    // A LUT that an EARLIER packer already constrained into a 5LUT slot must
+    // drive O5, not O6.  The transform above maps every LUT's output to O6
+    // unconditionally, but carry packing runs BEFORE LUT packing ("Packing
+    // carries" precedes "Packing LUTs") and pins the CARRY4 DI driver to
+    // BEL_5LUT so that its O5 reaches DI over the internal path.  A 5LUT bel
+    // has no O6 at all, so the cell arrived at the placer needing a pin its
+    // own bel does not have, and the slice was rejected -- correctly, and with
+    // nothing to say why:
+    //   ERROR: post-placement validity check failed for Bel
+    //          'SLICE_X168Y172/A5FF' (no cell)
+    // The equivalent fix-up already exists for SRLs a few hundred lines below,
+    // but it detects the 5LUT position from a BEL ATTRIBUTE STRING, so it only
+    // catches imported placements and never the constr_z form used here.
+    // BOTH forms have to be caught.  constr_z is how the carry packer pins its
+    // own DI driver; a BEL ATTRIBUTE is how an EXTERNALLY STAMPED placement
+    // arrives (place_lef/carry_stamp.py, and the --placer lef transplant).  The
+    // SRL fix below handles only the attribute form and this once handled only
+    // constr_z, so a stamped carry DI route-thru fell between the two and died
+    // with the same unactionable message the comment above quotes -- observed
+    // on ethmin as SLICE_X180Y31/A5FF, where carry_stamp had put a LUT2 $DIrt
+    // on A5LUT with its output still on O6.
+    int relocated_o5 = 0;
+    for (auto &cell : ctx->cells) {
+        CellInfo *ci = cell.second.get();
+        if (ci->type != id_SLICE_LUTX)
+            continue;
+        bool five = ci->constr_abs_z && (ci->constr_z & 0xF) == BEL_5LUT;
+        if (!five) {
+            auto bel = ci->attrs.find(ctx->id("BEL"));
+            five = bel != ci->attrs.end() &&
+                   bel->second.as_string().find("5LUT") != std::string::npos;
+        }
+        if (!five)
+            continue;
+        if (get_net_or_empty(ci, id_O6) != nullptr) {
+            rename_port(ctx, ci, id_O6, id_O5);
+            ++relocated_o5;
+        }
+    }
+    if (relocated_o5 > 0)
+        log_info("     %d LUT(s) constrained to a 5LUT slot moved from O6 to O5\n", relocated_o5);
 }
 
 void XilinxPacker::pack_ffs()

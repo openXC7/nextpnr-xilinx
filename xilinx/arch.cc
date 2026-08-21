@@ -29,6 +29,7 @@
 #include "nextpnr.h"
 #include "placer1.h"
 #include "placer_heap.h"
+#include "placer_lef.h"
 #include "router1.h"
 #include "router2.h"
 #include "timing.h"
@@ -991,6 +992,14 @@ bool Arch::place()
             return false;
     } else if (placer == "sa") {
         if (!placer1(getCtx(), Placer1Cfg(getCtx())))
+            return false;
+    } else if (placer == "lef-emu") {
+        // The ORIGINAL emulation: nextpnr's own placer nudged toward
+        // place_lef's choices, delegating to placer1.  "lef" no longer reaches
+        // here -- customRewriteJson runs the transplant and rewrites the
+        // setting to "sa" -- but this path is HW-verified (johnson 355.49 MHz)
+        // so it stays selectable rather than being silently replaced.
+        if (!placer_lef(getCtx()))
             return false;
     } else {
         log_error("US+ architecture does not support placer '%s'\n", placer.c_str());
@@ -2881,7 +2890,16 @@ const std::string Arch::defaultPlacer = "sa";
 // "--placer" give the flow's real placer rather than a 51-minute heap run on a
 // hard-macro design.  heap is merely selectable again, for the designs that
 // want a placer at all.
-const std::vector<std::string> Arch::availablePlacers = {"sa", "heap"};
+// "lef" is the TRANSPLANT of place_lef: its recognition packer, netlist
+// prepasses, carry_stamp and placer, ported into xilinx/{pack_to_lef_port,
+// placer_lef}.cc.  It does not run in the placer slot at all -- it runs from
+// customRewriteJson, BEFORE the netlist is parsed, because its packer
+// recognises LUT6/FDRE/CARRY4 and Arch::pack() would have replaced those.  It
+// hands nextpnr a fully stamped netlist and rewrites the placer to "sa", whose
+// constraints pass then honours the stamps.
+// "lef-emu" is the earlier emulation (placer_lef.cc), kept because it is
+// HW-verified independently.
+const std::vector<std::string> Arch::availablePlacers = {"sa", "heap", "lef", "lef-emu"};
 
 const std::string Arch::defaultRouter = "router2";
 const std::vector<std::string> Arch::availableRouters = {"router1", "router2"};
