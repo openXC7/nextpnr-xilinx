@@ -1897,9 +1897,9 @@ bool place_lef_prepass(Context *ctx, const std::string &json_path)
         log_info("place_lef prepasses: %d wide-mux pin(s) given their own LUT (%d of them "
                  "shared with a non-mux consumer), %d shared MUXF7 subtree(s) replicated, "
                  "%d constant mux input(s) materialised, %d carry chain(s) replicated "
-                 "(%d rungs)\n",
+                 "(%d rungs), %d Verilog-literal param(s) normalised\n",
                  ps.muxdup, ps.mux_exclusive, ps.muxf7_rep, ps.consts, ps.carry_chains,
-                 ps.carry_rungs);
+                 ps.carry_rungs, ps.init_fixed);
         // A pin LEFT ALONE is a wide-mux data pin that must be driven from its
         // own slice and cannot be -- it will fail to route on every seed, so
         // say so rather than letting it surface later as a skipped arc.

@@ -80,10 +80,11 @@ struct PrepassStats
     int consts = 0;       // constant MUXF7/F8 inputs given a real LUT1
     int carry_chains = 0; // shared carry chains replicated
     int carry_rungs = 0;
+    int init_fixed = 0;  // Verilog-literal params rewritten to bit-strings
 };
 
 // Runs, in place_lef's own order: split_degenerate_muxf, replicate_shared_muxf7,
-// replicate_shared_carry, materialise_const_drivers.
+// replicate_shared_carry, materialise_const_drivers, normalise_init.
 PrepassStats netlist_prepasses(Netlist *n);
 
 } // namespace lefpack

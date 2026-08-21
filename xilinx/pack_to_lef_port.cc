@@ -1710,6 +1710,84 @@ static void materialise_const_drivers(JPtr mj, PrepassStats &st)
     append_cells(mj, extra);
 }
 
+// ---- normalise_init -------------------------------------------------------
+// Turn every Verilog numeric literal parameter ("N'hV" / "N'bV" / "N'dV") into
+// an MSB-first bit-string of N bits.  nextpnr stores numeric params as a string
+// of [01xz] and asserts on anything else:
+//   Assertion failure: str[i] == S0 || str[i] == S1 || str[i] == Sx || str[i] == Sz
+//     (common/nextpnr.h:342)
+// It aborts in POST-ROUTING LEGALISATION, long after a clean route, and
+// truncates the fasm -- observed on ethmin after materialise_const_drivers,
+// which writes INIT as 2'h0 and relies on this pass to rewrite it to "00".
+// A genuine string param (an enum/mode) carries no apostrophe and is left alone.
+static int normalise_init(JPtr mj)
+{
+    JPtr cells = mj->member("cells");
+    if (!cells || cells->k != JVal::OBJ) return 0;
+    auto hex_bits = [](const std::string &digits, std::string &out) {
+        for (char c : digits) {
+            int v;
+            if (c >= '0' && c <= '9') v = c - '0';
+            else if (c >= 'a' && c <= 'f') v = c - 'a' + 10;
+            else if (c >= 'A' && c <= 'F') v = c - 'A' + 10;
+            else if (c == 'x' || c == 'X' || c == 'z' || c == 'Z') v = 0;
+            else return false;
+            for (int k = 3; k >= 0; k--) out += ((v >> k) & 1) ? '1' : '0';
+        }
+        return true;
+    };
+    auto lit_to_bits = [&](const std::string &s, std::string &out) {
+        size_t q = s.find('\'');
+        if (q == std::string::npos || q == 0 || q + 1 >= s.size()) return false;
+        int width = 0;
+        try {
+            width = std::stoi(s.substr(0, q));
+        } catch (...) {
+            return false;
+        }
+        if (width <= 0) return false;
+        char base = char(tolower(s[q + 1]));
+        std::string digits;
+        for (size_t i = q + 2; i < s.size(); i++)
+            if (s[i] != '_') digits += s[i];
+        std::string raw;
+        if (base == 'h') {
+            if (!hex_bits(digits, raw)) return false;
+        } else if (base == 'b') {
+            for (char c : digits)
+                raw += (c == 'x' || c == 'X' || c == 'z' || c == 'Z') ? '0' : c;
+        } else if (base == 'd' && width <= 62) {
+            int64_t v = 0;
+            try {
+                v = std::stoll(digits);
+            } catch (...) {
+                return false;
+            }
+            for (int i = 0; i < width; i++) raw += ((v >> (width - 1 - i)) & 1) ? '1' : '0';
+        } else
+            return false;
+        int n = int(raw.size());
+        out = (n >= width) ? raw.substr(n - width, width)
+                           : std::string(width - n, '0') + raw;
+        return true;
+    };
+    int nfix = 0;
+    for (auto &c : cells->obj) {
+        JPtr ps = c.second->member("parameters");
+        if (!ps || ps->k != JVal::OBJ) continue;
+        for (auto &pv : ps->obj) {
+            if (pv.second->k != JVal::STR) continue;
+            if (pv.second->str.find('\'') == std::string::npos) continue;
+            std::string bits;
+            if (lit_to_bits(pv.second->str, bits)) {
+                pv.second = jstr(bits);
+                nfix++;
+            }
+        }
+    }
+    return nfix;
+}
+
 // ---- JSON writer ----------------------------------------------------------
 static void json_escape(std::string &out, const std::string &s)
 {
@@ -1812,6 +1890,7 @@ PrepassStats netlist_prepasses(Netlist *n)
     for (auto &m : mods->obj) replicate_shared_muxf7(m.second, st);
     for (auto &m : mods->obj) replicate_shared_carry(m.second, st);
     for (auto &m : mods->obj) materialise_const_drivers(m.second, st);
+    for (auto &m : mods->obj) st.init_fixed += normalise_init(m.second);
     return st;
 }
 
