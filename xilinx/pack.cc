@@ -237,12 +237,26 @@ void XilinxPacker::pack_luts()
     // The equivalent fix-up already exists for SRLs a few hundred lines below,
     // but it detects the 5LUT position from a BEL ATTRIBUTE STRING, so it only
     // catches imported placements and never the constr_z form used here.
+    // BOTH forms have to be caught.  constr_z is how the carry packer pins its
+    // own DI driver; a BEL ATTRIBUTE is how an EXTERNALLY STAMPED placement
+    // arrives (place_lef/carry_stamp.py, and the --placer lef transplant).  The
+    // SRL fix below handles only the attribute form and this once handled only
+    // constr_z, so a stamped carry DI route-thru fell between the two and died
+    // with the same unactionable message the comment above quotes -- observed
+    // on ethmin as SLICE_X180Y31/A5FF, where carry_stamp had put a LUT2 $DIrt
+    // on A5LUT with its output still on O6.
     int relocated_o5 = 0;
     for (auto &cell : ctx->cells) {
         CellInfo *ci = cell.second.get();
-        if (ci->type != id_SLICE_LUTX || !ci->constr_abs_z)
+        if (ci->type != id_SLICE_LUTX)
             continue;
-        if ((ci->constr_z & 0xF) != BEL_5LUT)
+        bool five = ci->constr_abs_z && (ci->constr_z & 0xF) == BEL_5LUT;
+        if (!five) {
+            auto bel = ci->attrs.find(ctx->id("BEL"));
+            five = bel != ci->attrs.end() &&
+                   bel->second.as_string().find("5LUT") != std::string::npos;
+        }
+        if (!five)
             continue;
         if (get_net_or_empty(ci, id_O6) != nullptr) {
             rename_port(ctx, ci, id_O6, id_O5);
