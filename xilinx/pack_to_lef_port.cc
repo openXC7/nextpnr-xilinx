@@ -2005,13 +2005,29 @@ CarryStampStats carry_stamp_tree(JPtr mj, const std::vector<std::pair<std::strin
 
     std::unordered_map<std::string, std::string> occupied; // bel -> cell
     std::set<std::string> carry_sites;
+    // Sites hosting distributed RAM or an SRL.  pack_to_lef stamps a RAM32M /
+    // RAM64X1D / SRL at ONE bel (<site>/A6LUT), but nextpnr EXPANDS it at pack
+    // time into sub-cells -- RAM32M becomes RAMD32 x6 + RAMS32 x2 -- which
+    // consume the WHOLE slice.  `occupied` therefore sees one bel taken and
+    // three lanes apparently free, so the neighbour search below hands one to a
+    // carry's const LUT and the bind fails much later:
+    //   ERROR: Cell '...$DIgndx' cannot be bound to bel 'SLICE_X74Y107/B6LUT'
+    //          since it is already bound to cell 'storage_.../DPR1_1'
+    // Reserve the whole site, exactly as carry_sites already does and for the
+    // same reason.  (carry_stamp.py has this bug too; ethmin has 12 DRAM
+    // slices and survived, litesoc has 36 RAM32M and does not.)
+    std::set<std::string> slicem_sites;
     for (auto &c : cells->obj) {
         JPtr at = c.second->member("attributes");
         JPtr b = at && at->k == JVal::OBJ ? at->member("BEL") : nullptr;
         if (!b || b->k != JVal::STR || b->str.empty()) continue;
         occupied[b->str] = c.first;
+        std::string site = b->str.substr(0, b->str.find('/'));
         if (b->str.size() > 7 && b->str.compare(b->str.size() - 7, 7, "/CARRY4") == 0)
-            carry_sites.insert(b->str.substr(0, b->str.find('/')));
+            carry_sites.insert(site);
+        std::string ty = upper(type_of(c.second));
+        if (starts_with(ty, "RAM") || starts_with(ty, "SRL"))
+            slicem_sites.insert(site);
     }
     auto claim = [&](const std::string &bel, const std::string &who) {
         auto it = occupied.find(bel);
@@ -2029,7 +2045,7 @@ CarryStampStats carry_stamp_tree(JPtr mj, const std::vector<std::pair<std::strin
         for (auto &dd : d) {
             std::string ns = "SLICE_X" + std::to_string(x + dd[0]) + "Y" + std::to_string(y + dd[1]);
             if (!known_sites.empty() && !known_sites.count(ns)) continue;
-            if (carry_sites.count(ns)) continue;
+            if (carry_sites.count(ns) || slicem_sites.count(ns)) continue;
             for (int sl = 0; sl < 4; sl++) {
                 std::string bel = ns + "/" + SLOT[sl] + std::string("6LUT");
                 if (!occupied.count(bel)) return bel;
@@ -2321,7 +2337,7 @@ CarryStampStats carry_stamp_tree(JPtr mj, const std::vector<std::pair<std::strin
             static const int d[8][2] = {{1,0},{-1,0},{0,1},{0,-1},{1,1},{-1,1},{1,-1},{-1,-1}};
             for (auto &dd : d) {
                 std::string ns = "SLICE_X" + std::to_string(x + dd[0]) + "Y" + std::to_string(y + dd[1]);
-                if (!ksites.count(ns) || carry_sites.count(ns)) continue;
+                if (!ksites.count(ns) || carry_sites.count(ns) || slicem_sites.count(ns)) continue;
                 for (int sl = 0; sl < 4; sl++) {
                     std::string bel = ns + "/" + SLOT[sl] + std::string("6LUT");
                     if (!occupied.count(bel)) return bel;
