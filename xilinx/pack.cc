@@ -1393,6 +1393,9 @@ bool Arch::pack()
     if (xc7) {
         XC7Packer packer;
         packer.ctx = getCtx();
+        // Before any cell is transformed: the yosys cell types (IBUF, BUFG,
+        // PLLE2_*, MMCME2_*) are what the propagation recognises.
+        packer.propagate_clock_constraints();
         packer.pack_constants();
         packer.pack_inverters();
         packer.pack_io();
