@@ -9,8 +9,10 @@
 #   1. builds nextpnr-xilinx from the PR (ARCH=xilinx)
 #   2. builds the chipdb for just the parts the demo subset needs,
 #      from the PR's own prjxray-db submodule
-#   3. runs the demos with the PR binary + db
-#   4. compares the blinkies against the committed golden bitstreams
+#   3. runs the FASM regression cases (demo-projects/regression/) with
+#      the PR binary, on the artix7 row
+#   4. runs the demos with the PR binary + db
+#   5. compares the blinkies against the committed golden bitstreams
 #
 # The full demo matrix stays on the nightly heavy run / the merge
 # pin-bump path; this is the fast per-PR smoke.
@@ -48,14 +50,17 @@ jobs:
             upper: SPARTAN7
             part: xc7s50csga324-1
             projects: litex-ddr-arty-s7 litex-minimal-arty-s7
+            regression: false
           - family: artix7
             upper: ARTIX7
             part: xc7a35tcsg324-1
             projects: blinky-digilent-arty
+            regression: true
           - family: kintex7
             upper: KINTEX7
             part: xc7k325tffg676-1
             projects: blinky-qmtech litex-ddr-qmtech-kintex7
+            regression: false
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -111,6 +116,35 @@ jobs:
             build-pr/bbasm -l ${{ matrix.part }}.bba chipdb/${{ matrix.part }}.bin
             rm -f ${{ matrix.part }}.bba
           '
+
+      # FASM-level regression cases (demo-projects/regression/, one
+      # directory per fixed bug).  They need this PR's binary plus a
+      # chipdb for each case's part.txt -- xc7a200tfbg484-2 today -- so
+      # only the artix7 row runs them.  Cheap and precise: the checks
+      # stop at the FASM, which is where bugs like #159 bit.
+      - name: Run FASM regression cases (this PR's binary)
+        if: matrix.regression == true
+        run: |
+          nix develop ./toolchain-nix --command bash -euxo pipefail <<'EOF'
+            # nix develop prepends the devshell's own store paths, so the
+            # toolchain's pinned nextpnr-xilinx shadows the one we just built
+            # from this PR.  Re-prepend it here, inside, and prove which
+            # binary is actually being used.
+            export PATH="$GITHUB_WORKSPACE/build-pr:$PATH"
+            command -v nextpnr-xilinx
+            case "$(command -v nextpnr-xilinx)" in
+              "$GITHUB_WORKSPACE/build-pr/"*) ;;
+              *) echo "::error::regression gate is not using this PR's nextpnr-xilinx"; exit 1 ;;
+            esac
+            # the regression cases pin xc7a200tfbg484-2 via part.txt
+            python3 nextpnr-xilinx/xilinx/python/bbaexport.py \
+              --device xc7a200tfbg484-2 \
+              --xray nextpnr-xilinx/xilinx/external/prjxray-db/artix7 \
+              --bba xc7a200tfbg484-2.bba
+            build-pr/bbasm -l xc7a200tfbg484-2.bba chipdb/xc7a200tfbg484-2.bin
+            rm -f xc7a200tfbg484-2.bba
+            CHIPDB_DIR="$GITHUB_WORKSPACE/chipdb" demo-projects/regression/run.sh
+          EOF
 
       - name: Build demos and compare goldens
         env:
