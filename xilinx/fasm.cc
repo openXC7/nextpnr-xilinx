@@ -2562,6 +2562,49 @@ struct FasmBackend
         pop();
     }
 
+    // A placed BUFIO emits nothing today, so the buffer is never switched on.
+    //
+    // #157 gave BUFIO a packer -- the cell is renamed to BUFIO_BUFIO and binds
+    // to the bel -- and from then on a design places and routes.  The clock
+    // reaches the site and leaves it through ordinary tile routing, which
+    // write_pip already emits:
+    //
+    //     HCLK_IOI3_X113Y78.HCLK_IOI_IO_PLL_CLK0_DMUX.HCLK_IOI_I2IOCLK_TOP0
+    //     HCLK_IOI3_X113Y78.HCLK_IOI_IOCLK0.HCLK_IOI_BUFIO_O0
+    //
+    // What is missing is the enable.  prjxray-db carries two bits per slot,
+    //
+    //     HCLK_IOI3.BUFIO_Y0.IN_USE 36_16 36_18
+    //     HCLK_IOI3.BUFIO_Y1.IN_USE 37_16 37_18
+    //     HCLK_IOI3.BUFIO_Y2.IN_USE 36_31 37_31
+    //     HCLK_IOI3.BUFIO_Y3.IN_USE 36_21 37_22
+    //
+    // (segbits_hclk_ioi3.db, added by openXC7/prjxray-db#7 from a
+    // 039-hclk-config campaign; the rows come out identical whether the BUFIO
+    // is fed from a clock-capable pad or from the region's MMCM, so they are
+    // an enable and not a record of the route).  Without them the bitstream
+    // assembles with those bits clear: valid-looking, and the I/O clock never
+    // starts -- the same silent-death shape as the RCLK2IO leaf that the same
+    // database change fixed on the BUFR side.
+    //
+    // Emitted from the cell for the reason given above write_bufr: the
+    // configuration belongs to the instance, and the pseudo-pip table only
+    // fires when the site is crossed as routing rather than occupied.
+    void write_bufio(CellInfo *ci)
+    {
+        // Site name is BUFIO_X0Y<y> and the feature is BUFIO_Y<y>, where the
+        // index is the site's y within its tile -- the same convention BUFR
+        // uses above, and the one the fuzzer used to mint the rows (the site's
+        // y minus the lowest BUFIO y of the tile).
+        auto xy = ctx->getSiteLocInTile(ci->bel);
+
+        push(get_tile_name(ci->bel.tile));
+        push("BUFIO_Y" + std::to_string(xy.y));
+        write_bit("IN_USE");
+        pop();
+        pop();
+    }
+
     void write_pll(CellInfo *ci)
     {
         push(get_tile_name(ci->bel.tile));
@@ -5270,6 +5313,11 @@ void write_gtx_channel(CellInfo *ci)
             }
             if (ci->type == id_BUFR_BUFR && ci->bel != BelId()) {
                 write_bufr(ci);
+                blank();
+                continue;
+            }
+            if (ci->type == id_BUFIO_BUFIO && ci->bel != BelId()) {
+                write_bufio(ci);
                 blank();
                 continue;
             }
