@@ -1329,7 +1329,38 @@ void XC7Packer::relocate_carry_o_fabric()
                     continue;
                 if (i == off) {
                     NetInfo *cin = get_net_or_empty(c4, ctx->id("CIN"));
-                    if (cin != nullptr)
+                    // A chain root whose carry-in was a constant has its CIN/CYINIT
+                    // pins disconnected by the PRECYINIT fix in pack_carries().
+                    // The constant value is recorded in PRECYINIT_CONST; use it as
+                    // the sum LUT's CIN input so the root bit's O fabric fanout is
+                    // relocated like any other bit.  Without this, bit 0 keeps an
+                    // O->fabric user alongside CO->fabric (the next bit's sum LUT),
+                    // which violates the single-OUTMUX budget.
+                    if (cin == nullptr) {
+                        if (c4->params.count(ctx->id("PRECYINIT_CONST"))) {
+                            int val = int_or_default(c4->params, ctx->id("PRECYINIT_CONST"), 0);
+                            cin = (val != 0) ? vcc : gnd;
+                        }
+                    }
+                    // Only relocate when bit 0 actually has a fabric O sink that
+                    // contends for OUTMUX; in-position sum FFs are local and do not
+                    // trigger the contention.  This keeps registered adders/counters
+                    // (v4/v10) on the direct XOR->FF path and preserves their fasm.
+                    bool needs_relocate = cin != nullptr;
+                    if (needs_relocate && i == off) {
+                        NetInfo *o = get_net_or_empty(c4, pname("O", i));
+                        if (o != nullptr) {
+                            bool only_ff = true;
+                            for (auto &u : o->users)
+                                if (!(u.port == ctx->id("D") && ff_types.count(u.cell->type))) {
+                                    only_ff = false;
+                                    break;
+                                }
+                            if (only_ff)
+                                needs_relocate = false;
+                        }
+                    }
+                    if (needs_relocate)
                         relocate_sum(c4, i, cin, root);
                 } else {
                     // Includes i == 3: a one-bit split makes bit 3 a new chain
