@@ -119,9 +119,10 @@ jobs:
 
       # FASM-level regression cases (demo-projects/regression/, one
       # directory per fixed bug).  They need this PR's binary plus a
-      # chipdb for each case's part.txt -- xc7a200tfbg484-2 today -- so
-      # only the artix7 row runs them.  Cheap and precise: the checks
-      # stop at the FASM, which is where bugs like #159 bit.
+      # chipdb for each case's part.txt -- xc7a200tfbg484-2 and
+      # xc7z010clg400 today -- so only the artix7 row runs them.
+      # Cheap and precise: the checks stop at the FASM, which is where
+      # bugs like #159 bit.
       - name: Run FASM regression cases (this PR's binary)
         if: matrix.regression == true
         run: |
@@ -136,13 +137,23 @@ jobs:
               "$GITHUB_WORKSPACE/build-pr/"*) ;;
               *) echo "::error::regression gate is not using this PR's nextpnr-xilinx"; exit 1 ;;
             esac
-            # the regression cases pin xc7a200tfbg484-2 via part.txt
+            # the default-suite cases pin xc7a200tfbg484-2 and
+            # xc7z010clg400 via part.txt (lut_shared_pin/#158 needs the
+            # zynq7 part)
             python3 nextpnr-xilinx/xilinx/python/bbaexport.py \
               --device xc7a200tfbg484-2 \
               --xray nextpnr-xilinx/xilinx/external/prjxray-db/artix7 \
               --bba xc7a200tfbg484-2.bba
             build-pr/bbasm -l xc7a200tfbg484-2.bba chipdb/xc7a200tfbg484-2.bin
             rm -f xc7a200tfbg484-2.bba
+            # bbaexport swaps artix7->zynq7 in both the --xray and the
+            # default --metadata paths when the device name contains "xc7z"
+            python3 nextpnr-xilinx/xilinx/python/bbaexport.py \
+              --device xc7z010clg400-2 \
+              --xray nextpnr-xilinx/xilinx/external/prjxray-db/artix7 \
+              --bba xc7z010clg400-2.bba
+            build-pr/bbasm -l xc7z010clg400-2.bba chipdb/xc7z010clg400.bin
+            rm -f xc7z010clg400-2.bba
             CHIPDB_DIR="$GITHUB_WORKSPACE/chipdb" demo-projects/regression/run.sh
           EOF
 
