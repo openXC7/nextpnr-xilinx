@@ -344,6 +344,96 @@ void XC7Packer::pack_gbs()
         }
         log_info("    BUFGCTRL: disconnected %d const control pins (config-tied, not routed)\n", n);
     }
+
+    // A BUFIO is a regional I/O clock buffer rather than a global one, but this
+    // is where the clock buffers get their bels and it has to run after
+    // pack_io() has placed the pads it reads.
+    constrain_bufios();
+}
+
+// A BUFIO is not placed wherever there is room: it is placed where the pad
+// says.  Its I pin has no fabric input at all -- the only wire that reaches it
+// is the I2IOCLK leg its own clock-capable pad drives into the HCLK_IOI tile --
+// so of the four BUFIO_BUFIO bels of a tile exactly ONE is reachable from a
+// given pad.  Sweeping the four master clock-capable pads of bank 35 of an
+// xc7a35tcsg324-1 against the four BUFIO sites of their tile gives a diagonal:
+// E2 routes only on BUFIO_X1Y4, F4 only on X1Y5, E3 only on X1Y6, D5 only on
+// X1Y7 -- the CCIO->BUFIO bijection prjxray's 039-hclk-config campaign measured
+// on silicon bitstreams, here read back out of our own routing graph.
+//
+// Nothing told the placer that.  #157 packs the cell onto a BUFIO_BUFIO bel and
+// the placer takes any free one, so a pad-fed BUFIO dies in the router:
+//
+//   ERROR: Failed to route arc 0 of net 'clk_ibuf',
+//          from SITEWIRE/IOB_X1Y76/INBUF_EN_OUT to SITEWIRE/BUFIO_X1Y5/I.
+//
+// (0 of those 4 probes routed; the placer picked X1Y5 for three of the pads.)
+//
+// So ask the routing graph which bel the pad reaches -- the same pip BFS
+// try_preplace() runs for a BUFG -- and constrain the cell to it.  A table of
+// pad->site pairs would answer the same question for artix7 today and be wrong
+// for the next family; the graph is per-part data and already knows.
+void XC7Packer::constrain_bufios()
+{
+    for (auto cell : sorted(ctx->cells)) {
+        CellInfo *ci = cell.second;
+        const bool is_bufio = (ci->type == id_BUFIO_BUFIO);
+        if (!is_bufio)
+            continue;
+
+        NetInfo *clk = get_net_or_empty(ci, id_I);
+        const bool has_driven_input = (clk != nullptr && clk->driver.cell != nullptr);
+        if (!has_driven_input)
+            continue;
+
+        CellInfo *drv = clk->driver.cell;
+        // Only a pad fixes the site.  A BUFIO driven by an MMCM/PLL output, or
+        // by anything else, enters the tile through a different DMUX leg and is
+        // left exactly as it was.  pack_io() has already given every input
+        // buffer its bel by now (decompose_iob() writes <site>/IOB33/INBUF_EN),
+        // which is what makes the pad knowable this early.
+        const bool driven_by_input_buffer = boost::contains(drv->type.str(ctx), "INBUF");
+        const bool driver_is_placed = drv->attrs.count(id_BEL) > 0;
+        if (!driven_by_input_buffer || !driver_is_placed)
+            continue;
+
+        BelId pad_bel = ctx->getBelByName(ctx->id(drv->attrs.at(id_BEL).as_string()));
+        const bool pad_bel_is_known = (pad_bel != BelId());
+        if (!pad_bel_is_known)
+            continue;
+
+        BelId dedicated =
+                find_bel_with_short_route(ctx->getBelPinWire(pad_bel, clk->driver.port), ci->type, id_I);
+        // No BUFIO reachable: the pad is not clock-capable.  Leave that to the
+        // router, whose message names the two ends of the arc it could not
+        // build; guessing a site here would only move the failure.
+        const bool pad_reaches_a_bufio = (dedicated != BelId());
+        if (!pad_reaches_a_bufio)
+            continue;
+
+        const bool user_chose_a_site = ci->attrs.count(id_BEL) > 0;
+        if (user_chose_a_site) {
+            // A site the user wrote wins, but check it against the graph rather
+            // than let a wrong one turn into a routing failure an hour later.
+            // A name that does not resolve is not ours to report: the placer
+            // already says "No Bel named ..." for that.
+            const std::string want = ci->attrs.at(id_BEL).as_string();
+            BelId want_bel = ctx->getBelByName(ctx->id(want));
+            const bool user_site_is_the_dedicated_one = (want_bel == dedicated);
+            const bool user_site_resolves = (want_bel != BelId());
+            if (user_site_is_the_dedicated_one)
+                used_bels.insert(dedicated);
+            else if (user_site_resolves)
+                log_error("BUFIO '%s' is constrained to bel '%s', which the pad driving it cannot reach; "
+                          "the BUFIO of that pad (%s) is '%s'.\n",
+                          ctx->nameOf(ci), want.c_str(), ctx->nameOfBel(pad_bel), ctx->nameOfBel(dedicated));
+            continue;
+        }
+        used_bels.insert(dedicated);
+        ci->attrs[id_BEL] = std::string(ctx->nameOfBel(dedicated));
+        log_info("    Constrained BUFIO '%s' to bel '%s' (dedicated site of the pad at %s)\n", ctx->nameOf(ci),
+                 ctx->nameOfBel(dedicated), ctx->nameOfBel(pad_bel));
+    }
 }
 
 void XC7Packer::pack_clocking()
