@@ -251,6 +251,7 @@ struct XC7Packer : public XilinxPacker
     // Bind every pad-fed BUFIO to the one site its pad can reach; run from
     // pack_gbs(), after pack_io() has placed the pads.
     void constrain_bufios();
+    void constrain_regional_clock_sinks(CellInfo *buf);
     void pack_clocking();
 
     // CFG
