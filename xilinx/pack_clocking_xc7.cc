@@ -377,8 +377,19 @@ void XC7Packer::constrain_bufios()
 {
     for (auto cell : sorted(ctx->cells)) {
         CellInfo *ci = cell.second;
-        const bool is_bufio = (ci->type == id_BUFIO_BUFIO);
-        if (!is_bufio)
+        // A pad-fed BUFR carries the same constraint as a BUFIO, for the same
+        // reason: its I pin is reached only by the I2IOCLK leg of its own
+        // clock-capable pad, so one site of the tile is right and the rest are
+        // unroutable.  xc7a35t hides this -- few sites, the placer guesses
+        // right -- but on an xc7a200tfbg484-2 with the pad at R4 it fails
+        // exactly as a BUFIO did before #168:
+        //
+        //   ERROR: Failed to route arc 0 of net 'clk_ibuf'
+        //
+        // Everything below reads ci->type, so the same graph walk answers for
+        // both buffer types.
+        const bool is_regional_buffer = (ci->type == id_BUFIO_BUFIO || ci->type == id_BUFR_BUFR);
+        if (!is_regional_buffer)
             continue;
 
         NetInfo *clk = get_net_or_empty(ci, id_I);
@@ -424,15 +435,16 @@ void XC7Packer::constrain_bufios()
             if (user_site_is_the_dedicated_one)
                 used_bels.insert(dedicated);
             else if (user_site_resolves)
-                log_error("BUFIO '%s' is constrained to bel '%s', which the pad driving it cannot reach; "
-                          "the BUFIO of that pad (%s) is '%s'.\n",
-                          ctx->nameOf(ci), want.c_str(), ctx->nameOfBel(pad_bel), ctx->nameOfBel(dedicated));
+                log_error("%s '%s' is constrained to bel '%s', which the pad driving it cannot reach; "
+                          "the dedicated site of that pad (%s) is '%s'.\n",
+                          ci->type.c_str(ctx), ctx->nameOf(ci), want.c_str(), ctx->nameOfBel(pad_bel),
+                          ctx->nameOfBel(dedicated));
             continue;
         }
         used_bels.insert(dedicated);
         ci->attrs[id_BEL] = std::string(ctx->nameOfBel(dedicated));
-        log_info("    Constrained BUFIO '%s' to bel '%s' (dedicated site of the pad at %s)\n", ctx->nameOf(ci),
-                 ctx->nameOfBel(dedicated), ctx->nameOfBel(pad_bel));
+        log_info("    Constrained %s '%s' to bel '%s' (dedicated site of the pad at %s)\n",
+                 ci->type.c_str(ctx), ctx->nameOf(ci), ctx->nameOfBel(dedicated), ctx->nameOfBel(pad_bel));
     }
 }
 
