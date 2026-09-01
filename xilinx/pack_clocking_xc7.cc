@@ -373,6 +373,100 @@ void XC7Packer::pack_gbs()
 // try_preplace() runs for a BUFG -- and constrain the cell to it.  A table of
 // pad->site pairs would answer the same question for artix7 today and be wrong
 // for the next family; the graph is per-part data and already knows.
+// Binding the buffer to the right site fixes the arc into it.  The arc out of
+// it is a separate problem: a BUFR drives one clock region, and nothing tells
+// the placer that the flops it clocks have to live there.  The placer does not
+// cost global nets, so the flops follow whatever data pin they touch and the
+// router then fails on the clock:
+//
+//   Failed to route arc 0 of net 'clk_bufr',
+//   from SITEWIRE/BUFR_X1Y8/O to SITEWIRE/SLICE_X42Y222/CLKINV_OUT
+//
+// (xc7a200tfbg484-2, pad at R4 in bank 34 -- the flops had gone to the LED in
+// bank 16, half a die away.)
+//
+// Ask the graph where the clock actually arrives, exactly as the site search
+// above does, and hand the placer that rectangle.  Deriving it from geometry
+// would mean encoding how tall a clock region is per family; the routing graph
+// is per-part data and already knows.
+void XC7Packer::constrain_regional_clock_sinks(CellInfo *buf)
+{
+    NetInfo *clk = get_net_or_empty(buf, id_O);
+    if (clk == nullptr || clk->users.empty())
+        return;
+    if (!buf->attrs.count(id_BEL))
+        return;
+    BelId buf_bel = ctx->getBelByName(ctx->id(buf->attrs.at(id_BEL).as_string()));
+    if (buf_bel == BelId())
+        return;
+
+    WireId src = ctx->getBelPinWire(buf_bel, id_O);
+    if (src == WireId())
+        return;
+
+    // Same effort cap and the same layer-by-layer walk as
+    // find_bel_with_short_route(); here we want every bel the clock reaches
+    // rather than the nearest one, so the walk runs to exhaustion.
+    const size_t max_visit = 1000000;
+    std::unordered_set<WireId> visited{src};
+    std::vector<WireId> frontier{src};
+    bool any = false;
+    int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    while (!frontier.empty() && visited.size() < max_visit) {
+        for (WireId w : frontier) {
+            for (auto bp : ctx->getWireBelPins(w)) {
+                // Only where the clock can actually clock something.  Counting
+                // every bel pin the walk touches returns the whole die: a wire
+                // brushing some bel's data input says nothing about the clock
+                // reaching its CLK, and the resulting rectangle was x8..264
+                // y26..234 -- no constraint at all.
+                if (bp.pin != id_CLK)
+                    continue;
+                Loc l = ctx->getBelLocation(bp.bel);
+                if (!any) {
+                    x0 = x1 = l.x;
+                    y0 = y1 = l.y;
+                    any = true;
+                } else {
+                    x0 = std::min(x0, l.x);
+                    x1 = std::max(x1, l.x);
+                    y0 = std::min(y0, l.y);
+                    y1 = std::max(y1, l.y);
+                }
+            }
+        }
+        std::vector<WireId> next_frontier;
+        for (WireId w : frontier)
+            for (auto pip : ctx->getPipsDownhill(w)) {
+                WireId dst = ctx->getPipDstWire(pip);
+                if (visited.count(dst))
+                    continue;
+                visited.insert(dst);
+                next_frontier.push_back(dst);
+            }
+        frontier.swap(next_frontier);
+    }
+    if (!any)
+        return;
+
+    IdString rname = ctx->id("clkregion_" + buf->name.str(ctx));
+    ctx->createRectangularRegion(rname, x0, y0, x1, y1);
+    int n = 0;
+    for (auto &usr : clk->users) {
+        // A cell already inside a placement cluster is positioned relative to
+        // its root, so constrain the root and let the cluster follow it.
+        CellInfo *tgt = usr.cell;
+        while (tgt->constr_parent != nullptr)
+            tgt = tgt->constr_parent;
+        if (tgt->region == nullptr) {
+            ctx->constrainCellToRegion(tgt->name, rname);
+            ++n;
+        }
+    }
+    log_info("    Constrained %d sink(s) of %s '%s' to its clock region x%d..%d y%d..%d\n", n,
+             buf->type.c_str(ctx), ctx->nameOf(buf), x0, x1, y0, y1);
+}
+
 void XC7Packer::constrain_bufios()
 {
     for (auto cell : sorted(ctx->cells)) {
