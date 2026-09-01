@@ -392,16 +392,22 @@ void XC7Packer::pack_gbs()
 void XC7Packer::constrain_regional_clock_sinks(CellInfo *buf)
 {
     NetInfo *clk = get_net_or_empty(buf, id_O);
-    if (clk == nullptr || clk->users.empty())
+    const bool clk_has_sinks = (clk != nullptr && !clk->users.empty());
+    if (!clk_has_sinks)
         return;
-    if (!buf->attrs.count(id_BEL))
+
+    const bool buf_is_placed = buf->attrs.count(id_BEL) > 0;
+    if (!buf_is_placed)
         return;
+
     BelId buf_bel = ctx->getBelByName(ctx->id(buf->attrs.at(id_BEL).as_string()));
-    if (buf_bel == BelId())
+    const bool buf_bel_is_known = (buf_bel != BelId());
+    if (!buf_bel_is_known)
         return;
 
     WireId src = ctx->getBelPinWire(buf_bel, id_O);
-    if (src == WireId())
+    const bool buf_has_an_output_wire = (src != WireId());
+    if (!buf_has_an_output_wire)
         return;
 
     // Same effort cap and the same layer-by-layer walk as
@@ -420,10 +426,12 @@ void XC7Packer::constrain_regional_clock_sinks(CellInfo *buf)
                 // brushing some bel's data input says nothing about the clock
                 // reaching its CLK, and the resulting rectangle was x8..264
                 // y26..234 -- no constraint at all.
-                if (bp.pin != id_CLK)
+                const bool pin_is_a_clock = (bp.pin == id_CLK);
+                if (!pin_is_a_clock)
                     continue;
                 Loc l = ctx->getBelLocation(bp.bel);
-                if (!any) {
+                const bool first_clock_pin = !any;
+                if (first_clock_pin) {
                     x0 = x1 = l.x;
                     y0 = y1 = l.y;
                     any = true;
@@ -439,14 +447,16 @@ void XC7Packer::constrain_regional_clock_sinks(CellInfo *buf)
         for (WireId w : frontier)
             for (auto pip : ctx->getPipsDownhill(w)) {
                 WireId dst = ctx->getPipDstWire(pip);
-                if (visited.count(dst))
+                const bool already_visited = visited.count(dst) > 0;
+                if (already_visited)
                     continue;
                 visited.insert(dst);
                 next_frontier.push_back(dst);
             }
         frontier.swap(next_frontier);
     }
-    if (!any)
+    const bool clock_reaches_a_bel = any;
+    if (!clock_reaches_a_bel)
         return;
 
     IdString rname = ctx->id("clkregion_" + buf->name.str(ctx));
@@ -458,7 +468,8 @@ void XC7Packer::constrain_regional_clock_sinks(CellInfo *buf)
         CellInfo *tgt = usr.cell;
         while (tgt->constr_parent != nullptr)
             tgt = tgt->constr_parent;
-        if (tgt->region == nullptr) {
+        const bool sink_unconstrained = (tgt->region == nullptr);
+        if (sink_unconstrained) {
             ctx->constrainCellToRegion(tgt->name, rname);
             ++n;
         }
