@@ -21,6 +21,7 @@
 #include <boost/algorithm/string.hpp>
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/range/adaptor/reversed.hpp>
+#include <cctype>
 #include <fstream>
 #include "log.h"
 #include "nextpnr.h"
@@ -5248,8 +5249,20 @@ void write_gtx_channel(CellInfo *ci)
 
         write_bit("ZADREG[0]", !bool_or_default(ci->params, ctx->id("ADREG"), true));
         write_bit("ZALUMODEREG[0]", !bool_or_default(ci->params, ctx->id("ALUMODEREG")));
-        write_bit("ZAREG_2_ACASCREG_1", !bool_or_default(ci->params, ctx->id("ACASCREG")));
-        write_bit("ZBREG_2_BCASCREG_1", !bool_or_default(ci->params, ctx->id("BCASCREG")));
+        // AREG_2_ACASCREG_1 is prjxray's name for a CONJUNCTION, not for
+        // ACASCREG: fuzzers/100-dsp-mskpat/generate.py sets it to
+        // (AREG == 2 && ACASCREG == 1).  Its Z-form bit therefore belongs in
+        // the bitstream whenever that conjunction is FALSE.  Deciding it from
+        // ACASCREG alone mis-encodes the case yosys emits whenever it absorbs
+        // one level of input register into the DSP -- AREG=1 with
+        // ACASCREG=1 -- which wrote no bit at all and reads back on silicon
+        // as AREG=2, one pipeline stage deeper than the netlist asked for.
+        // The multiply then samples its operands a cycle late and the design
+        // returns wrong products with a correct netlist.  Same for B.
+        auto acascreg = int_or_default(ci->params, ctx->id("ACASCREG"), 1);
+        auto bcascreg = int_or_default(ci->params, ctx->id("BCASCREG"), 1);
+        write_bit("ZAREG_2_ACASCREG_1", !(areg == 2 && acascreg == 1));
+        write_bit("ZBREG_2_BCASCREG_1", !(breg == 2 && bcascreg == 1));
         write_bit("ZCARRYINREG[0]", !bool_or_default(ci->params, ctx->id("CARRYINREG")));
         write_bit("ZCARRYINSELREG[0]", !bool_or_default(ci->params, ctx->id("CARRYINSELREG")));
         write_bit("ZCREG[0]", !bool_or_default(ci->params, ctx->id("CREG"), true));
@@ -5273,9 +5286,39 @@ void write_gtx_channel(CellInfo *ci)
             boost::split(pins, attr_value, boost::is_any_of(" "));
             for (auto pin : pins) {
                 if (boost::empty(pin)) continue;
+                // These pins have no interconnect path into the site, so the
+                // tile bit IS the pin: it bypasses the site's optional input
+                // inverter, and the ZIS_*_INVERTED bits fasm.cc writes apply
+                // only to the routed pins.  The bit therefore has to carry the
+                // LOGICAL value -- flip the constant when the netlist asked
+                // for an inversion.
+                //
+                // Splitting the trailing index off matters: erase_all() of
+                // "0123456789" turned "INMODE1" into "INMODE" and then looked
+                // up IS_INMODE_INVERTED, which yosys never emits (it writes
+                // the per-bit IS_INMODE[1]_INVERTED), so `inv` was always
+                // false and every bussed pin got the un-flipped constant.
+                // That is the "seems to be inverted for unknown reasons" that
+                // kept INMODE/ALUMODE2/ALUMODE3 commented out of the packer's
+                // const-pin list in pack_dsp_xc7.cc.
                 auto pin_basename = pin;
-                boost::erase_all(pin_basename, "0123456789");
-                auto inv = bool_or_default(ci->params, ctx->id("IS_" + pin_basename + "_INVERTED"), 0);
+                std::string idx;
+                while (!pin_basename.empty() && std::isdigit((unsigned char)pin_basename.back())) {
+                    idx.insert(idx.begin(), pin_basename.back());
+                    pin_basename.pop_back();
+                }
+                bool inv = bool_or_default(ci->params, ctx->id("IS_" + pin + "_INVERTED"), false);
+                if (!idx.empty()) {
+                    inv |= bool_or_default(
+                            ci->params,
+                            ctx->id("IS_" + pin_basename + "[" + idx + "]_INVERTED"), false);
+                    inv |= ((int_or_default(ci->params,
+                                            ctx->id("IS_" + pin_basename + "_INVERTED"), 0)
+                             >> std::stoi(idx)) & 0x1) != 0;
+                } else {
+                    inv |= bool_or_default(ci->params, ctx->id("IS_" + pin_basename + "_INVERTED"),
+                                           false);
+                }
                 auto net_name = inv ? (const_net_name == "GND" ? "VCC" : "GND") : const_net_name;
                 write_bit(dsp + "_" + pin + ".DSP_" + net_name + "_" + tile_side);
             }
