@@ -349,7 +349,13 @@ class NextpnrTileType:
 			if p.is_route_thru() and p.src_wire().name().endswith("_CE_INT"):
 				continue
 			if p.is_route_thru() and is_xc7_logic:
-				continue
+				# Drop only 'hint' ppips: LUT-function aggregate wires (e.g. CLBLL_L_A,
+				# CLBLL_L_AMUX). These are routing metadata only, not real connections.
+				# All 'always' ppips (IMUX->A1, BYP->AX, FAN->CE, CLK, SR, LOGIC_OUTS,
+				# etc.) are genuine tile-level connections and must pass through.
+				_last = p.dst_wire().name().rsplit('_', 1)[-1]
+				if _last in ('A', 'B', 'C', 'D', 'AMUX', 'BMUX', 'CMUX', 'DMUX'):
+					continue
 			if p.is_route_thru() and "TFB" in p.dst_wire().name():
 				continue
 			if p.src_wire().name().startswith("CLK_BUFG_R_FBG_OUT"):
