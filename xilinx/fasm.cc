@@ -1196,11 +1196,18 @@ struct FasmBackend
                     write_bit("LVCMOS15_SSTL15.DRIVE.I16_I_FIXED");
                 else if (iostandard == "LVCMOS18" && (drive == 12 || drive == 8))
                     write_bit("LVCMOS18.DRIVE.I12_I8");
-                else if ((iostandard == "LVCMOS33" && drive == 16) ||
-                         (iostandard == "LVTTL"    && drive == 16))
+                // prjxray-db names both patterns as covering DRIVE=12
+                // (I12_I8 and I12_I16), which cannot both be right.  The tie is
+                // broken by the four Vivado-built references in
+                // prjxray-db/artix7/harness/{arty-a7/{swbut,uart,pmod},basys3/swbut}:
+                // across all 35 LVCMOS33 output pads at Vivado's default drive
+                // the pattern is I12_I16, and I12_I8 does not occur once.  So 12
+                // belongs with 16 here, and I12_I8 is left to its other member, 8.
+                else if ((iostandard == "LVCMOS33" && (drive == 16 || drive == 12)) ||
+                         (iostandard == "LVTTL"    && (drive == 16 || drive == 12)))
                     write_bit("LVCMOS33_LVTTL.DRIVE.I12_I16");
-                else if ((iostandard == "LVCMOS33" && (drive == 8 || drive == 12)) ||
-                         (iostandard == "LVTTL"    && (drive == 8 || drive == 12)))
+                else if ((iostandard == "LVCMOS33" && drive == 8) ||
+                         (iostandard == "LVTTL"    && drive == 8))
                     write_bit("LVCMOS33_LVTTL.DRIVE.I12_I8");
                 else if ((iostandard == "LVCMOS33" && drive == 4) ||
                          (iostandard == "LVTTL"    && drive == 4))
@@ -1275,11 +1282,17 @@ struct FasmBackend
             // prjxray's DB has no SLEW.SLOW key for diff sites; emitting
             // it triggers FasmLookupError on round-trip.  Also skip if
             // is_output already covered the emit upstream.
-            if (!is_output && !is_diff && slew == "SLOW"
+            // The is_hp_bank guard is what the comment above always claimed but
+            // the condition did not check.  Measured against the Vivado-built
+            // reference in prjxray-db/artix7/harness/arty-a7/swbut/design.bit
+            // (xc7a35t, HR bank, LVCMOS33, PACKAGE_PIN + IOSTANDARD only):
+            // Vivado sets SLEW.SLOW on the 8 output pads and on none of the 9
+            // input pads, while we were setting it on all 17.  SLEW is an
+            // output-driver property; an input-only pad has no driver to slew.
+            if (!is_output && !is_diff && is_hp_bank && slew == "SLOW"
                 && iostandard != "LVDS_25" && iostandard != "TMDS_33") {
                 write_bit("LVCMOS12_LVCMOS15_LVCMOS18_LVCMOS25_LVCMOS33_LVTTL_SSTL135_SSTL15.SLEW.SLOW");
-                if (is_hp_bank)
-                    write_bit("LVCMOS12_LVCMOS15_LVCMOS18.SLEW.SLOW");
+                write_bit("LVCMOS12_LVCMOS15_LVCMOS18.SLEW.SLOW");
             }
             // HP-bank IBUF glue — fires per active input site (parallel to
             // OBUF_HP_BANK_GLUE).  For differential inputs Vivado uses a
