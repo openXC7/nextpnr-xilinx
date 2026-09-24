@@ -39,3 +39,7 @@ install_manifest.txt
 *.bba
 __pycache__/
 *.pyc
+
+# [epiq]: local hydrated state is never committed
+.epiq/events/
+.epiq/log/

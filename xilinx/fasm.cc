@@ -2088,7 +2088,8 @@ struct FasmBackend
     static size_t regional_buffer_offset(const std::string &s)
     {
         size_t off = s.find("BUFHCLK");
-        if (off != std::string::npos)
+        const bool is_bufhclk = (off != std::string::npos);
+        if (is_bufhclk)
             return off;
         return s.find("BUFRCLK");
     }
@@ -2210,7 +2211,8 @@ struct FasmBackend
                     // feature no longer produces a FasmLookupError -- which is
                     // the criterion this change was held against.
                     size_t off = regional_buffer_offset(s);
-                    if (off != std::string::npos) {
+                    const bool is_regional_buffer_source = (off != std::string::npos);
+                    if (is_regional_buffer_source) {
                         write_bit(s);
                         hclk_by_row[tile / ctx->chip_info->width].insert(s.substr(off));
                     }
@@ -2244,7 +2246,8 @@ struct FasmBackend
                 auto used_hclk = used_wires_starting_with(tile, "HCLK_CMT_CK_", true);
                 for (auto s : used_hclk) {
                     size_t off = regional_buffer_offset(s);
-                    if (off != std::string::npos) {
+                    const bool is_regional_buffer_source = (off != std::string::npos);
+                    if (is_regional_buffer_source) {
                         write_bit(s + "_USED");
                         hclk_by_row[tile / ctx->chip_info->width].insert(s.substr(off));
                     }
