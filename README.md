@@ -1,3 +1,15 @@
+> **Archived — development continues in [openXC7/nextpnr](https://github.com/openXC7/nextpnr).**
+>
+> Its `himbaechel` xilinx micro-architecture carries this fork's fixes (clocking,
+> IO, BRAM, DSP) and is what the openXC7 toolchain now builds: the devshell's
+> `nextpnr-xilinx` executable comes from that repository, through the
+> flag-translating shim its CI ships.
+>
+> The last release of this line is
+> [0.9.8](https://github.com/openXC7/nextpnr-xilinx/releases/tag/0.9.8). Before
+> the archive, every open issue was either closed with a signpost or carried
+> over to openXC7/nextpnr.
+
 # nextpnr-xilinx
 
 [![NLnet Foundation](https://img.shields.io/badge/funded%20by-NLnet%20Foundation-74AA00)](https://nlnet.nl/)
